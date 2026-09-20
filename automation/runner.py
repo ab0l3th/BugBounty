@@ -14,7 +14,7 @@ STATE_DIR = RESULTS_DIR / '.state'
 WORKER_SCRIPT = ROOT / 'automation' / 'worker.py'
 
 
-def run_worker() -> dict:
+def run_worker() -> list[dict]:
     result = subprocess.run(
         [sys.executable, str(WORKER_SCRIPT)],
         cwd=str(ROOT),
@@ -27,10 +27,10 @@ def run_worker() -> dict:
         raise RuntimeError(combined or 'Worker failed without output.')
     payload = json.loads(combined)
     if isinstance(payload, list):
-        if payload:
-            return payload[0]
-        raise RuntimeError('Worker returned empty payload list.')
-    return payload
+        return payload
+    if isinstance(payload, dict):
+        return [payload]
+    raise RuntimeError('Worker returned an unexpected payload format.')
 
 
 def save_json(path: Path, payload: dict) -> None:
@@ -66,28 +66,29 @@ def send_notification(job: str, payload: dict) -> None:
 
 
 def main() -> None:
-    current = run_worker()
-    job_name = current.get('job', 'unknown-job')
-    result_file = RESULTS_DIR / f'{job_name}.json'
-    save_json(result_file, current)
+    current_jobs = run_worker()
+    for current in current_jobs:
+        job_name = current.get('job', 'unknown-job')
+        result_file = RESULTS_DIR / f'{job_name}.json'
+        save_json(result_file, current)
 
-    state_file = STATE_DIR / f'{job_name}.json'
-    previous = None
-    if state_file.exists():
-        previous = json.loads(state_file.read_text(encoding='utf-8'))
+        state_file = STATE_DIR / f'{job_name}.json'
+        previous = None
+        if state_file.exists():
+            previous = json.loads(state_file.read_text(encoding='utf-8'))
 
-    if previous is None:
+        if previous is None:
+            save_json(state_file, current)
+            print(f'Initial state saved for {job_name}.')
+            continue
+
+        if diff_changed(current, previous):
+            send_notification(job_name, current)
+            print(f'Change detected for {job_name}. Notification sent.')
+        else:
+            print(f'No change detected for {job_name}.')
+
         save_json(state_file, current)
-        print(f'Initial state saved for {job_name}.')
-        return
-
-    if diff_changed(current, previous):
-        send_notification(job_name, current)
-        print(f'Change detected for {job_name}. Notification sent.')
-    else:
-        print(f'No change detected for {job_name}.')
-
-    save_json(state_file, current)
 
 
 if __name__ == '__main__':
