@@ -1,0 +1,16 @@
+[Unit]
+Description=BugBounty local dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ab0l3th/BugBounty
+User=ab0l3th
+Group=ab0l3th
+ExecStart=/home/ab0l3th/BugBounty/.venv/bin/gunicorn --bind 0.0.0.0:8000 automation.dashboard_app:app
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

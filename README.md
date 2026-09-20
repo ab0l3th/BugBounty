@@ -58,6 +58,16 @@ The project includes a basic passive recon worker that:
 
 This workflow is intentionally limited to passive reconnaissance and scope enforcement. No active exploitation or service degradation is allowed.
 
+## Local LAN dashboard
+
+A lightweight dashboard is included for local review over your private network:
+
+- app entry: `automation/dashboard_app.py`
+- service file: `automation/systemd/bugbounty-dashboard.service`
+- local docs: `automation/dashboard_README.md`
+
+It reads the JSON result files from `results/` and serves a simple web view suitable for hosts on your LAN. It is intended for private, in-network access only and is not exposed publicly.
+
 ## Initial status
 
 This repository has been initialized as a private, controlled workspace for approved bug bounty and security research workflows.
