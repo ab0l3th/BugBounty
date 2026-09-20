@@ -1,0 +1,5 @@
+name: example-passive-discovery
+type: passive
+targets:
+  - '*.example.com'
+  - 'example.com'

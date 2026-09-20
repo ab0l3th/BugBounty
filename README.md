@@ -33,6 +33,7 @@ This repository is designed to support authorized bug bounty and security testin
 
 - `automation/` — polling workers, schedules, and passive recon automation
 - `programs/` — one folder per program or engagement
+- `programs/template/` — reusable template for all new scope intakes
 - `templates/` — reusable templates for notes, issue records, and reports
 - `notes/` — general working memory and process notes
 - `scans/` — queued or archived scan definitions and outputs
@@ -42,10 +43,13 @@ This repository is designed to support authorized bug bounty and security testin
 ## Program intake workflow
 
 1. Validate scope and approvals.
-2. Add a new folder under `programs/` for the program.
-3. Record allowed targets, rules, and exclusions.
-4. Add automation jobs in `jobs/` only after scope is confirmed.
-5. Maintain clean evidence and clear reporting paths.
+2. Copy the standard template from `programs/template/`.
+3. Rename it for the new program and replace the sample domain entries.
+4. Record allowed targets, rules, and exclusions.
+5. Add automation jobs in `jobs/` only after scope is confirmed.
+6. Maintain clean evidence and clear reporting paths.
+
+Every new program should use the same passive-only intake flow, scope validation, and review model as the AA scope.
 
 ## Automation workflow
 
