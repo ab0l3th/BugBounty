@@ -1,6 +1,0 @@
-name: example-passive-discovery
-program: example-scope
-type: passive
-targets:
-  - '*.example.com'
-  - 'example.com'
