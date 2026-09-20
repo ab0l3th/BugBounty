@@ -75,16 +75,62 @@ def run_passive_job(job: dict, allowed_scope: list[str]) -> dict:
         result['status'] = 'no_in_scope_targets'
         return result
 
+    from passive_discovery import build_job_output
     from passive_dns_enrichment import passive_dns_enrichment
+
+    legacy = build_job_output()
     passive = passive_dns_enrichment(job.get('program', DEFAULT_PROGRAM))
+
+    merged_assets: dict[str, dict] = {}
+    for asset in legacy.get('assets', []):
+        domain = asset.get('domain')
+        if not domain:
+            continue
+        merged_assets[domain] = {
+            'domain': domain,
+            'status': asset.get('status', 'in_scope'),
+            'source': asset.get('source', ''),
+            'sources': list(dict.fromkeys(asset.get('sources', []))),
+            'source_count': int(asset.get('source_count', len(asset.get('sources', [])))),
+            'evidence': list(asset.get('evidence', [])),
+        }
+
+    for asset in passive.get('assets', []):
+        domain = asset.get('domain')
+        if not domain:
+            continue
+        existing = merged_assets.get(domain)
+        if existing:
+            existing_sources = list(dict.fromkeys(existing.get('sources', []) + asset.get('sources', [])))
+            existing_evidence = existing.get('evidence', []) + asset.get('evidence', [])
+            merged_assets[domain] = {
+                'domain': domain,
+                'status': 'in_scope',
+                'source': ', '.join(existing_sources),
+                'sources': existing_sources,
+                'source_count': len(existing_sources),
+                'evidence': list({(item.get('source'), item.get('url')): item for item in existing_evidence}.values()),
+            }
+        else:
+            merged_assets[domain] = {
+                'domain': domain,
+                'status': asset.get('status', 'in_scope'),
+                'source': asset.get('source', ''),
+                'sources': list(dict.fromkeys(asset.get('sources', []))),
+                'source_count': int(asset.get('source_count', len(asset.get('sources', [])))),
+                'evidence': list(asset.get('evidence', [])),
+            }
+
+    discovered = sorted(merged_assets)
+    ordered_assets = [merged_assets[domain] for domain in discovered]
     result.update({
         'enrichment_job': passive.get('job', result['job']),
         'enrichment_program': passive.get('program', result['program']),
-        'targets': passive.get('targets', result['targets']),
-        'discovered': passive.get('discovered', []),
-        'assets': passive.get('assets', []),
-        'status': passive.get('status', 'ok'),
-        'source_count': passive.get('source_count', 0),
+        'targets': list(dict.fromkeys((legacy.get('targets', []) or result['targets']) + (passive.get('targets', []) or []))),
+        'discovered': discovered,
+        'assets': ordered_assets,
+        'status': 'ok' if discovered else 'no_new_assets',
+        'source_count': len({source for row in ordered_assets for source in row.get('sources', [])}),
     })
     return result
 

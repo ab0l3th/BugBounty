@@ -61,6 +61,19 @@ def public_sources_for(domain: str) -> List[str]:
     ]
 
 
+def source_label_for(url: str) -> str:
+    lowered = url.lower()
+    if 'crt.sh' in lowered:
+        return 'crt.sh'
+    if 'google' in lowered and 'search' in lowered:
+        return 'google-search'
+    if 'dns.google' in lowered:
+        return 'dns.google'
+    if 'https://' in lowered:
+        return url.split('://', 1)[1].split('/', 1)[0]
+    return 'public-source'
+
+
 def discover_passive_assets(domain: str) -> List[str]:
     observed: Set[str] = set()
     for url in public_sources_for(domain):
@@ -73,22 +86,48 @@ def discover_passive_assets(domain: str) -> List[str]:
 
 def build_job_output() -> dict:
     allowed = load_allowed_domains()
+    evidence_by_host: dict[str, list[dict]] = {}
+    source_by_host: dict[str, set[str]] = {}
     all_found: Set[str] = set()
     for domain in allowed:
         if domain.startswith('*.'):
             base = domain[2:]
         else:
             base = domain
-        for found in discover_passive_assets(base):
-            all_found.add(found)
+        for url in public_sources_for(base):
+            data = fetch_url(url)
+            if not data:
+                continue
+            for found in extract_domains(data):
+                if not is_in_scope(found, allowed):
+                    continue
+                all_found.add(found)
+                label = source_label_for(url)
+                source_by_host.setdefault(found, set()).add(label)
+                evidence_by_host.setdefault(found, []).append({'source': label, 'url': url})
 
     filtered = filter_scope(all_found, allowed)
+    assets = []
+    for host in filtered:
+        sources = sorted(source_by_host.get(host, set()))
+        evidence = evidence_by_host.get(host, [])
+        assets.append({
+            'domain': host,
+            'status': 'in_scope',
+            'source': ', '.join(sources),
+            'sources': sources,
+            'source_count': len(sources),
+            'evidence': evidence,
+        })
+
     return {
         'job': 'aa-passive-discovery',
         'type': 'passive',
         'targets': allowed,
         'discovered': sorted(filtered),
+        'assets': assets,
         'status': 'ok' if filtered else 'no_new_assets',
+        'source_count': len({source for item in assets for source in item.get('sources', [])}),
     }
 
 

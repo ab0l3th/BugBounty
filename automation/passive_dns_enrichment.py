@@ -75,6 +75,13 @@ def dns_google_candidates(domain: str) -> Set[str]:
     return found
 
 
+def source_urls(domain: str) -> Dict[str, str]:
+    return {
+        'crt.sh': f'https://crt.sh/?q=%25.{domain}&output=json',
+        'dns.google': f'https://dns.google/resolve?name={domain}&type=A',
+    }
+
+
 def candidate_sources(domain: str) -> Dict[str, Set[str]]:
     sources: Dict[str, Set[str]] = {
         'crt.sh': crt_sh_candidates(domain),
@@ -112,12 +119,19 @@ def passive_dns_enrichment(program_name: str) -> Dict[str, object]:
     assets = []
     for host in discovered:
         sources = sorted(seen.get(host, set()))
+        evidence = []
+        for source in sources:
+            evidence.append({
+                'source': source,
+                'url': source_urls(host).get(source, ''),
+            })
         assets.append({
             'domain': host,
             'status': 'in_scope',
             'source': ', '.join(sources),
             'sources': sources,
             'source_count': len(sources),
+            'evidence': evidence,
         })
 
     return {

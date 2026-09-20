@@ -147,6 +147,21 @@ def index():
         ul { margin: 10px 0 0 20px; }
         code { background: #0b1120; border-radius: 4px; padding: 2px 6px; }
         a { color: #7dd3fc; }
+        .evidence-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+        .evidence-item { background: #111827; border: 1px solid #334155; border-radius: 6px; padding: 6px 8px; }
+        .evidence-item a { text-decoration: none; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { text-align: left; vertical-align: top; padding: 8px; border-bottom: 1px solid #334155; }
+        @media (max-width: 640px) {
+          body { padding: 16px; }
+          .summary-row { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
+          .pill strong { font-size: 22px; }
+          .job { padding: 12px; }
+          table, thead, tbody, th, td, tr { display: block; }
+          thead { display: none; }
+          tr { margin-bottom: 10px; border-bottom: 1px solid #334155; padding-bottom: 8px; }
+          td { border-bottom: none; padding: 6px 0; }
+        }
       </style>
     </head>
     <body>
@@ -195,7 +210,17 @@ def index():
                   {% for asset in job.assets %}
                     <tr>
                       <td><code>{{ asset.domain }}</code></td>
-                      <td>{{ asset.source or asset.sources|join(', ') }}</td>
+                      <td>
+                        {% if asset.evidence %}
+                          <div class="evidence-list">
+                            {% for item in asset.evidence %}
+                              <span class="evidence-item"><a href="{{ item.url }}" target="_blank" rel="noopener">{{ item.source }}</a></span>
+                            {% endfor %}
+                          </div>
+                        {% else %}
+                          {{ asset.source or asset.sources|join(', ') }}
+                        {% endif %}
+                      </td>
                       <td>{{ asset.status }}</td>
                     </tr>
                   {% else %}
