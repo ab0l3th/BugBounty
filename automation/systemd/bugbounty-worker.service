@@ -6,9 +6,9 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/home/ab0l3th/BugBounty
-ExecStart=/home/ab0l3th/BugBounty/.venv/bin/python3 /home/ab0l3th/BugBounty/automation/runner.py
 User=ab0l3th
 Group=ab0l3th
+ExecStart=/bin/bash -lc 'cd /home/ab0l3th/BugBounty && git fetch --all --prune && git reset --hard origin/main && git clean -fd && /home/ab0l3th/BugBounty/.venv/bin/python3 /home/ab0l3th/BugBounty/automation/runner.py'
 
 [Install]
 WantedBy=multi-user.target

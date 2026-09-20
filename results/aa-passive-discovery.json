@@ -1,5 +1,6 @@
 {
-  "job": "aa-passive-discovery",
+  "job": "american-airlines-passive-dns",
+  "program": "american-airlines",
   "type": "passive",
   "targets": [
     "*.aa.com",
@@ -22,8 +23,18 @@
   "skipped": [],
   "status": "ok",
   "discovered": [
-    "aavacations.com",
-    "cloud.aa.com",
-    "maverick.aa.com"
-  ]
+    "aavacations.com"
+  ],
+  "assets": [
+    {
+      "domain": "aavacations.com",
+      "status": "in_scope",
+      "source": "dns.google",
+      "sources": [
+        "dns.google"
+      ],
+      "source_count": 1
+    }
+  ],
+  "source_count": 1
 }

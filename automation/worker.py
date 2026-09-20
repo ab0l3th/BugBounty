@@ -54,12 +54,15 @@ def load_job(path: Path) -> dict:
 def run_passive_job(job: dict, allowed_scope: list[str]) -> dict:
     result = {
         'job': job.get('name'),
+        'program': job.get('program', DEFAULT_PROGRAM),
         'type': job.get('type', 'passive'),
         'targets': [],
         'queued': [],
         'skipped': [],
         'status': 'ok',
         'discovered': [],
+        'assets': [],
+        'source_count': 0,
     }
     for target in job.get('targets', []):
         if is_in_scope(target, allowed_scope):
@@ -72,10 +75,17 @@ def run_passive_job(job: dict, allowed_scope: list[str]) -> dict:
         result['status'] = 'no_in_scope_targets'
         return result
 
-    from passive_discovery import build_job_output
-    passive = build_job_output()
-    result['discovered'] = passive.get('discovered', [])
-    result['status'] = passive.get('status', 'ok')
+    from passive_dns_enrichment import passive_dns_enrichment
+    passive = passive_dns_enrichment(job.get('program', DEFAULT_PROGRAM))
+    result.update({
+        'job': passive.get('job', result['job']),
+        'program': passive.get('program', result['program']),
+        'targets': passive.get('targets', result['targets']),
+        'discovered': passive.get('discovered', []),
+        'assets': passive.get('assets', []),
+        'status': passive.get('status', 'ok'),
+        'source_count': passive.get('source_count', 0),
+    })
     return result
 
 

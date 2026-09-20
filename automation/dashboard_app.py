@@ -27,20 +27,27 @@ def list_jobs() -> List[Dict[str, Any]]:
         return jobs
 
     for path in sorted(RESULTS_DIR.glob('*.json')):
-        if path.name.startswith('.'): 
+        if path.name.startswith('.'):
             continue
         payload = read_result_file(path)
         if not payload:
             continue
+        assets = payload.get('assets') or [
+            {'domain': host, 'status': 'in_scope', 'sources': [], 'source': ''}
+            for host in payload.get('discovered', [])
+        ]
         jobs.append({
             'name': payload.get('job', path.stem),
             'path': path.name,
             'status': payload.get('status', 'unknown'),
             'type': payload.get('type', 'unknown'),
+            'program': payload.get('program', 'unknown'),
             'discovered': payload.get('discovered', []),
+            'assets': assets,
             'targets': payload.get('targets', []),
             'queued': payload.get('queued', []),
             'skipped': payload.get('skipped', []),
+            'source_count': payload.get('source_count', 0),
             'raw': payload,
         })
     return jobs
@@ -79,23 +86,41 @@ def index():
             <div class="job">
               <h2>{{ job.name }}</h2>
               <div class="status {{ 'ok' if job.status == 'ok' else 'warn' if job.status == 'no_new_assets' else 'bad' }}">{{ job.status }}</div>
+              <p><strong>Program:</strong> {{ job.program }}</p>
               <p><strong>Type:</strong> {{ job.type }}</p>
+              <p><strong>Source count:</strong> {{ job.source_count }}</p>
               <p><strong>Targets:</strong> {{ job.targets|length }}</p>
               <p><strong>Discovered:</strong> {{ job.discovered|length }}</p>
+
+              <h3>Discovered assets</h3>
+              <table style="width:100%; border-collapse: collapse; margin-top: 10px;">
+                <thead>
+                  <tr>
+                    <th align="left">Domain</th>
+                    <th align="left">Source</th>
+                    <th align="left">Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for asset in job.assets %}
+                    <tr>
+                      <td><code>{{ asset.domain }}</code></td>
+                      <td>{{ asset.source or asset.sources|join(', ') }}</td>
+                      <td>{{ asset.status }}</td>
+                    </tr>
+                  {% else %}
+                    <tr><td colspan="3">No newly discovered assets.</td></tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+
               <h3>In-scope targets</h3>
               <ul>
                 {% for item in job.targets %}
                   <li><code>{{ item }}</code></li>
                 {% endfor %}
               </ul>
-              <h3>Discovered assets</h3>
-              <ul>
-                {% for item in job.discovered %}
-                  <li><code>{{ item }}</code></li>
-                {% else %}
-                  <li>No newly discovered assets.</li>
-                {% endfor %}
-              </ul>
+
               <h3>Queued</h3>
               <ul>
                 {% for item in job.queued %}
