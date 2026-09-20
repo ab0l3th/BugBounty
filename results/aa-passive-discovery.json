@@ -1,5 +1,5 @@
 {
-  "job": "american-airlines-passive-dns",
+  "job": "aa-passive-discovery",
   "program": "american-airlines",
   "type": "passive",
   "targets": [
@@ -36,5 +36,7 @@
       "source_count": 1
     }
   ],
-  "source_count": 1
+  "source_count": 1,
+  "enrichment_job": "american-airlines-passive-dns",
+  "enrichment_program": "american-airlines"
 }

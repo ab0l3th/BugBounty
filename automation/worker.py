@@ -78,8 +78,8 @@ def run_passive_job(job: dict, allowed_scope: list[str]) -> dict:
     from passive_dns_enrichment import passive_dns_enrichment
     passive = passive_dns_enrichment(job.get('program', DEFAULT_PROGRAM))
     result.update({
-        'job': passive.get('job', result['job']),
-        'program': passive.get('program', result['program']),
+        'enrichment_job': passive.get('job', result['job']),
+        'enrichment_program': passive.get('program', result['program']),
         'targets': passive.get('targets', result['targets']),
         'discovered': passive.get('discovered', []),
         'assets': passive.get('assets', []),
