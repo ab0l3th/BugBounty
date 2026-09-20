@@ -1,0 +1,14 @@
+[Unit]
+Description=BugBounty Passive Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/ab0l3th/BugBounty
+ExecStart=/home/ab0l3th/BugBounty/.venv/bin/python3 /home/ab0l3th/BugBounty/automation/runner.py
+User=ab0l3th
+Group=ab0l3th
+
+[Install]
+WantedBy=multi-user.target

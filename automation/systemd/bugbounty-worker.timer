@@ -1,0 +1,11 @@
+[Unit]
+Description=Run BugBounty worker on a fixed interval
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Unit=bugbounty-worker.service
+
+[Install]
+WantedBy=timers.target
