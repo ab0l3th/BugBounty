@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from scope_validator import is_in_scope, load_scope
+from scope_validator import is_in_scope, parse_scope_pattern
 
 ROOT = Path(__file__).resolve().parent.parent
 JOBS_DIR = ROOT / 'jobs'
@@ -18,7 +18,9 @@ def read_scope_file() -> list[str]:
         for line in SCOPE_FILE.read_text(encoding='utf-8').splitlines():
             value = line.strip()
             if value.startswith('- '):
-                patterns.append(value[2:].strip().strip("'\""))
+                pattern = parse_scope_pattern(value[2:].strip())
+                if pattern:
+                    patterns.append(pattern)
     return patterns
 
 
@@ -29,8 +31,6 @@ def discover_jobs() -> list[Path]:
 
 
 def load_job(path: Path) -> dict:
-    # A simple YAML-like parser for the repo's current schema; keep this minimal and explicit.
-    # In a later step this should be replaced with PyYAML.
     data = {'name': path.stem, 'targets': [], 'type': 'passive'}
     for line in path.read_text(encoding='utf-8').splitlines():
         clean = line.strip()
@@ -55,6 +55,7 @@ def run_passive_job(job: dict, allowed_scope: list[str]) -> dict:
         'queued': [],
         'skipped': [],
         'status': 'ok',
+        'discovered': [],
     }
     for target in job.get('targets', []):
         if is_in_scope(target, allowed_scope):
@@ -62,8 +63,15 @@ def run_passive_job(job: dict, allowed_scope: list[str]) -> dict:
             result['queued'].append(target)
         else:
             result['skipped'].append(target)
+
     if not result['queued']:
         result['status'] = 'no_in_scope_targets'
+        return result
+
+    from passive_discovery import build_job_output
+    passive = build_job_output()
+    result['discovered'] = passive.get('discovered', [])
+    result['status'] = passive.get('status', 'ok')
     return result
 
 

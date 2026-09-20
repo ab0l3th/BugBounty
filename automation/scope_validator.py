@@ -1,11 +1,49 @@
 from __future__ import annotations
 
 import fnmatch
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 
 def normalize_domain(domain: str) -> str:
     return domain.strip().strip("'\"").lower().rstrip('.')
+
+
+def parse_scope_pattern(value: str) -> Optional[str]:
+    """Accept only domain-like entries from the scope file and ignore prose."""
+    candidate = normalize_domain(value)
+    if not candidate:
+        return None
+
+    if candidate.startswith('*.'):
+        suffix = candidate[2:]
+    elif candidate.startswith('*'):
+        suffix = candidate[1:]
+    else:
+        suffix = candidate
+
+    if not suffix or '.' not in suffix:
+        return None
+    if suffix.startswith('.') or suffix.endswith('.'):
+        return None
+    if any(ch in suffix for ch in (' ', '/', '\\', ':', '@', '?', '#')):
+        return None
+    if '*' in suffix:
+        return None
+
+    labels = suffix.split('.')
+    if len(labels) < 2:
+        return None
+    for label in labels:
+        if not label or label.startswith('-') or label.endswith('-'):
+            return None
+        if any(ch not in 'abcdefghijklmnopqrstuvwxyz0123456789-' for ch in label):
+            return None
+
+    if value.startswith('*.'):
+        return f'*.{suffix}'
+    if value.startswith('*'):
+        return suffix
+    return suffix
 
 
 def is_in_scope(candidate: str, allowed_patterns: Iterable[str]) -> bool:
@@ -28,7 +66,9 @@ def load_scope(scope_file: List[str]) -> List[str]:
     for line in scope_file:
         value = line.strip()
         if value and not value.startswith('#'):
-            scope.append(value)
+            parsed = parse_scope_pattern(value)
+            if parsed:
+                scope.append(parsed)
     return scope
 
 

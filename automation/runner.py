@@ -26,6 +26,10 @@ def run_worker() -> dict:
     if result.returncode != 0:
         raise RuntimeError(combined or 'Worker failed without output.')
     payload = json.loads(combined)
+    if isinstance(payload, list):
+        if payload:
+            return payload[0]
+        raise RuntimeError('Worker returned empty payload list.')
     return payload
 
 

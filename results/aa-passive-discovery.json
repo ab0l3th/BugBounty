@@ -20,5 +20,10 @@
     "aavacations.com"
   ],
   "skipped": [],
-  "status": "ok"
+  "status": "ok",
+  "discovered": [
+    "aavacations.com",
+    "cloud.aa.com",
+    "maverick.aa.com"
+  ]
 }
