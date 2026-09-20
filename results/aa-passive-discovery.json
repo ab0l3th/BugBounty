@@ -1,0 +1,24 @@
+{
+  "job": "aa-passive-discovery",
+  "type": "passive",
+  "targets": [
+    "*.aa.com",
+    "*.psaairlines.com",
+    "*.envoyair.com",
+    "*.piedmont-airlines.com",
+    "*.cloud.aa.com",
+    "*.maverick.aa.com",
+    "aavacations.com"
+  ],
+  "queued": [
+    "*.aa.com",
+    "*.psaairlines.com",
+    "*.envoyair.com",
+    "*.piedmont-airlines.com",
+    "*.cloud.aa.com",
+    "*.maverick.aa.com",
+    "aavacations.com"
+  ],
+  "skipped": [],
+  "status": "ok"
+}

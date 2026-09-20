@@ -44,8 +44,19 @@ This repository is designed to support authorized bug bounty and security testin
 1. Validate scope and approvals.
 2. Add a new folder under `programs/` for the program.
 3. Record allowed targets, rules, and exclusions.
-4. Add automation jobs in `automation/` only after scope is confirmed.
+4. Add automation jobs in `jobs/` only after scope is confirmed.
 5. Maintain clean evidence and clear reporting paths.
+
+## Automation workflow
+
+The project includes a basic passive recon worker that:
+
+- reads approved jobs from `jobs/`
+- validates targets against the in-scope asset list
+- skips out-of-scope targets
+- writes a sanitized result record under `results/`
+
+This workflow is intentionally limited to passive reconnaissance and scope enforcement. No active exploitation or service degradation is allowed.
 
 ## Initial status
 

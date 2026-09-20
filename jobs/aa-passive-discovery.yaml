@@ -1,0 +1,10 @@
+name: aa-passive-discovery
+type: passive
+targets:
+  - '*.aa.com'
+  - '*.psaairlines.com'
+  - '*.envoyair.com'
+  - '*.piedmont-airlines.com'
+  - '*.cloud.aa.com'
+  - '*.maverick.aa.com'
+  - 'aavacations.com'
