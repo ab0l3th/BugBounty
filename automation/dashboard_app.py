@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 from typing import Any, Dict, List
@@ -129,4 +130,8 @@ def api_jobs():
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8000, debug=False)
+    parser = argparse.ArgumentParser(description='BugBounty LAN dashboard')
+    parser.add_argument('--port', type=int, default=8001, help='Port to bind for the local LAN UI')
+    parser.add_argument('--host', default='0.0.0.0', help='Host interface to bind')
+    args = parser.parse_args()
+    app.run(host=args.host, port=args.port, debug=False)

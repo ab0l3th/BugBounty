@@ -8,7 +8,7 @@ Type=simple
 WorkingDirectory=/home/ab0l3th/BugBounty
 User=ab0l3th
 Group=ab0l3th
-ExecStart=/home/ab0l3th/BugBounty/.venv/bin/gunicorn --bind 0.0.0.0:8000 automation.dashboard_app:app
+ExecStart=/home/ab0l3th/BugBounty/.venv/bin/gunicorn --bind 0.0.0.0:8001 automation.dashboard_app:app
 Restart=always
 RestartSec=10
 
