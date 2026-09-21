@@ -1,8 +1,0 @@
-identifier,asset_type,instruction,eligible_for_bounty,eligible_for_submission,availability_requirement,confidentiality_requirement,integrity_requirement,max_severity,system_tags,created_at,updated_at
-*.aa.com,WILDCARD,Please note we can only accept submissions on domains and subdomains explicitly owned by American Airlines. ,false,true,,,,critical,,2019-10-08 18:36:49 UTC,2023-05-15 16:34:17 UTC
-*.psaairlines.com,WILDCARD,"",false,true,,,,critical,,2022-06-06 16:29:06 UTC,2023-05-15 16:38:50 UTC
-*.envoyair.com,WILDCARD,"",false,true,,,,critical,,2022-06-06 16:30:25 UTC,2023-05-15 16:38:50 UTC
-*.piedmont-airlines.com,WILDCARD,"",false,true,,,,critical,,2022-06-06 16:31:37 UTC,2023-05-15 16:38:50 UTC
-*.cloud.aa.com,WILDCARD,,false,true,,,,critical,,2024-04-01 16:44:47 UTC,2024-04-01 16:44:47 UTC
-*.maverick.aa.com,WILDCARD,,false,true,,,,critical,,2024-04-01 16:46:04 UTC,2024-04-01 16:46:04 UTC
-*aavacations.com,WILDCARD,,false,true,,,,critical,,2025-10-09 17:53:26 UTC,2025-10-09 17:53:26 UTC
