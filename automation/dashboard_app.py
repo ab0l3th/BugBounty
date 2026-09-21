@@ -57,10 +57,8 @@ def job_title_label(value: str) -> str:
     text = (value or '').lower().replace('_', '-')
     if 'github' in text and 'monitor' in text:
         return 'GitHub Monitor'
-    if 'passive-dns' in text or ('dns' in text and 'passive' in text):
+    if 'passive' in text and ('dns' in text or 'discovery' in text):
         return 'Passive DNS Discovery'
-    if 'passive-discovery' in text or ('passive' in text and 'discovery' in text):
-        return 'Passive Discovery'
     if 'github' in text:
         return 'GitHub Monitor'
     if 'dns' in text:
@@ -74,6 +72,22 @@ def group_jobs_by_program(jobs: List[Dict[str, Any]]) -> Dict[str, List[Dict[str
         program = job.get('program', 'unknown')
         grouped.setdefault(program, []).append(job)
     return dict(sorted(grouped.items(), key=lambda item: program_label(item[0])))
+
+
+def summarize_program_jobs(jobs: List[Dict[str, Any]]) -> Dict[str, int]:
+    summary = {'jobs': 0, 'targets': 0, 'discovered': 0, 'passive_dns_jobs': 0, 'completed': 0, 'running': 0}
+    for job in jobs:
+        summary['jobs'] += 1
+        summary['targets'] += len(job.get('targets', []) or [])
+        summary['discovered'] += len(job.get('discovered', []) or [])
+        state = (job.get('job_state') or '').lower()
+        if state == 'completed':
+            summary['completed'] += 1
+        elif state == 'running':
+            summary['running'] += 1
+        if 'passive dns discovery' in job_title_label(job.get('name', '')).lower():
+            summary['passive_dns_jobs'] += 1
+    return summary
 
 
 def read_result_file(path: Path) -> Dict[str, Any]:
@@ -251,6 +265,9 @@ def index():
         .pill strong { display: block; font-size: 28px; margin-top: 8px; }
         .program-group { margin-bottom: 24px; }
         .program-header { margin: 0 0 12px; font-size: 28px; }
+        .program-summary-card { background: #0f172a; border: 1px solid #334155; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+        .program-summary-card h3 { margin: 0 0 6px; font-size: 18px; }
+        .program-summary-card .meta { color: #cbd5e1; font-size: 14px; }
         .job { margin-bottom: 18px; padding: 0; background: #0f172a; border-left: 4px solid #38bdf8; border-radius: 8px; overflow: hidden; }
         summary { list-style: none; cursor: pointer; padding: 16px; display: block; }
         summary::-webkit-details-marker { display: none; }
@@ -310,8 +327,15 @@ def index():
         </div>
         {% if jobs %}
           {% for program_name, program_jobs in grouped_jobs.items() %}
+            {% set program_summary = summarize_program_jobs(program_jobs) %}
             <div class="program-group">
               <h2 class="program-header">{{ program_label(program_name) }}</h2>
+              {% if program_summary.passive_dns_jobs %}
+                <div class="program-summary-card">
+                  <h3>Passive DNS</h3>
+                  <div class="meta">{{ program_summary.passive_dns_jobs }} jobs &nbsp; | &nbsp; Targets: {{ program_summary.targets }} &nbsp; | &nbsp; Discovered: {{ program_summary.discovered }} &nbsp; | &nbsp; {{ program_summary.completed }}/{{ program_summary.passive_dns_jobs }} complete</div>
+                </div>
+              {% endif %}
               {% for job in program_jobs %}
                 <details class="job">
                   <summary>
@@ -398,7 +422,7 @@ def index():
       </div>
     </body>
     </html>
-    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, program_label=program_label, job_title_label=job_title_label)
+    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs)
 
 
 @app.route('/api/jobs')

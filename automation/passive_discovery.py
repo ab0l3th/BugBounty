@@ -68,24 +68,21 @@ def filter_scope(domains: Iterable[str], allowed_patterns: Iterable[str]) -> Lis
 
 def public_sources_for(domain: str) -> List[str]:
     return [
-        f'https://crt.sh/?q=%25.{domain}&output=json',
         f'https://api.certspotter.com/v1/issuances?domain={domain}&include_subdomains=true&expand=dns_names',
         f'https://api.hackertarget.com/hostsearch/?q={domain}',
-        f'https://www.google.com/search?q=site%3A{domain}',
+        f'https://crt.sh/?q=%25.{domain}&output=json',
         f'https://dns.google/resolve?name={domain}&type=A',
     ]
 
 
 def source_label_for(url: str) -> str:
     lowered = url.lower()
-    if 'crt.sh' in lowered:
-        return 'crt.sh'
     if 'certspotter' in lowered:
         return 'certspotter'
     if 'hackertarget' in lowered:
         return 'hackertarget'
-    if 'google' in lowered and 'search' in lowered:
-        return 'google-search'
+    if 'crt.sh' in lowered:
+        return 'crt.sh'
     if 'dns.google' in lowered:
         return 'dns.google'
     if 'https://' in lowered:
