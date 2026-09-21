@@ -23,6 +23,7 @@ WORKFLOW_SEQUENCE = {
     'aa-passive-discovery': {'step': 1, 'depends_on': []},
     'american-airlines-passive-dns': {'step': 2, 'depends_on': ['aa-passive-discovery']},
     'confirm-live-web-assets': {'step': 3, 'depends_on': ['aa-passive-discovery', 'american-airlines-passive-dns']},
+    'service-enumeration-live-hosts': {'step': 4, 'depends_on': ['confirm-live-web-assets']},
 }
 
 
@@ -326,6 +327,126 @@ def _probe_live_web_assets(hosts: list[str], *, use_external_tools: bool = False
     }
 
 
+def _service_enumeration_candidates(host: str) -> list[str]:
+    host = host.strip().strip('.')
+    if not host:
+        return []
+    ports = [80, 443, 8080, 8443, 8000, 5000]
+    urls: list[str] = []
+    for port in ports:
+        if port in {80, 443}:
+            scheme = 'https' if port == 443 else 'http'
+            urls.append(f'{scheme}://{host}')
+            continue
+        urls.append(f'http://{host}:{port}')
+        urls.append(f'https://{host}:{port}')
+    return list(dict.fromkeys(urls))
+
+
+def _classify_service(host: str, probe_rows: list[dict]) -> str:
+    host_lower = host.lower()
+    if 'api' in host_lower or any('api' in str(row.get('url', '')).lower() for row in probe_rows):
+        return 'api-gateway'
+    if any('admin' in str(row.get('url', '')).lower() or 'login' in str(row.get('url', '')).lower() for row in probe_rows):
+        return 'app-server'
+    if any('cloudfront' in str(row.get('server', '')).lower() or 'nginx' in str(row.get('server', '')).lower() or 'envoy' in str(row.get('server', '')).lower() or 'haproxy' in str(row.get('server', '')).lower() for row in probe_rows):
+        return 'reverse-proxy'
+    return 'static-site'
+
+
+def _enumerate_live_services(hosts: list[str], *, use_external_tools: bool = False) -> dict:
+    deduped_hosts = sorted(set(hosts))
+    results: list[dict] = []
+    probe_log: list[dict] = []
+    thread_status: list[dict] = []
+    max_workers = min(8, max(1, len(deduped_hosts)))
+
+    def enumerate_host(host: str) -> dict:
+        thread_name = threading.current_thread().name
+        rows: list[dict] = []
+        for url in _service_enumeration_candidates(host):
+            attempt = {
+                'thread_id': thread_name,
+                'host': host,
+                'url': url,
+                'status': 'checking',
+                'timestamp': time.time(),
+            }
+            probe_log.append(attempt)
+            try:
+                req = urllib_request.Request(url, headers={'User-Agent': 'BugBountyPassiveRecon/1.0'}, method='GET')
+                with urllib_request.urlopen(req, timeout=8) as resp:
+                    code = getattr(resp, 'status', resp.getcode())
+                    headers = getattr(resp, 'headers', {})
+                    server = headers.get('Server', '') if hasattr(headers, 'get') else ''
+                    attempt['status'] = 'open'
+                    attempt['status_code'] = code
+                    attempt['server'] = str(server)
+                    rows.append({
+                        'url': url,
+                        'port': 443 if url.startswith('https://') and url.count(':') == 5 else 80,
+                        'status_code': code,
+                        'server': str(server),
+                        'service_type': 'http'
+                    })
+            except Exception as exc:
+                attempt['status'] = 'closed'
+                attempt['error'] = str(exc)
+
+        if use_external_tools and _command_exists('nmap'):
+            try:
+                result = subprocess.run(['nmap', '-Pn', '--top-ports', '20', '-T', 'polite', '-sV', host], capture_output=True, text=True, timeout=20)
+                if result.stdout.strip():
+                    probe_log.append({
+                        'thread_id': thread_name,
+                        'host': host,
+                        'status': 'nmap',
+                        'tool': 'nmap',
+                        'stdout': result.stdout.strip(),
+                        'timestamp': time.time(),
+                    })
+            except (FileNotFoundError, subprocess.SubprocessError, ValueError):
+                pass
+
+        open_ports = sorted({row['port'] for row in rows})
+        classification = _classify_service(host, rows)
+        service_record = {
+            'domain': host,
+            'status': 'enumerated',
+            'kind': classification,
+            'ports': open_ports,
+            'alternate_hosts': [],
+            'evidence': rows,
+        }
+        results.append(service_record)
+        thread_status.append({
+            'thread_id': thread_name,
+            'host': host,
+            'status': 'enumerated',
+            'kind': classification,
+            'ports': open_ports,
+            'timestamp': time.time(),
+        })
+        return service_record
+
+    if not deduped_hosts:
+        return {'discovered': [], 'services': [], 'probe_log': [], 'thread_status': [], 'assets': []}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(enumerate_host, host) for host in deduped_hosts]
+        for future in as_completed(futures):
+            future.result()
+
+    return {
+        'discovered': [row['domain'] for row in results],
+        'services': results,
+        'probe_log': probe_log,
+        'thread_status': thread_status,
+        'assets': results,
+        'threads': max_workers,
+    }
+
+
 def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: bool = False) -> dict:
     job_name = (job.get('name') or '').strip()
     job_type = (job.get('type', 'passive') or 'passive').lower()
@@ -409,6 +530,52 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             response['probe_log'] = probe_result.get('probe_log', [])
             response['thread_status'] = probe_result.get('thread_status', [])
             response['probe_threads'] = probe_result.get('threads', 0)
+        return response
+
+    if job_name == 'service-enumeration-live-hosts':
+        live_assets_path = RESULTS_DIR / 'confirm-live-web-assets.json'
+        if not live_assets_path.exists():
+            return {
+                'job': job_name,
+                'program': job.get('program', DEFAULT_PROGRAM),
+                'type': 'passive',
+                'targets': [],
+                'queued': [],
+                'skipped': [],
+                'status': 'waiting_on_dependencies',
+                'job_state': 'waiting_on_dependencies',
+                'discovered': [],
+                'assets': [],
+                'source_count': 0,
+                'dependencies': ['confirm-live-web-assets'],
+            }
+
+        try:
+            payload = json.loads(live_assets_path.read_text(encoding='utf-8'))
+        except Exception:
+            payload = {}
+        live_hosts = payload.get('discovered', []) or payload.get('targets', []) or payload.get('assets', [])
+        if isinstance(live_hosts, list) and live_hosts and isinstance(live_hosts[0], dict):
+            live_hosts = [row.get('domain') for row in live_hosts if isinstance(row, dict) and row.get('domain')]
+        deduped_hosts = sorted({host for host in live_hosts if isinstance(host, str) and host.strip()})
+        enum_result = _enumerate_live_services(deduped_hosts, use_external_tools=use_external_tools)
+        assets = enum_result.get('assets', [])
+        response = {
+            'job': job_name,
+            'program': job.get('program', DEFAULT_PROGRAM),
+            'type': 'passive',
+            'targets': deduped_hosts,
+            'queued': deduped_hosts,
+            'skipped': [],
+            'status': 'ok' if assets else 'no_new_assets',
+            'discovered': [row.get('domain') for row in assets],
+            'assets': assets,
+            'source_count': sum(len(asset.get('ports', [])) for asset in assets),
+            'depends_on': ['confirm-live-web-assets'],
+        }
+        response['probe_log'] = enum_result.get('probe_log', [])
+        response['thread_status'] = enum_result.get('thread_status', [])
+        response['probe_threads'] = enum_result.get('threads', 0)
         return response
 
     result = {

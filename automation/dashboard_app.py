@@ -37,6 +37,11 @@ WORKFLOW_SEQUENCE = {
         'label': 'Confirm Live Web Assets',
         'depends_on': ['aa-passive-discovery', 'american-airlines-passive-dns'],
     },
+    'service-enumeration-live-hosts': {
+        'step': 4,
+        'label': 'Service Enumeration',
+        'depends_on': ['confirm-live-web-assets'],
+    },
 }
 
 
@@ -93,6 +98,8 @@ def job_title_label(value: str) -> str:
         return 'GitHub Monitor'
     if 'confirm-live-web-assets' in text or ('live' in text and 'web' in text and 'assets' in text):
         return 'Confirm Live Web Assets'
+    if 'service' in text and 'enumeration' in text:
+        return 'Service Enumeration'
     if 'aa-passive-discovery' in text:
         return 'Passive Web Discovery'
     if 'passive-dns' in text or ('passive' in text and 'dns' in text and 'discovery' not in text):
@@ -378,7 +385,7 @@ def index():
     jobs = list_jobs()
     summary = summarize_jobs(jobs)
     grouped_jobs = group_jobs_by_program(jobs)
-    workflow_order = [job_workflow_metadata(job_name) for job_name in ['aa-passive-discovery', 'american-airlines-passive-dns', 'confirm-live-web-assets']]
+    workflow_order = [job_workflow_metadata(job_name) for job_name in ['aa-passive-discovery', 'american-airlines-passive-dns', 'confirm-live-web-assets', 'service-enumeration-live-hosts']]
     return render_template_string('''
     <!doctype html>
     <html lang="en">

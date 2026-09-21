@@ -98,15 +98,22 @@ This sequence is intentionally ordered and must be followed in order:
    - Goal: reduce the list from "all discovered domains" to "real web apps worth testing"
    - Important: this step must not run before steps 1 and 2 because it depends on the host/service data produced by those steps.
 
-4. Run vhost discovery only when there is evidence of shared infrastructure.
+4. Enumerate services on the live hosts.
+   - For every host that responds, run a port and service check to see what is exposed.
+   - Identify whether the asset is a plain static site, a reverse proxy, an API gateway, or a true application server.
+   - Look for alternate hosts, admin endpoints, login surfaces, and exposed management interfaces.
+   - This is higher value than broad directory scanning because it answers what the app actually is before brute-forcing paths.
+
+5. Run vhost discovery only when there is evidence of shared infrastructure.
    - Use vhost checks when multiple apps share the same IP, or when a proxy/CDN is likely fronting the application.
    - Skip vhost fuzzing for simple single-app domains unless evidence suggests it is necessary.
+   - This is the "maybe" stage, not the default first move.
 
-5. Run targeted directory and file enumeration only on the confirmed live targets.
+6. Run targeted directory and file enumeration only on the confirmed live targets.
    - Focus on actual app roots rather than broad, noisy scans across every discovered domain.
    - Prioritize likely application paths such as `/admin`, `/login`, `/api`, `/docs`, `/health`, `/backup`, `/config`, and similar known app locations.
 
-6. Move into application testing only after the live targets and reachable app surface are known.
+7. Move into application testing only after the live targets and reachable app surface are known.
    - Test authentication flows, exposed APIs, admin panels, and likely misconfigurations.
    - Keep testing minimal, scoped, and aligned with the approved rules.
 

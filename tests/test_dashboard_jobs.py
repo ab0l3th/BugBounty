@@ -102,6 +102,14 @@ class DashboardJobMetadataTest(unittest.TestCase):
         self.assertEqual(live_assets_job['depends_on'], ['aa-passive-discovery', 'american-airlines-passive-dns'])
         self.assertEqual(job_title_label('confirm-live-web-assets'), 'Confirm Live Web Assets')
 
+    def test_dashboard_detects_service_enumeration_step_and_title(self):
+        jobs = list_jobs()
+        service_job = next((job for job in jobs if job['name'] == 'service-enumeration-live-hosts'), None)
+        self.assertIsNotNone(service_job)
+        self.assertEqual(service_job['workflow_step'], 4)
+        self.assertEqual(service_job['depends_on'], ['confirm-live-web-assets'])
+        self.assertEqual(job_title_label('service-enumeration-live-hosts'), 'Service Enumeration')
+
     def test_confirm_live_web_assets_uses_merged_step1_and_step2_targets(self):
         from worker import run_passive_job
 
