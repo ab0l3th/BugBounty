@@ -2,11 +2,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = ROOT / 'results'
@@ -178,6 +183,50 @@ def list_jobs() -> List[Dict[str, Any]]:
             'raw': payload,
         })
     return sorted(jobs, key=lambda item: item['name'])
+
+
+def verify_github_signature(payload: bytes, signature: str | None, secret: str) -> bool:
+    if not secret or not signature or not signature.startswith('sha256='):
+        return False
+    expected = 'sha256=' + hmac.new(secret.encode('utf-8'), payload, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(signature, expected)
+
+
+def trigger_repo_sync_on_push() -> None:
+    commands = [
+        ['git', 'fetch', '--all', '--prune'],
+        ['git', 'reset', '--hard', 'origin/main'],
+        ['git', 'clean', '-fd'],
+        [sys.executable, str(ROOT / 'automation' / 'runner.py')],
+    ]
+    for command in commands:
+        subprocess.run(command, cwd=str(ROOT), check=True)
+
+
+@app.route('/webhook/github', methods=['POST'])
+def github_webhook():
+    raw = request.get_data(cache=True, as_text=False)
+    signature = request.headers.get('X-Hub-Signature-256', '')
+    secret = os.environ.get('BUGBOUNTY_GITHUB_WEBHOOK_SECRET', '').strip()
+    if not secret:
+        return jsonify({'status': 'error', 'message': 'missing webhook secret'}), 500
+    if not verify_github_signature(raw, signature, secret):
+        return jsonify({'status': 'error', 'message': 'invalid signature'}), 401
+
+    event = request.headers.get('X-GitHub-Event', '')
+    payload = request.get_json(silent=True) or {}
+    ref = payload.get('ref', '')
+    if event != 'push':
+        return jsonify({'status': 'ignored', 'event': event}), 202
+    if ref != 'refs/heads/main':
+        return jsonify({'status': 'ignored', 'ref': ref}), 202
+
+    try:
+        trigger_repo_sync_on_push()
+    except subprocess.CalledProcessError as exc:
+        return jsonify({'status': 'error', 'message': 'repo sync failed', 'returncode': exc.returncode}), 500
+
+    return jsonify({'status': 'ok', 'event': event, 'ref': ref}), 200
 
 
 @app.route('/')
