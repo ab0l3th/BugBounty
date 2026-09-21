@@ -134,15 +134,19 @@ def merged_live_asset_targets() -> List[str]:
 
 
 def live_web_asset_targets_from_step3() -> List[str]:
+    """Only the hosts Step 3 confirmed live, not the full candidate pool it was fed."""
     path = RESULTS_DIR / 'confirm-live-web-assets.json'
     if not path.exists():
         return []
     payload = read_result_file(path)
     if not payload:
         return []
+    live = list(payload.get('discovered', []) or [])
+    if not live:
+        live = [a.get('domain') for a in (payload.get('assets', []) or []) if isinstance(a, dict) and a.get('domain')]
     merged: List[str] = []
     seen: set[str] = set()
-    for item in (payload.get('discovered', []) or []) + (payload.get('targets', []) or []) + (payload.get('queued', []) or []):
+    for item in live:
         if item and item not in seen:
             seen.add(item)
             merged.append(item)
@@ -373,7 +377,7 @@ def rerun_job(job_name: str) -> Dict[str, Any]:
     RUNNING_DIR.mkdir(parents=True, exist_ok=True)
     (RUNNING_DIR / f'{job_name}.lock').write_text(str(int(time.time())), encoding='utf-8')
 
-    command = [sys.executable, str(ROOT / 'automation' / 'worker.py'), '--force']
+    command = [sys.executable, str(ROOT / 'automation' / 'worker.py'), '--force', '--job', job_name]
     if job_name in ACTIVE_JOBS:
         command.append('--allow-active')
     if program and program != 'unknown':

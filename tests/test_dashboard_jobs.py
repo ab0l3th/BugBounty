@@ -118,7 +118,8 @@ class DashboardJobMetadataTest(unittest.TestCase):
             'program': 'american-airlines',
             'status': 'ok',
             'discovered': ['host-001.example.com', 'host-002.example.com', 'host-001.example.com'],
-            'targets': ['host-001.example.com', 'host-002.example.com'],
+            'targets': ['host-001.example.com', 'host-002.example.com', 'cand-a.example.com', 'cand-b.example.com', 'cand-c.example.com'],
+            'queued': ['host-001.example.com', 'host-002.example.com', 'cand-a.example.com', 'cand-b.example.com', 'cand-c.example.com'],
             'assets': [
                 {'domain': 'host-001.example.com', 'status': 'live', 'source': 'http-probe', 'sources': ['http-probe']},
                 {'domain': 'host-002.example.com', 'status': 'live', 'source': 'http-probe', 'sources': ['http-probe']},
@@ -302,6 +303,19 @@ class DashboardJobMetadataTest(unittest.TestCase):
                 response = client.post('/jobs/aa-passive-discovery/rerun')
                 self.assertEqual(response.status_code, 401)
                 mock_popen.assert_not_called()
+
+    def test_rerun_launches_only_the_requested_job(self):
+        with patch('dashboard_app.subprocess.Popen', return_value=type('Proc', (), {'pid': 4321})()) as mock_popen, \
+             patch.dict('os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token'}):
+            with app.test_client() as client:
+                response = client.post('/jobs/service-enumeration-live-hosts/rerun', headers={'X-BugBounty-Token': 'test-token'})
+                self.assertEqual(response.status_code, 202)
+                launched_cmd = mock_popen.call_args[0][0]
+                self.assertIn('--job', launched_cmd)
+                self.assertEqual(launched_cmd[launched_cmd.index('--job') + 1], 'service-enumeration-live-hosts')
+                self.assertIn('--allow-active', launched_cmd)
+        (Path(__file__).resolve().parents[1] / 'results' / 'service-enumeration-live-hosts.json').unlink(missing_ok=True)
+        (Path(__file__).resolve().parents[1] / 'results' / '.running' / 'service-enumeration-live-hosts.lock').unlink(missing_ok=True)
 
 
 if __name__ == '__main__':

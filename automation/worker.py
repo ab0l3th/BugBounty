@@ -570,7 +570,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             payload = json.loads(live_assets_path.read_text(encoding='utf-8'))
         except Exception:
             payload = {}
-        live_hosts = payload.get('discovered', []) or payload.get('targets', []) or payload.get('assets', [])
+        live_hosts = payload.get('discovered', []) or payload.get('assets', [])
         if isinstance(live_hosts, list) and live_hosts and isinstance(live_hosts[0], dict):
             live_hosts = [row.get('domain') for row in live_hosts if isinstance(row, dict) and row.get('domain')]
         deduped_hosts = sorted({host for host in live_hosts if isinstance(host, str) and host.strip()})
@@ -680,6 +680,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
 def main() -> None:
     parser = argparse.ArgumentParser(description='BugBounty passive job worker')
     parser.add_argument('--program', default=None, help='Program folder to use for scope validation')
+    parser.add_argument('--job', default=None, help='Run only this single job (by job name or file stem) instead of the whole pipeline.')
     parser.add_argument('--force', action='store_true', help='Re-run completed jobs even when result files already exist.')
     parser.add_argument('--allow-active', action='store_true', help='Permit jobs that make live connections to targets (steps 3 and 4). Off by default for passive-only safety.')
     parser.add_argument('--external-probes', action='store_true', help='Enable curl/nmap/whatweb checks alongside Python HTTP probes for live asset confirmation.')
@@ -691,6 +692,8 @@ def main() -> None:
     jobs = discover_jobs()
     if args.program:
         jobs = [path for path in jobs if load_job(path).get('program') == args.program]
+    if args.job:
+        jobs = [path for path in jobs if path.stem == args.job or load_job(path).get('name') == args.job]
 
     all_results = []
     for job_path in jobs:
