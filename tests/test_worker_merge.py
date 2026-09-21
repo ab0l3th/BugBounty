@@ -99,6 +99,18 @@ class WorkerMergeTest(unittest.TestCase):
         self.assertEqual(set(merged['discovered']), {'a.aa.com', 'legacy.aa.com', 'new.aa.com'})
         self.assertEqual(len(merged['assets']), 3)
 
+    def test_active_job_result_replaces_and_does_not_merge_stale_targets(self):
+        stale = {'job': 'service-enumeration-live-hosts', 'targets': [f'cand{i}.aa.com' for i in range(3354)], 'discovered': [], 'assets': [], 'status': 'queued'}
+        fresh = {'job': 'service-enumeration-live-hosts', 'targets': ['live1.aa.com', 'live2.aa.com'], 'discovered': ['live1.aa.com'], 'assets': [{'domain': 'live1.aa.com', 'kind': 'app-server'}], 'status': 'ok'}
+        written = worker._result_for_write('service-enumeration-live-hosts', stale, fresh)
+        self.assertEqual(written['targets'], ['live1.aa.com', 'live2.aa.com'])
+
+    def test_passive_job_result_still_accumulates(self):
+        previous = {'job': 'aa-passive-discovery', 'targets': ['*.aa.com'], 'discovered': ['old.aa.com'], 'assets': [{'domain': 'old.aa.com', 'sources': ['legacy']}], 'status': 'ok'}
+        current = {'job': 'aa-passive-discovery', 'targets': ['*.aa.com'], 'discovered': ['new.aa.com'], 'assets': [{'domain': 'new.aa.com', 'sources': ['crt.sh']}], 'status': 'ok'}
+        written = worker._result_for_write('aa-passive-discovery', previous, current)
+        self.assertEqual(set(written['discovered']), {'old.aa.com', 'new.aa.com'})
+
     def test_should_run_job_skips_existing_completed_results(self):
         path = Path('jobs/aa-passive-discovery.yaml')
         result_path = Path('results/aa-passive-discovery.json')

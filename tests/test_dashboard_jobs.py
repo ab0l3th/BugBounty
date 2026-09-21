@@ -123,6 +123,19 @@ class DashboardJobMetadataTest(unittest.TestCase):
         finally:
             result_path.unlink(missing_ok=True)
 
+    def test_resource_caps_bound_hosts_and_workers(self):
+        import worker as w
+        with patch.object(w, 'MAX_HOSTS_PER_RUN', 3), patch.object(w, 'MAX_WORKERS', 2):
+            capped, truncated = w._cap_hosts([f'h{i}.aa.com' for i in range(10)])
+            self.assertEqual(len(capped), 3)
+            self.assertTrue(truncated)
+            self.assertEqual(w._bounded_workers(50), 2)
+            self.assertEqual(w._bounded_workers(1), 1)
+        # Under the cap, nothing is truncated.
+        small, truncated2 = w._cap_hosts(['a.aa.com', 'b.aa.com'])
+        self.assertFalse(truncated2)
+        self.assertEqual(small, ['a.aa.com', 'b.aa.com'])
+
     def test_passive_jobs_are_distinct_in_dashboard_titles(self):
         self.assertEqual(job_title_label('aa-passive-discovery'), 'Passive Web Discovery')
         self.assertEqual(job_title_label('american-airlines-passive-dns'), 'Passive DNS Discovery')

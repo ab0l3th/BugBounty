@@ -41,6 +41,35 @@ ACTIVE_JOBS = {'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vho
 COMPLETED_STATUSES = {'completed', 'ok', 'no_new_assets', 'no_in_scope_targets', 'no_shared_infra', 'no_paths', 'no_findings', 'no_activity'}
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, '').strip())
+        return value if value > 0 else default
+    except (ValueError, TypeError):
+        return default
+
+
+# Resource guards to keep active runs from exhausting memory on large host sets. Tunable via env.
+MAX_WORKERS = _env_int('BUGBOUNTY_MAX_WORKERS', 8)
+MAX_HOSTS_PER_RUN = _env_int('BUGBOUNTY_MAX_HOSTS', 500)
+MAX_LOG_ENTRIES = _env_int('BUGBOUNTY_MAX_LOG', 4000)
+
+
+def _bounded_workers(count: int) -> int:
+    return min(MAX_WORKERS, max(1, count))
+
+
+def _cap_hosts(hosts: list[str]) -> tuple[list[str], bool]:
+    """Bound the number of hosts processed in a single run to avoid runaway memory use."""
+    if MAX_HOSTS_PER_RUN and len(hosts) > MAX_HOSTS_PER_RUN:
+        return hosts[:MAX_HOSTS_PER_RUN], True
+    return list(hosts), False
+
+
+def _cap_log(entries: list) -> list:
+    return entries[:MAX_LOG_ENTRIES] if MAX_LOG_ENTRIES and len(entries) > MAX_LOG_ENTRIES else entries
+
+
 def job_workflow_dependencies(job_name: str) -> list[str]:
     return list(WORKFLOW_SEQUENCE.get(job_name, {}).get('depends_on', []))
 
@@ -153,6 +182,13 @@ def merge_result_payloads(previous: dict | None, current: dict) -> dict:
     return merged
 
 
+def _result_for_write(job_name: str | None, previous: dict | None, current: dict) -> dict:
+    """Active steps replace prior results; passive discovery accumulates across runs."""
+    if job_name in ACTIVE_JOBS:
+        return current
+    return merge_result_payloads(previous, current)
+
+
 def _lock_is_active(job_stem: str) -> bool:
     """True only if a lock exists and its PID is alive; stale locks are removed."""
     lock_path = RUNNING_DIR / f'{job_stem}.lock'
@@ -262,7 +298,7 @@ def _probe_live_web_assets(hosts: list[str], *, use_external_tools: bool = False
     probe_log: list[dict] = []
     thread_status: list[dict] = []
     headers = {'User-Agent': 'BugBountyPassiveRecon/1.0'}
-    max_workers = min(8, max(1, len(deduped_hosts)))
+    max_workers = _bounded_workers(len(deduped_hosts))
 
     def probe_host(host: str) -> dict:
         thread_name = threading.current_thread().name
@@ -380,8 +416,8 @@ def _probe_live_web_assets(hosts: list[str], *, use_external_tools: bool = False
 
     return {
         'discovered': discovered,
-        'probe_log': probe_log,
-        'thread_status': thread_status,
+        'probe_log': _cap_log(probe_log),
+        'thread_status': _cap_log(thread_status),
         'assets': discovered,
         'threads': max_workers,
     }
@@ -419,7 +455,7 @@ def _enumerate_live_services(hosts: list[str], *, use_external_tools: bool = Fal
     results: list[dict] = []
     probe_log: list[dict] = []
     thread_status: list[dict] = []
-    max_workers = min(8, max(1, len(deduped_hosts)))
+    max_workers = _bounded_workers(len(deduped_hosts))
 
     def enumerate_host(host: str) -> dict:
         thread_name = threading.current_thread().name
@@ -512,8 +548,8 @@ def _enumerate_live_services(hosts: list[str], *, use_external_tools: bool = Fal
     return {
         'discovered': [row['domain'] for row in results],
         'services': results,
-        'probe_log': probe_log,
-        'thread_status': thread_status,
+        'probe_log': _cap_log(probe_log),
+        'thread_status': _cap_log(thread_status),
         'assets': results,
         'threads': max_workers,
     }
@@ -614,7 +650,7 @@ def _run_vhost_discovery(service_assets: list[dict]) -> dict:
     probe_log: list[dict] = []
     thread_status: list[dict] = []
     assets: list[dict] = []
-    max_workers = min(8, max(1, len(candidates)))
+    max_workers = _bounded_workers(len(candidates))
 
     def investigate(candidate: dict) -> dict:
         thread_name = threading.current_thread().name
@@ -680,7 +716,7 @@ def _directory_enumeration(hosts: list[str], *, wordlist: list[str] | None = Non
     assets: list[dict] = []
     probe_log: list[dict] = []
     thread_status: list[dict] = []
-    max_workers = min(8, max(1, len(deduped_hosts)))
+    max_workers = _bounded_workers(len(deduped_hosts))
     headers = {'User-Agent': 'BugBountyPassiveRecon/1.0'}
 
     def scan_host(host: str) -> dict:
@@ -897,7 +933,7 @@ def _application_security_tests(hosts: list[str], *, use_external_tools: bool = 
     assets: list[dict] = []
     probe_log: list[dict] = []
     thread_status: list[dict] = []
-    max_workers = min(8, max(1, len(deduped_hosts)))
+    max_workers = _bounded_workers(len(deduped_hosts))
 
     def test_host(host: str) -> dict:
         thread_name = threading.current_thread().name
@@ -998,7 +1034,7 @@ def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False) -
     assets: list[dict] = []
     probe_log: list[dict] = []
     thread_status: list[dict] = []
-    max_workers = min(8, max(1, len(deduped_hosts)))
+    max_workers = _bounded_workers(len(deduped_hosts))
 
     def test_host(host: str) -> dict:
         thread_name = threading.current_thread().name
@@ -1181,6 +1217,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             if is_in_scope(host, allowed_scope):
                 deduped_targets.append(host)
 
+        deduped_targets, _truncated = _cap_hosts(deduped_targets)
         probe_result = _probe_live_web_assets(deduped_targets, use_external_tools=use_external_tools)
         live_assets = probe_result.get('assets', probe_result.get('discovered', [])) if isinstance(probe_result, dict) else probe_result
         deduped = {}
@@ -1243,6 +1280,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
         if isinstance(live_hosts, list) and live_hosts and isinstance(live_hosts[0], dict):
             live_hosts = [row.get('domain') for row in live_hosts if isinstance(row, dict) and row.get('domain')]
         deduped_hosts = sorted({host for host in live_hosts if isinstance(host, str) and host.strip()})
+        deduped_hosts, _truncated = _cap_hosts(deduped_hosts)
         enum_result = _enumerate_live_services(deduped_hosts, use_external_tools=use_external_tools)
         assets = enum_result.get('assets', [])
         response = {
@@ -1350,6 +1388,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             if is_in_scope(host, allowed_scope):
                 deduped_hosts.append(host)
 
+        deduped_hosts, _truncated = _cap_hosts(deduped_hosts)
         enum_result = _directory_enumeration(deduped_hosts, use_external_tools=use_external_tools)
         assets = enum_result.get('assets', [])
         response = {
@@ -1381,6 +1420,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             }
         hosts = _combined_live_hosts()
         deduped_hosts = [h for h in hosts if is_in_scope(h, allowed_scope)]
+        deduped_hosts, _truncated = _cap_hosts(deduped_hosts)
         test_result = _application_security_tests(deduped_hosts, use_external_tools=use_external_tools)
         assets = test_result.get('assets', [])
         response = {
@@ -1406,6 +1446,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
                 'dependencies': ['directory-enumeration-live-hosts'],
             }
         api_hosts = [h for h in _api_candidate_hosts() if is_in_scope(h, allowed_scope)]
+        api_hosts, _truncated = _cap_hosts(api_hosts)
         test_result = _api_endpoint_tests(api_hosts, use_external_tools=use_external_tools)
         assets = test_result.get('assets', [])
         response = {
@@ -1570,7 +1611,9 @@ def main() -> None:
                     previous = json.loads(out_path.read_text(encoding='utf-8'))
                 except Exception:
                     previous = None
-            merged_result = merge_result_payloads(previous, result)
+            # Active steps derive targets/results from the current run only; merging would
+            # carry stale targets forward. Passive discovery still accumulates across runs.
+            merged_result = _result_for_write(job.get('name'), previous, result)
             out_path.write_text(json.dumps(merged_result, indent=2), encoding='utf-8')
             all_results.append(merged_result)
         finally:
