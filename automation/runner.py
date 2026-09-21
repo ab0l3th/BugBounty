@@ -15,8 +15,12 @@ WORKER_SCRIPT = ROOT / 'automation' / 'worker.py'
 
 
 def run_worker() -> list[dict]:
+    command = [sys.executable, str(WORKER_SCRIPT)]
+    # Opt-in: allow the scheduled/webhook run to execute active steps so the pipeline auto-advances.
+    if os.environ.get('BUGBOUNTY_ALLOW_ACTIVE', '').strip().lower() in {'1', 'true', 'yes', 'on'}:
+        command.append('--allow-active')
     result = subprocess.run(
-        [sys.executable, str(WORKER_SCRIPT)],
+        command,
         cwd=str(ROOT),
         capture_output=True,
         text=True,

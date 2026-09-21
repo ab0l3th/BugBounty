@@ -153,6 +153,49 @@ def merge_result_payloads(previous: dict | None, current: dict) -> dict:
     return merged
 
 
+def _lock_is_active(job_stem: str) -> bool:
+    """True only if a lock exists and its PID is alive; stale locks are removed."""
+    lock_path = RUNNING_DIR / f'{job_stem}.lock'
+    if not lock_path.exists():
+        return False
+    try:
+        content = lock_path.read_text(encoding='utf-8').strip()
+    except OSError:
+        return False
+    try:
+        pid = int(content)
+    except ValueError:
+        pid = None
+    if pid and pid > 0:
+        if pid == os.getpid():
+            return True
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            _remove_lock(lock_path)
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+    try:
+        age = time.time() - lock_path.stat().st_mtime
+    except OSError:
+        return False
+    if age > 1800:
+        _remove_lock(lock_path)
+        return False
+    return True
+
+
+def _remove_lock(lock_path: Path) -> None:
+    try:
+        lock_path.unlink()
+    except OSError:
+        pass
+
+
 def should_run_job(job_path: Path, *, force: bool = False) -> bool:
     if force:
         return True
@@ -165,7 +208,10 @@ def should_run_job(job_path: Path, *, force: bool = False) -> bool:
         return True
     status = payload.get('status')
     job_state = payload.get('job_state')
-    if status in (COMPLETED_STATUSES | {'waiting_on_dependencies'}) or job_state in {'completed', 'queued', 'running', 'waiting_on_dependencies'}:
+    # Only skip genuinely completed jobs; queued/waiting jobs should be picked up so the
+    # pipeline can auto-advance once dependencies finish. Active in-flight runs are guarded
+    # separately by a live lock check.
+    if status in COMPLETED_STATUSES or job_state == 'completed':
         return False
     return True
 
@@ -1504,6 +1550,9 @@ def main() -> None:
             if pending:
                 print(json.dumps({'job': job.get('name'), 'status': 'waiting_on_dependencies', 'dependencies': pending}, indent=2))
                 continue
+        if not args.force and _lock_is_active(job_path.stem):
+            print(json.dumps({'job': job.get('name'), 'status': 'busy', 'reason': 'another run holds the lock'}, indent=2))
+            continue
         if not args.force and not should_run_job(job_path):
             continue
         RUNNING_DIR.mkdir(parents=True, exist_ok=True)

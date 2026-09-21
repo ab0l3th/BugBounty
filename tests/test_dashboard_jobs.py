@@ -106,6 +106,23 @@ class DashboardJobMetadataTest(unittest.TestCase):
         finally:
             lock_path.unlink(missing_ok=True)
 
+    def test_should_run_job_runs_queued_but_skips_completed(self):
+        from worker import should_run_job, RESULTS_DIR
+        from pathlib import Path
+        import json as _json
+        stem = 'unit-test-should-run'
+        result_path = RESULTS_DIR / f'{stem}.json'
+        fake = Path(f'jobs/{stem}.yaml')
+        try:
+            result_path.write_text(_json.dumps({'status': 'queued', 'job_state': 'queued'}), encoding='utf-8')
+            self.assertTrue(should_run_job(fake))
+            result_path.write_text(_json.dumps({'status': 'waiting_on_dependencies', 'job_state': 'waiting_on_dependencies'}), encoding='utf-8')
+            self.assertTrue(should_run_job(fake))
+            result_path.write_text(_json.dumps({'status': 'ok'}), encoding='utf-8')
+            self.assertFalse(should_run_job(fake))
+        finally:
+            result_path.unlink(missing_ok=True)
+
     def test_passive_jobs_are_distinct_in_dashboard_titles(self):
         self.assertEqual(job_title_label('aa-passive-discovery'), 'Passive Web Discovery')
         self.assertEqual(job_title_label('american-airlines-passive-dns'), 'Passive DNS Discovery')
