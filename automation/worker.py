@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import shutil
@@ -68,6 +69,16 @@ def _cap_hosts(hosts: list[str]) -> tuple[list[str], bool]:
 
 def _cap_log(entries: list) -> list:
     return entries[:MAX_LOG_ENTRIES] if MAX_LOG_ENTRIES and len(entries) > MAX_LOG_ENTRIES else entries
+
+
+def _drain_futures(futures, log: list | None = None) -> None:
+    """Consume thread futures, swallowing per-task exceptions so one failure isn't fatal."""
+    for future in as_completed(futures):
+        try:
+            future.result()
+        except Exception as exc:
+            if log is not None:
+                log.append({'status': 'error', 'error': str(exc), 'timestamp': time.time()})
 
 
 def job_workflow_dependencies(job_name: str) -> list[str]:
@@ -411,8 +422,7 @@ def _probe_live_web_assets(hosts: list[str], *, use_external_tools: bool = False
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(probe_host, host) for host in deduped_hosts]
-        for future in as_completed(futures):
-            future.result()
+        _drain_futures(futures, probe_log)
 
     return {
         'discovered': discovered,
@@ -542,8 +552,7 @@ def _enumerate_live_services(hosts: list[str], *, use_external_tools: bool = Fal
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(enumerate_host, host) for host in deduped_hosts]
-        for future in as_completed(futures):
-            future.result()
+        _drain_futures(futures, probe_log)
 
     return {
         'discovered': [row['domain'] for row in results],
@@ -625,7 +634,9 @@ def _select_vhost_candidates(service_assets: list[dict]) -> list[dict]:
 
 def _probe_vhost(ip: str, host_header: str, scheme: str = 'https') -> dict:
     """Request an IP with a specific Host header and return a small response signature."""
-    url = f'{scheme}://{ip}'
+    # IPv6 literals must be bracketed to form a valid URL authority.
+    authority = f'[{ip}]' if ':' in ip and not ip.startswith('[') else ip
+    url = f'{scheme}://{authority}'
     req = urllib_request.Request(url, headers={'User-Agent': 'BugBountyPassiveRecon/1.0', 'Host': host_header}, method='GET')
     try:
         with urllib_request.urlopen(req, timeout=8) as resp:
@@ -641,7 +652,7 @@ def _probe_vhost(ip: str, host_header: str, scheme: str = 'https') -> dict:
                 'server': str(server),
                 'ok': True,
             }
-    except (urllib_error.HTTPError, urllib_error.URLError, ValueError, OSError) as exc:
+    except (urllib_error.HTTPError, urllib_error.URLError, ValueError, OSError, http.client.HTTPException) as exc:
         return {'host_header': host_header, 'ip': ip, 'ok': False, 'error': str(exc)}
 
 
@@ -685,7 +696,11 @@ def _run_vhost_discovery(service_assets: list[dict]) -> dict:
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(investigate, candidate) for candidate in candidates]
         for future in as_completed(futures):
-            future.result()
+            # A single probe failure must never abort the whole run.
+            try:
+                future.result()
+            except Exception as exc:
+                probe_log.append({'status': 'error', 'error': str(exc), 'timestamp': time.time()})
 
     return {
         'discovered': sorted(row['domain'] for row in assets),
@@ -760,8 +775,7 @@ def _directory_enumeration(hosts: list[str], *, wordlist: list[str] | None = Non
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(scan_host, host) for host in deduped_hosts]
-        for future in as_completed(futures):
-            future.result()
+        _drain_futures(futures, probe_log)
 
     hits = [a for a in assets if a['paths']]
     return {
@@ -1000,8 +1014,7 @@ def _application_security_tests(hosts: list[str], *, use_external_tools: bool = 
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(test_host, host) for host in deduped_hosts]
-        for future in as_completed(futures):
-            future.result()
+        _drain_futures(futures, probe_log)
 
     hits = [a for a in assets if a.get('findings')]
     return {
@@ -1102,8 +1115,7 @@ def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False) -
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(test_host, host) for host in deduped_hosts]
-        for future in as_completed(futures):
-            future.result()
+        _drain_futures(futures, probe_log)
 
     hits = [a for a in assets if a.get('findings')]
     return {

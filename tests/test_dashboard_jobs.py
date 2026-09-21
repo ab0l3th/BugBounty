@@ -242,6 +242,29 @@ class DashboardJobMetadataTest(unittest.TestCase):
         self.assertEqual(sorted(flagged['a.example.com']['co_hosted']), ['b.example.com'])
         self.assertEqual(flagged['proxy.example.com']['reason'], 'proxy-fronted')
 
+    def test_probe_vhost_handles_ipv6_without_raising(self):
+        # An IPv6 literal must be bracketed in the URL; a bad address must never raise.
+        from worker import _probe_vhost
+        result = _probe_vhost('2001:db8::904b', 'host.example.com')
+        self.assertIn('ok', result)
+        self.assertFalse(result['ok'])
+
+    def test_run_vhost_discovery_survives_ipv6_candidate(self):
+        # A single malformed/unreachable probe must not crash the whole run.
+        from worker import _run_vhost_discovery
+        service_assets = [
+            {'domain': 'a.example.com', 'kind': 'static-site', 'ports': [443]},
+            {'domain': 'b.example.com', 'kind': 'static-site', 'ports': [443]},
+        ]
+        ip_map = {
+            'a.example.com': {'2001:db8::904b'},
+            'b.example.com': {'2001:db8::904b'},
+        }
+        with patch('worker._resolve_host_ips', side_effect=lambda h: ip_map.get(h, set())):
+            result = _run_vhost_discovery(service_assets)
+        self.assertIn('assets', result)
+        self.assertIsInstance(result['assets'], list)
+
     def test_dashboard_detects_directory_enumeration_step_and_title(self):
         jobs = list_jobs()
         dir_job = next((job for job in jobs if job['name'] == 'directory-enumeration-live-hosts'), None)
