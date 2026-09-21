@@ -31,6 +31,30 @@ class DashboardJobMetadataTest(unittest.TestCase):
         self.assertEqual(queued['job_state'], 'queued')
         self.assertEqual(queued['status'], 'queued')
 
+    def test_running_lock_overrides_queued_payload_state(self):
+        result_path = ROOT / 'results' / 'aa-passive-discovery.json'
+        lock_path = ROOT / 'results' / '.running' / 'aa-passive-discovery.lock'
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(__import__('json').dumps({
+            'job': 'aa-passive-discovery',
+            'program': 'american-airlines',
+            'status': 'queued',
+            'job_state': 'queued',
+            'discovered': [],
+            'assets': [],
+            'targets': []
+        }, indent=2), encoding='utf-8')
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text('123456', encoding='utf-8')
+
+        jobs = list_jobs()
+        queued = next(job for job in jobs if job['name'] == 'aa-passive-discovery')
+        self.assertEqual(queued['job_state'], 'running')
+
+        result_path.unlink()
+        if lock_path.exists():
+            lock_path.unlink()
+
     def test_passive_jobs_share_one_dns_label_and_provider_list(self):
         self.assertEqual(job_title_label('aa-passive-discovery'), 'Passive DNS Discovery')
         self.assertEqual(job_title_label('american-airlines-passive-dns'), 'Passive DNS Discovery')

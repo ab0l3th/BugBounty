@@ -23,12 +23,12 @@ app = Flask(__name__)
 
 
 def _job_state_for(job_name: str, payload: Dict[str, Any] | None = None) -> str:
+    if RUNNING_DIR.exists() and (RUNNING_DIR / f'{job_name}.lock').exists():
+        return 'running'
     if payload and payload.get('status') == 'queued':
         return 'queued'
     if payload and payload.get('job_state') == 'queued':
         return 'queued'
-    if RUNNING_DIR.exists() and (RUNNING_DIR / f'{job_name}.lock').exists():
-        return 'running'
     if payload and payload.get('job_state') == 'completed':
         return 'completed'
     if payload and payload.get('status') in {'ok', 'no_new_assets', 'no_in_scope_targets'}:
