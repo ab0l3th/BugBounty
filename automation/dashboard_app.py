@@ -50,6 +50,10 @@ def job_workflow_metadata(name: str) -> Dict[str, Any]:
 def _job_state_for(job_name: str, payload: Dict[str, Any] | None = None) -> str:
     if RUNNING_DIR.exists() and (RUNNING_DIR / f'{job_name}.lock').exists():
         return 'running'
+    if payload and payload.get('status') == 'waiting_on_dependencies':
+        return 'waiting_on_dependencies'
+    if payload and payload.get('job_state') == 'waiting_on_dependencies':
+        return 'waiting_on_dependencies'
     if payload and payload.get('status') == 'queued':
         return 'queued'
     if payload and payload.get('job_state') == 'queued':
@@ -62,7 +66,7 @@ def _job_state_for(job_name: str, payload: Dict[str, Any] | None = None) -> str:
 
 
 def summarize_jobs(jobs: List[Dict[str, Any]]) -> Dict[str, int]:
-    summary = {'total': len(jobs), 'queued': 0, 'running': 0, 'completed': 0}
+    summary = {'total': len(jobs), 'queued': 0, 'running': 0, 'completed': 0, 'waiting_on_dependencies': 0}
     for job in jobs:
         state = job.get('job_state', 'queued')
         if state in summary:
@@ -229,8 +233,8 @@ def list_jobs() -> List[Dict[str, Any]]:
                 jobs.append({
                     'name': definition.get('name', job_name),
                     'path': path.name,
-                    'status': 'queued',
-                    'job_state': 'queued',
+                    'status': 'running' if job_state == 'running' else ('waiting_on_dependencies' if job_state == 'waiting_on_dependencies' else 'queued'),
+                    'job_state': job_state,
                     'type': definition.get('type', 'passive'),
                     'program': definition.get('program', 'unknown'),
                     'discovered': [],
@@ -241,7 +245,7 @@ def list_jobs() -> List[Dict[str, Any]]:
                     'source_count': 0,
                     'workflow_step': metadata.get('step', definition.get('order', 99)),
                     'depends_on': metadata.get('depends_on', definition.get('depends_on', [])),
-                    'raw': {'job': definition.get('name', job_name), 'job_state': 'queued'},
+                    'raw': {'job': definition.get('name', job_name), 'job_state': job_state},
                 })
 
     if not RESULTS_DIR.exists():

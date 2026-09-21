@@ -146,7 +146,7 @@ def should_run_job(job_path: Path, *, force: bool = False) -> bool:
         return True
     status = payload.get('status')
     job_state = payload.get('job_state')
-    if status in {'ok', 'no_new_assets', 'no_in_scope_targets'} or job_state in {'completed', 'queued', 'running'}:
+    if status in {'ok', 'no_new_assets', 'no_in_scope_targets', 'waiting_on_dependencies'} or job_state in {'completed', 'queued', 'running', 'waiting_on_dependencies'}:
         return False
     return True
 
@@ -214,6 +214,7 @@ def run_passive_job(job: dict, allowed_scope: list[str]) -> dict:
                 'queued': [],
                 'skipped': [],
                 'status': 'waiting_on_dependencies',
+                'job_state': 'waiting_on_dependencies',
                 'discovered': [],
                 'assets': [],
                 'source_count': 0,

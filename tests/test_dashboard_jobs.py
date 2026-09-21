@@ -55,6 +55,22 @@ class DashboardJobMetadataTest(unittest.TestCase):
         if lock_path.exists():
             lock_path.unlink()
 
+    def test_running_lock_is_visible_even_without_result_payload(self):
+        lock_path = ROOT / 'results' / '.running' / 'confirm-live-web-assets.lock'
+        result_path = ROOT / 'results' / 'confirm-live-web-assets.json'
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text('123456', encoding='utf-8')
+        result_path.unlink(missing_ok=True)
+
+        try:
+            jobs = list_jobs()
+            live_assets_job = next(job for job in jobs if job['name'] == 'confirm-live-web-assets')
+            self.assertEqual(live_assets_job['job_state'], 'running')
+            self.assertEqual(live_assets_job['status'], 'running')
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+
     def test_passive_jobs_are_distinct_in_dashboard_titles(self):
         self.assertEqual(job_title_label('aa-passive-discovery'), 'Passive Web Discovery')
         self.assertEqual(job_title_label('american-airlines-passive-dns'), 'Passive DNS Discovery')
@@ -119,6 +135,29 @@ class DashboardJobMetadataTest(unittest.TestCase):
 
         (root / 'aa-passive-discovery.json').unlink(missing_ok=True)
         (root / 'american-airlines-passive-dns.json').unlink(missing_ok=True)
+
+    def test_dashboard_reports_dependency_wait_as_waiting_state(self):
+        result_path = ROOT / 'results' / 'confirm-live-web-assets.json'
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(__import__('json').dumps({
+            'job': 'confirm-live-web-assets',
+            'program': 'american-airlines',
+            'status': 'waiting_on_dependencies',
+            'job_state': 'waiting_on_dependencies',
+            'discovered': [],
+            'assets': [],
+            'targets': [],
+            'queued': [],
+            'skipped': []
+        }, indent=2), encoding='utf-8')
+
+        try:
+            jobs = list_jobs()
+            live_assets_job = next(job for job in jobs if job['name'] == 'confirm-live-web-assets')
+            self.assertEqual(live_assets_job['job_state'], 'waiting_on_dependencies')
+            self.assertEqual(live_assets_job['status'], 'waiting_on_dependencies')
+        finally:
+            result_path.unlink(missing_ok=True)
 
     def test_dashboard_can_queue_rerun_for_job(self):
         with patch('dashboard_app.subprocess.Popen', return_value=type('Proc', (), {'pid': 1234})()) as mock_popen:
