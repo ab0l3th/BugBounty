@@ -143,6 +143,8 @@ def index():
         summary { list-style: none; cursor: pointer; padding: 16px; display: block; }
         summary::-webkit-details-marker { display: none; }
         .job-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+        .job-title-wrap { flex: 1; }
+        .job-summary { font-size: 14px; color: #cbd5e1; margin-top: 4px; }
         .job-content { padding: 0 16px 16px; }
         .status { display: inline-block; padding: 4px 8px; border-radius: 999px; font-size: 12px; font-weight: bold; }
         .ok { background: #14532d; color: #dcfce7; }
@@ -197,7 +199,10 @@ def index():
             <details class="job">
               <summary>
                 <div class="job-header">
-                  <h2>{{ job.name }}</h2>
+                  <div class="job-title-wrap">
+                    <h2>{{ job.name }}</h2>
+                    <div class="job-summary"><strong>Targets:</strong> {{ job.targets|length }} &nbsp; <strong>Discovered:</strong> {{ job.discovered|length }} &nbsp; <strong>Status:</strong> {{ job.job_state }}</div>
+                  </div>
                   <div class="status {{ 'ok' if job.job_state == 'completed' else 'warn' if job.job_state == 'running' else 'bad' }}">{{ job.job_state }}</div>
                 </div>
               </summary>
