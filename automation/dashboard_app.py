@@ -302,6 +302,10 @@ def group_jobs_by_program(jobs: List[Dict[str, Any]]) -> Dict[str, List[Dict[str
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for job in jobs:
         program = job.get('program', 'unknown')
+        name = (job.get('name') or '')
+        # Suppress GitHub monitoring jobs from the dashboard view.
+        if 'github' in program.lower() or 'github' in name.lower():
+            continue
         grouped.setdefault(program, []).append(job)
     return dict(sorted(grouped.items(), key=lambda item: program_label(item[0])))
 
@@ -746,7 +750,11 @@ def index():
         .pill { background: #0f172a; border: 1px solid #334155; border-radius: 10px; padding: 16px; text-align: center; }
         .pill strong { display: block; font-size: 28px; margin-top: 8px; }
         .program-group { margin-bottom: 24px; }
-        .program-header { margin: 0 0 12px; font-size: 28px; }
+        .program-header { margin: 0 0 12px; font-size: 28px; cursor: pointer; list-style: none; display: flex; align-items: center; gap: 10px; }
+        .program-header::-webkit-details-marker { display: none; }
+        .program-header::before { content: '\\25B6'; font-size: 15px; color: #7dd3fc; transition: transform 0.15s ease; display: inline-block; }
+        details.program-group[open] > .program-header::before { transform: rotate(90deg); }
+        .program-count { font-size: 16px; color: #94a3b8; font-weight: normal; }
         .program-summary-card { background: #0f172a; border: 1px solid #334155; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
         .program-summary-card h3 { margin: 0 0 6px; font-size: 18px; }
         .program-summary-card .meta { color: #cbd5e1; font-size: 14px; }
@@ -845,8 +853,8 @@ def index():
         {% if jobs %}
           {% for program_name, program_jobs in grouped_jobs.items() %}
             {% set program_summary = summarize_program_jobs(program_jobs) %}
-            <div class="program-group">
-              <h2 class="program-header">{{ program_label(program_name) }}</h2>
+            <details class="program-group" open>
+              <summary class="program-header">{{ program_label(program_name) }} <span class="program-count">({{ program_summary.jobs }} jobs)</span></summary>
               {% if program_summary.passive_dns_jobs %}
                 <div class="program-summary-card">
                   <h3>Passive DNS</h3>
@@ -957,7 +965,7 @@ def index():
                   </div>
                 </details>
               {% endfor %}
-            </div>
+            </details>
           {% endfor %}
         {% else %}
           <div class="card">
