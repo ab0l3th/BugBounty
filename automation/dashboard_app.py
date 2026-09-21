@@ -228,14 +228,18 @@ def rerun_job(job_name: str) -> Dict[str, Any]:
     if program and program != 'unknown':
         command.extend(['--program', str(program)])
 
-    completed = subprocess.run(command, cwd=str(ROOT), capture_output=True, text=True, check=False)
+    launched = subprocess.Popen(
+        command,
+        cwd=str(ROOT),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
     return {
-        'status': 'queued' if completed.returncode == 0 else 'error',
+        'status': 'queued',
         'job': job_name,
         'program': program,
-        'returncode': completed.returncode,
-        'stdout': completed.stdout.strip(),
-        'stderr': completed.stderr.strip(),
+        'pid': launched.pid,
     }
 
 
@@ -458,7 +462,7 @@ def rerun_job_endpoint(job_name: str):
         result = rerun_job(job_name)
     except KeyError:
         return jsonify({'status': 'error', 'message': f'Unknown job: {job_name}'}), 404
-    return jsonify(result)
+    return jsonify(result), 202
 
 
 @app.route('/api/jobs')

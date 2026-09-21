@@ -49,12 +49,12 @@ class DashboardJobMetadataTest(unittest.TestCase):
                 self.assertTrue({'certspotter', 'hackertarget', 'crt.sh', 'dns.google'} <= provider_names)
 
     def test_dashboard_can_queue_rerun_for_job(self):
-        with patch('dashboard_app.subprocess.run', return_value=type('Proc', (), {'returncode': 0, 'stdout': '[]', 'stderr': ''})()) as mock_run:
+        with patch('dashboard_app.subprocess.Popen', return_value=type('Proc', (), {'pid': 1234})()) as mock_popen:
             with app.test_client() as client:
                 response = client.post('/jobs/aa-passive-discovery/rerun')
-                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.status_code, 202)
                 self.assertIn('queued', response.get_json()['status'])
-                mock_run.assert_called_once()
+                mock_popen.assert_called_once()
 
 
 if __name__ == '__main__':
