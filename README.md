@@ -108,6 +108,7 @@ This sequence is intentionally ordered and must be followed in order:
    - Use vhost checks when multiple apps share the same IP, or when a proxy/CDN is likely fronting the application.
    - Skip vhost fuzzing for simple single-app domains unless evidence suggests it is necessary.
    - This is the "maybe" stage, not the default first move.
+   - Implemented as the `vhost-discovery-shared-infra` job: it groups the Step 4 live hosts by resolved IP, flags only hosts that share an IP or are proxy/CDN fronted, and confirms name-based virtual hosting using in-scope co-located hostnames (no blind external wordlists).
 
 6. Run targeted directory and file enumeration only on the confirmed live targets.
    - Focus on actual app roots rather than broad, noisy scans across every discovered domain.

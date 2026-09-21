@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -25,10 +26,11 @@ WORKFLOW_SEQUENCE = {
     'american-airlines-passive-dns': {'step': 2, 'depends_on': ['aa-passive-discovery']},
     'confirm-live-web-assets': {'step': 3, 'depends_on': ['aa-passive-discovery', 'american-airlines-passive-dns']},
     'service-enumeration-live-hosts': {'step': 4, 'depends_on': ['confirm-live-web-assets']},
+    'vhost-discovery-shared-infra': {'step': 5, 'depends_on': ['service-enumeration-live-hosts']},
 }
 
 # Jobs that make live connections to targets and must not run in the default passive-only mode.
-ACTIVE_JOBS = {'confirm-live-web-assets', 'service-enumeration-live-hosts'}
+ACTIVE_JOBS = {'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra'}
 
 
 def job_workflow_dependencies(job_name: str) -> list[str]:
@@ -463,6 +465,148 @@ def _enumerate_live_services(hosts: list[str], *, use_external_tools: bool = Fal
     }
 
 
+def _resolve_host_ips(host: str) -> set[str]:
+    host = host.strip().strip('.')
+    if not host:
+        return set()
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, OSError, UnicodeError):
+        return set()
+    return {info[4][0] for info in infos if info and info[4]}
+
+
+# Server banners that indicate a CDN/proxy is fronting the host.
+_PROXY_BANNERS = ('cloudfront', 'cloudflare', 'akamai', 'fastly', 'nginx', 'envoy', 'haproxy', 'varnish', 'incapsula')
+
+
+def _asset_is_proxy_fronted(asset: dict) -> bool:
+    if str(asset.get('kind', '')).lower() == 'reverse-proxy':
+        return True
+    for row in asset.get('evidence', []) or []:
+        if isinstance(row, dict) and any(b in str(row.get('server', '')).lower() for b in _PROXY_BANNERS):
+            return True
+    return False
+
+
+def _select_vhost_candidates(service_assets: list[dict]) -> list[dict]:
+    """Only hosts with evidence of shared infrastructure: co-located on one IP, or proxy/CDN fronted."""
+    hosts = [a.get('domain') for a in service_assets if isinstance(a, dict) and a.get('domain')]
+    ip_to_hosts: dict[str, set[str]] = {}
+    host_ips: dict[str, set[str]] = {}
+    for host in hosts:
+        ips = _resolve_host_ips(host)
+        host_ips[host] = ips
+        for ip in ips:
+            ip_to_hosts.setdefault(ip, set()).add(host)
+
+    proxy_hosts = {a.get('domain') for a in service_assets if isinstance(a, dict) and _asset_is_proxy_fronted(a)}
+
+    candidates: list[dict] = []
+    for asset in service_assets:
+        if not isinstance(asset, dict):
+            continue
+        host = asset.get('domain')
+        if not host:
+            continue
+        co_hosted = sorted({
+            other
+            for ip in host_ips.get(host, set())
+            for other in ip_to_hosts.get(ip, set())
+            if other != host
+        })
+        shared_ip = next((ip for ip in host_ips.get(host, set()) if len(ip_to_hosts.get(ip, set())) > 1), None)
+        if shared_ip:
+            candidates.append({
+                'domain': host,
+                'reason': 'shared-ip',
+                'shared_ip': shared_ip,
+                'co_hosted': co_hosted,
+            })
+        elif host in proxy_hosts:
+            candidates.append({
+                'domain': host,
+                'reason': 'proxy-fronted',
+                'shared_ip': None,
+                'co_hosted': co_hosted,
+            })
+    return candidates
+
+
+def _probe_vhost(ip: str, host_header: str, scheme: str = 'https') -> dict:
+    """Request an IP with a specific Host header and return a small response signature."""
+    url = f'{scheme}://{ip}'
+    req = urllib_request.Request(url, headers={'User-Agent': 'BugBountyPassiveRecon/1.0', 'Host': host_header}, method='GET')
+    try:
+        with urllib_request.urlopen(req, timeout=8) as resp:
+            code = getattr(resp, 'status', resp.getcode())
+            body = resp.read(4096)
+            headers = getattr(resp, 'headers', {})
+            server = headers.get('Server', '') if hasattr(headers, 'get') else ''
+            return {
+                'host_header': host_header,
+                'ip': ip,
+                'status_code': code,
+                'length': len(body),
+                'server': str(server),
+                'ok': True,
+            }
+    except (urllib_error.HTTPError, urllib_error.URLError, ValueError, OSError) as exc:
+        return {'host_header': host_header, 'ip': ip, 'ok': False, 'error': str(exc)}
+
+
+def _run_vhost_discovery(service_assets: list[dict]) -> dict:
+    candidates = _select_vhost_candidates(service_assets)
+    probe_log: list[dict] = []
+    thread_status: list[dict] = []
+    assets: list[dict] = []
+    max_workers = min(8, max(1, len(candidates)))
+
+    def investigate(candidate: dict) -> dict:
+        thread_name = threading.current_thread().name
+        host = candidate['domain']
+        ip = candidate.get('shared_ip')
+        evidence: list[dict] = []
+        # For shared-IP candidates, confirm name-based virtual hosting using only in-scope co-hosted names.
+        if ip:
+            for header_host in [host] + candidate.get('co_hosted', []):
+                sig = _probe_vhost(ip, header_host)
+                evidence.append(sig)
+                probe_log.append({'thread_id': thread_name, 'host': host, 'ip': ip, 'host_header': header_host, 'status': 'checked', 'timestamp': time.time()})
+        distinct = len({(row.get('status_code'), row.get('length')) for row in evidence if row.get('ok')})
+        record = {
+            'domain': host,
+            'status': 'vhost_confirmed' if distinct > 1 else 'vhost_candidate',
+            'kind': candidate['reason'],
+            'shared_ip': ip,
+            'co_hosted': candidate.get('co_hosted', []),
+            'source': 'vhost',
+            'sources': ['vhost'],
+            'source_count': 1,
+            'evidence': evidence,
+        }
+        assets.append(record)
+        thread_status.append({'thread_id': thread_name, 'host': host, 'status': record['status'], 'reason': candidate['reason'], 'timestamp': time.time()})
+        return record
+
+    if not candidates:
+        return {'discovered': [], 'assets': [], 'probe_log': [], 'thread_status': [], 'threads': 0, 'candidates': 0}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(investigate, candidate) for candidate in candidates]
+        for future in as_completed(futures):
+            future.result()
+
+    return {
+        'discovered': sorted(row['domain'] for row in assets),
+        'assets': sorted(assets, key=lambda r: r['domain']),
+        'probe_log': probe_log,
+        'thread_status': thread_status,
+        'threads': max_workers,
+        'candidates': len(candidates),
+    }
+
+
 def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: bool = False) -> dict:
     job_name = (job.get('name') or '').strip()
     job_type = (job.get('type', 'passive') or 'passive').lower()
@@ -592,6 +736,50 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
         response['probe_log'] = enum_result.get('probe_log', [])
         response['thread_status'] = enum_result.get('thread_status', [])
         response['probe_threads'] = enum_result.get('threads', 0)
+        return response
+
+    if job_name == 'vhost-discovery-shared-infra':
+        service_path = RESULTS_DIR / 'service-enumeration-live-hosts.json'
+        if not service_path.exists():
+            return {
+                'job': job_name,
+                'program': job.get('program', DEFAULT_PROGRAM),
+                'type': 'active',
+                'targets': [],
+                'queued': [],
+                'skipped': [],
+                'status': 'waiting_on_dependencies',
+                'job_state': 'waiting_on_dependencies',
+                'discovered': [],
+                'assets': [],
+                'source_count': 0,
+                'dependencies': ['service-enumeration-live-hosts'],
+            }
+
+        try:
+            payload = json.loads(service_path.read_text(encoding='utf-8'))
+        except Exception:
+            payload = {}
+        service_assets = [a for a in (payload.get('assets', []) or []) if isinstance(a, dict) and a.get('domain')]
+        evaluated_hosts = sorted({a['domain'] for a in service_assets})
+        vhost_result = _run_vhost_discovery(service_assets)
+        assets = vhost_result.get('assets', [])
+        response = {
+            'job': job_name,
+            'program': job.get('program', DEFAULT_PROGRAM),
+            'type': 'active',
+            'targets': evaluated_hosts,
+            'queued': evaluated_hosts,
+            'skipped': sorted(set(evaluated_hosts) - {row.get('domain') for row in assets}),
+            'status': 'ok' if assets else 'no_shared_infra',
+            'discovered': vhost_result.get('discovered', []),
+            'assets': assets,
+            'source_count': vhost_result.get('candidates', 0),
+            'depends_on': ['service-enumeration-live-hosts'],
+        }
+        response['probe_log'] = vhost_result.get('probe_log', [])
+        response['thread_status'] = vhost_result.get('thread_status', [])
+        response['probe_threads'] = vhost_result.get('threads', 0)
         return response
 
     result = {

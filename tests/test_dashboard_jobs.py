@@ -110,6 +110,62 @@ class DashboardJobMetadataTest(unittest.TestCase):
         self.assertEqual(service_job['depends_on'], ['confirm-live-web-assets'])
         self.assertEqual(job_title_label('service-enumeration-live-hosts'), 'Service Enumeration')
 
+    def test_dashboard_detects_vhost_discovery_step_and_title(self):
+        jobs = list_jobs()
+        vhost_job = next((job for job in jobs if job['name'] == 'vhost-discovery-shared-infra'), None)
+        self.assertIsNotNone(vhost_job)
+        self.assertEqual(vhost_job['workflow_step'], 5)
+        self.assertEqual(vhost_job['depends_on'], ['service-enumeration-live-hosts'])
+        self.assertEqual(job_title_label('vhost-discovery-shared-infra'), 'Vhost Discovery')
+
+    def test_vhost_discovery_uses_step4_live_hosts_as_targets(self):
+        result_path = ROOT / 'results' / 'service-enumeration-live-hosts.json'
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(__import__('json').dumps({
+            'job': 'service-enumeration-live-hosts',
+            'program': 'american-airlines',
+            'status': 'ok',
+            'discovered': ['host-001.example.com', 'host-002.example.com'],
+            'targets': ['host-001.example.com', 'host-002.example.com'],
+            'assets': [
+                {'domain': 'host-001.example.com', 'status': 'enumerated', 'kind': 'reverse-proxy', 'ports': [443]},
+                {'domain': 'host-002.example.com', 'status': 'enumerated', 'kind': 'static-site', 'ports': [443]},
+            ],
+            'source_count': 2,
+        }, indent=2), encoding='utf-8')
+        try:
+            jobs = list_jobs()
+            vhost_job = next(job for job in jobs if job['name'] == 'vhost-discovery-shared-infra')
+            self.assertEqual(vhost_job['targets'], ['host-001.example.com', 'host-002.example.com'])
+        finally:
+            result_path.unlink(missing_ok=True)
+
+    def test_vhost_gate_flags_shared_ip_and_proxy_only(self):
+        from worker import _select_vhost_candidates
+
+        service_assets = [
+            {'domain': 'a.example.com', 'kind': 'static-site', 'ports': [443]},
+            {'domain': 'b.example.com', 'kind': 'static-site', 'ports': [443]},
+            {'domain': 'proxy.example.com', 'kind': 'reverse-proxy', 'ports': [443]},
+            {'domain': 'unique.example.com', 'kind': 'static-site', 'ports': [443]},
+        ]
+        ip_map = {
+            'a.example.com': {'10.0.0.1'},
+            'b.example.com': {'10.0.0.1'},
+            'proxy.example.com': {'10.0.0.9'},
+            'unique.example.com': {'10.0.0.2'},
+        }
+        with patch('worker._resolve_host_ips', side_effect=lambda h: ip_map.get(h, set())):
+            candidates = _select_vhost_candidates(service_assets)
+        flagged = {c['domain']: c for c in candidates}
+        self.assertIn('a.example.com', flagged)
+        self.assertIn('b.example.com', flagged)
+        self.assertIn('proxy.example.com', flagged)
+        self.assertNotIn('unique.example.com', flagged)
+        self.assertEqual(flagged['a.example.com']['reason'], 'shared-ip')
+        self.assertEqual(sorted(flagged['a.example.com']['co_hosted']), ['b.example.com'])
+        self.assertEqual(flagged['proxy.example.com']['reason'], 'proxy-fronted')
+
     def test_service_enumeration_uses_step3_live_asset_output(self):
         result_path = ROOT / 'results' / 'confirm-live-web-assets.json'
         result_path.parent.mkdir(parents=True, exist_ok=True)
