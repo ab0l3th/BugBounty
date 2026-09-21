@@ -62,8 +62,12 @@ def job_title_label(value: str) -> str:
     text = (value or '').lower().replace('_', '-')
     if 'github' in text and 'monitor' in text:
         return 'GitHub Monitor'
-    if 'passive' in text and ('dns' in text or 'discovery' in text):
+    if 'aa-passive-discovery' in text:
+        return 'Passive Web Discovery'
+    if 'passive-dns' in text or ('passive' in text and 'dns' in text and 'discovery' not in text):
         return 'Passive DNS Discovery'
+    if 'passive' in text and 'discovery' in text:
+        return 'Passive Discovery'
     if 'github' in text:
         return 'GitHub Monitor'
     if 'dns' in text:

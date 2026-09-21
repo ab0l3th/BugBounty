@@ -55,8 +55,8 @@ class DashboardJobMetadataTest(unittest.TestCase):
         if lock_path.exists():
             lock_path.unlink()
 
-    def test_passive_jobs_share_one_dns_label_and_provider_list(self):
-        self.assertEqual(job_title_label('aa-passive-discovery'), 'Passive DNS Discovery')
+    def test_passive_jobs_are_distinct_in_dashboard_titles(self):
+        self.assertEqual(job_title_label('aa-passive-discovery'), 'Passive Web Discovery')
         self.assertEqual(job_title_label('american-airlines-passive-dns'), 'Passive DNS Discovery')
 
         sources = public_sources_for('example.com')
