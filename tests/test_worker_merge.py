@@ -76,6 +76,29 @@ class WorkerMergeTest(unittest.TestCase):
         self.assertEqual(result['status'], 'ok')
         self.assertGreaterEqual(result['source_count'], 2)
 
+    def test_merge_result_payloads_keeps_previous_history(self):
+        previous = {
+            'job': 'aa-passive-discovery',
+            'program': 'american-airlines',
+            'targets': ['*.aa.com'],
+            'discovered': ['a.aa.com', 'legacy.aa.com'],
+            'assets': [{'domain': 'a.aa.com', 'sources': ['legacy']}, {'domain': 'legacy.aa.com', 'sources': ['legacy']}],
+            'status': 'ok',
+        }
+        current = {
+            'job': 'aa-passive-discovery',
+            'program': 'american-airlines',
+            'targets': ['*.aa.com'],
+            'discovered': ['a.aa.com', 'new.aa.com'],
+            'assets': [{'domain': 'a.aa.com', 'sources': ['crt.sh']}, {'domain': 'new.aa.com', 'sources': ['crt.sh']}],
+            'status': 'ok',
+        }
+
+        merged = worker.merge_result_payloads(previous, current)
+
+        self.assertEqual(set(merged['discovered']), {'a.aa.com', 'legacy.aa.com', 'new.aa.com'})
+        self.assertEqual(len(merged['assets']), 3)
+
 
 if __name__ == '__main__':
     unittest.main()

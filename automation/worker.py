@@ -51,6 +51,60 @@ def load_job(path: Path) -> dict:
     return data
 
 
+def merge_result_payloads(previous: dict | None, current: dict) -> dict:
+    if not previous:
+        return current
+    if not isinstance(previous, dict) or not isinstance(current, dict):
+        return current
+
+    def merge_assets(rows_a: list[dict], rows_b: list[dict]) -> list[dict]:
+        merged: dict[str, dict] = {}
+        for row in rows_a + rows_b:
+            if not isinstance(row, dict):
+                continue
+            domain = row.get('domain')
+            if not domain:
+                continue
+            existing = merged.setdefault(domain, {
+                'domain': domain,
+                'status': row.get('status', 'in_scope'),
+                'source': '',
+                'sources': [],
+                'source_count': 0,
+                'evidence': [],
+            })
+            sources = list(dict.fromkeys((existing.get('sources', []) or []) + (row.get('sources', []) or [])))
+            evidence = existing.get('evidence', []) + row.get('evidence', [])
+            deduped = {}
+            for item in evidence:
+                if not isinstance(item, dict):
+                    continue
+                key = (item.get('source', ''), item.get('url', ''))
+                deduped[key] = item
+            existing.update({
+                'domain': domain,
+                'status': row.get('status', existing.get('status', 'in_scope')),
+                'source': ', '.join(sources),
+                'sources': sources,
+                'source_count': len(sources),
+                'evidence': list(deduped.values()),
+            })
+        return [merged[name] for name in sorted(merged)]
+
+    discovered = sorted(set(previous.get('discovered', [])) | set(current.get('discovered', [])))
+    targets = list(dict.fromkeys((previous.get('targets', []) or []) + (current.get('targets', []) or [])))
+    merged = dict(current)
+    merged['discovered'] = discovered
+    merged['targets'] = targets
+    merged['assets'] = merge_assets(previous.get('assets', []), current.get('assets', []))
+    merged['source_count'] = len({source for row in merged['assets'] for source in row.get('sources', [])})
+    if not merged.get('job'):
+        merged['job'] = previous.get('job', current.get('job'))
+    if not merged.get('program'):
+        merged['program'] = previous.get('program', current.get('program'))
+    return merged
+
+
 def run_passive_job(job: dict, allowed_scope: list[str]) -> dict:
     job_type = (job.get('type', 'passive') or 'passive').lower()
     if job_type in {'github', 'repo', 'monitor'}:
@@ -158,8 +212,15 @@ def main() -> None:
         if not RESULTS_DIR.exists():
             RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         out_path = RESULTS_DIR / f"{job_path.stem}.json"
-        out_path.write_text(json.dumps(result, indent=2), encoding='utf-8')
-        all_results.append(result)
+        previous = None
+        if out_path.exists():
+            try:
+                previous = json.loads(out_path.read_text(encoding='utf-8'))
+            except Exception:
+                previous = None
+        merged_result = merge_result_payloads(previous, result)
+        out_path.write_text(json.dumps(merged_result, indent=2), encoding='utf-8')
+        all_results.append(merged_result)
 
     print(json.dumps(all_results, indent=2))
 
