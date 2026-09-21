@@ -588,6 +588,142 @@ def github_webhook():
     return jsonify({'status': 'ok', 'event': event, 'ref': ref}), 200
 
 
+@app.route('/about')
+def about_overview():
+    return render_template_string('''
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>BugBounty Workflow Overview</title>
+      <style>
+        body { font-family: Arial, sans-serif; background: #111827; color: #e5e7eb; margin: 0; padding: 32px; }
+        .wrap { max-width: 1100px; margin: 0 auto; }
+        .topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 24px; }
+        .brand { font-size: 32px; font-weight: bold; margin: 0; }
+        .nav { display: flex; gap: 10px; flex-wrap: wrap; }
+        .nav a { text-decoration: none; color: #e2e8f0; background: #1f2937; border: 1px solid #334155; border-radius: 8px; padding: 8px 12px; }
+        .card { background: #1f2937; border: 1px solid #374151; border-radius: 12px; padding: 20px; margin-bottom: 20px; box-shadow: 0 8px 20px rgba(0,0,0,0.18); }
+        h1 { margin-top: 0; margin-bottom: 20px; }
+        h2 { margin-top: 0; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 18px; }
+        .step { background: #0f172a; border: 1px solid #334155; border-radius: 10px; padding: 16px; }
+        .step .num { font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: #93c5fd; }
+        .step h3 { margin: 8px 0 10px; }
+        .step p { margin: 0; color: #cbd5e1; line-height: 1.5; }
+        ul { margin: 10px 0 0 20px; line-height: 1.7; color: #dbeafe; }
+        code { background: #0b1120; border-radius: 4px; padding: 2px 6px; }
+        a { color: #7dd3fc; }
+      </style>
+    </head>
+    <body>
+      <div class="wrap">
+        <div class="topbar">
+          <div class="brand">BugBounty Dashboard</div>
+          <div class="nav">
+            <a href="/">Dashboard</a>
+            <a href="/about">About</a>
+          </div>
+        </div>
+
+        <div class="card">
+          <h1>BugBounty Workflow Overview</h1>
+          <p>This dashboard is a structured recon pipeline designed to move from passive discovery to live validation and then into targeted application and API testing. The workflow is intentionally evidence-based: each step narrows the scope using the output of the previous stage instead of scanning everything blindly.</p>
+          <p>The goal is to find realistic, high-signal assets and manually validate them before writing a report or investing time in deep exploitation.</p>
+        </div>
+
+        <div class="card">
+          <h2>How the workflow works</h2>
+          <div class="grid">
+            <div class="step">
+              <div class="num">Step 1</div>
+              <h3>Passive Web Discovery</h3>
+              <p>Collect likely target domains and web surfaces from public and passive sources. This is the broadest reconnaissance stage and intentionally avoids active probing.</p>
+            </div>
+            <div class="step">
+              <div class="num">Step 2</div>
+              <h3>Passive DNS Discovery</h3>
+              <p>Expand and enrich the target list through DNS and certificate intelligence to find related hosts, aliases, and subdomains that may be in scope.</p>
+            </div>
+            <div class="step">
+              <div class="num">Step 3</div>
+              <h3>Confirm Live Web Assets</h3>
+              <p>Take the deduplicated output from the passive stages and verify which assets actually respond over HTTP or HTTPS. This step is what turns a candidate list into a real, reachable target set.</p>
+            </div>
+            <div class="step">
+              <div class="num">Step 4</div>
+              <h3>Service Enumeration</h3>
+              <p>Inspect confirmed live hosts to fingerprint services, ports, and protocols. The purpose is to answer: what is actually listening and how is the host serving traffic?</p>
+            </div>
+            <div class="step">
+              <div class="num">Step 5</div>
+              <h3>Vhost Discovery</h3>
+              <p>Look for virtual hosts, shared infrastructure, or alternate app surfaces that sit behind the same IP or proxy stack. This is useful when a single origin is hosting multiple domains or apps.</p>
+            </div>
+            <div class="step">
+              <div class="num">Step 6</div>
+              <h3>Targeted Directory Enumeration</h3>
+              <p>Run narrow, evidence-driven directory discovery only for hosts that are already validated. This avoids noisy scans against everything and keeps the scope relevant.</p>
+            </div>
+            <div class="step">
+              <div class="num">Step 7</div>
+              <h3>Application Security Testing</h3>
+              <p>Assess the app surface for misconfigurations, exposed admin/debug routes, stack disclosure, login issues, unsafe paths, and app-level findings that deserve manual validation.</p>
+            </div>
+            <div class="step">
+              <div class="num">Step 8</div>
+              <h3>API Endpoint Testing</h3>
+              <p>Inspect live APIs for auth issues, debug endpoints, GraphQL, OpenAPI docs, and other high-value paths that can leak data or reveal vulnerabilities. This is where API-specific routes are validated.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>What happens in the app testing stage</h2>
+          <p>The application testing pass focuses on confirmed live web apps, not raw domain lists. It checks:</p>
+          <ul>
+            <li>Base app pages and common admin routes</li>
+            <li>Framework and version disclosure via headers or HTML</li>
+            <li>Debug, management, or health endpoints</li>
+            <li>Obvious misconfigurations and exposed config paths</li>
+            <li>Login or access flows that reveal weak protections</li>
+            <li>Server-side error patterns or verbose stack traces</li>
+          </ul>
+          <p>Findings are prioritized for manual validation because the stage is meant to reduce noise, not flood the queue with weak or duplicate signals.</p>
+        </div>
+
+        <div class="card">
+          <h2>What happens in the API testing stage</h2>
+          <p>API testing starts only after we have a clear indication that the host is serving an API or API-like surface. The workflow looks for JSON responses, Swagger/OpenAPI docs, GraphQL endpoints, and common API base paths like <code>/api</code>, <code>/graphql</code>, and <code>/v1</code>.</p>
+          <p>From there, it inspects for:</p>
+          <ul>
+            <li>Unauthenticated or weakly authenticated debug routes</li>
+            <li>Swagger and OpenAPI docs that expose internal paths</li>
+            <li>GraphQL introspection or schema disclosure</li>
+            <li>Actuator, metrics, and environment endpoints</li>
+            <li>Sensitive JSON endpoints returning config, metadata, or user data</li>
+          </ul>
+          <p>Any credible item is documented with reproduction steps and evidence so it can be manually verified by the operator.</p>
+        </div>
+
+        <div class="card">
+          <h2>Operating principles</h2>
+          <ul>
+            <li>Passive first, active second.</li>
+            <li>Only test hosts that were confirmed alive.</li>
+            <li>Use previous stage output to narrow the target list.</li>
+            <li>Prefer high-signal checks over noisy broad scanning.</li>
+            <li>Manually confirm issues before escalating them into a full finding.</li>
+            <li>Capture evidence and reproduction steps in clean, readable output.</li>
+          </ul>
+        </div>
+      </div>
+    </body>
+    </html>
+    ''')
+
+
 @app.route('/')
 def index():
     jobs = list_jobs()
@@ -659,7 +795,10 @@ def index():
     <body>
       <div class="wrap">
         <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:20px;">
-          <h1 style="margin:0;">BugBounty Dashboard</h1>
+          <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+            <h1 style="margin:0;">BugBounty Dashboard</h1>
+            <a href="/about" style="color:#7dd3fc; text-decoration:none; background:#1f2937; border:1px solid #334155; border-radius:8px; padding:7px 10px; font-size:14px;">About</a>
+          </div>
           <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; background:#1f2937; border:1px solid #334155; border-radius:10px; padding:8px 12px;">
             <label for="refresh-interval" style="font-size:14px; color:#cbd5e1;">Auto refresh</label>
             <select id="refresh-interval" style="background:#0f172a; color:#e5e7eb; border:1px solid #475569; border-radius:6px; padding:6px 8px;">

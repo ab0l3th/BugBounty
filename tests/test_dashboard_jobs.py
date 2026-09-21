@@ -160,6 +160,17 @@ class DashboardJobMetadataTest(unittest.TestCase):
                 provider_names = {entry['source'] for entry in result['provider_status']}
                 self.assertTrue({'certspotter', 'hackertarget', 'crt.sh', 'dns.google'} <= provider_names)
 
+    def test_dashboard_about_page_exists_and_describes_workflow(self):
+        client = app.test_client()
+        response = client.get('/about')
+        self.assertEqual(response.status_code, 200)
+        body = response.get_data(as_text=True)
+        self.assertIn('BugBounty Workflow Overview', body)
+        self.assertIn('Passive Web Discovery', body)
+        self.assertIn('Confirm Live Web Assets', body)
+        self.assertIn('Application Security Testing', body)
+        self.assertIn('API Endpoint Testing', body)
+
     def test_dashboard_detects_third_workflow_job_and_order(self):
         jobs = list_jobs()
         live_assets_job = next(job for job in jobs if job['name'] == 'confirm-live-web-assets')
