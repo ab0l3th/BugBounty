@@ -32,6 +32,7 @@ class DashboardJobMetadataTest(unittest.TestCase):
         self.assertEqual(queued['status'], 'queued')
 
     def test_running_lock_overrides_queued_payload_state(self):
+        import os
         result_path = ROOT / 'results' / 'aa-passive-discovery.json'
         lock_path = ROOT / 'results' / '.running' / 'aa-passive-discovery.lock'
         result_path.parent.mkdir(parents=True, exist_ok=True)
@@ -45,7 +46,7 @@ class DashboardJobMetadataTest(unittest.TestCase):
             'targets': []
         }, indent=2), encoding='utf-8')
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_path.write_text('123456', encoding='utf-8')
+        lock_path.write_text(str(os.getpid()), encoding='utf-8')
 
         jobs = list_jobs()
         queued = next(job for job in jobs if job['name'] == 'aa-passive-discovery')
@@ -56,10 +57,11 @@ class DashboardJobMetadataTest(unittest.TestCase):
             lock_path.unlink()
 
     def test_running_lock_is_visible_even_without_result_payload(self):
+        import os
         lock_path = ROOT / 'results' / '.running' / 'confirm-live-web-assets.lock'
         result_path = ROOT / 'results' / 'confirm-live-web-assets.json'
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_path.write_text('123456', encoding='utf-8')
+        lock_path.write_text(str(os.getpid()), encoding='utf-8')
         result_path.unlink(missing_ok=True)
 
         try:
@@ -70,6 +72,39 @@ class DashboardJobMetadataTest(unittest.TestCase):
         finally:
             if lock_path.exists():
                 lock_path.unlink()
+
+    def test_stale_lock_with_dead_pid_is_not_running(self):
+        import os
+        lock_path = ROOT / 'results' / '.running' / 'aa-passive-discovery.lock'
+        result_path = ROOT / 'results' / 'aa-passive-discovery.json'
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        # A PID that is almost certainly not alive.
+        lock_path.write_text('2147480000', encoding='utf-8')
+        result_path.write_text(__import__('json').dumps({
+            'job': 'aa-passive-discovery', 'program': 'american-airlines',
+            'status': 'ok', 'discovered': ['x.aa.com'], 'assets': [], 'targets': []
+        }, indent=2), encoding='utf-8')
+        try:
+            jobs = list_jobs()
+            job = next(j for j in jobs if j['name'] == 'aa-passive-discovery')
+            self.assertNotEqual(job['job_state'], 'running')
+            # stale lock should have been cleaned up
+            self.assertFalse(lock_path.exists())
+        finally:
+            lock_path.unlink(missing_ok=True)
+            result_path.unlink(missing_ok=True)
+
+    def test_live_lock_with_current_pid_is_running(self):
+        import os
+        lock_path = ROOT / 'results' / '.running' / 'aa-passive-discovery.lock'
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(str(os.getpid()), encoding='utf-8')
+        try:
+            jobs = list_jobs()
+            job = next(j for j in jobs if j['name'] == 'aa-passive-discovery')
+            self.assertEqual(job['job_state'], 'running')
+        finally:
+            lock_path.unlink(missing_ok=True)
 
     def test_passive_jobs_are_distinct_in_dashboard_titles(self):
         self.assertEqual(job_title_label('aa-passive-discovery'), 'Passive Web Discovery')
@@ -317,6 +352,48 @@ class DashboardJobMetadataTest(unittest.TestCase):
             self.assertIn('missing_security_headers', types)
             self.assertIn('cors_misconfig', types)
             self.assertIn('tech_disclosure', types)
+
+    def test_application_findings_generate_html_writeup_with_repro_steps(self):
+        from worker import _application_security_tests, RESULTS_DIR
+
+        class FakeResp:
+            def __init__(self, status, headers, body=b'ok'):
+                self.status = status
+                self._headers = headers
+                self._body = body
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def getcode(self):
+                return self.status
+            def read(self, n=None):
+                return self._body
+            @property
+            def headers(self):
+                class H(dict):
+                    def items(inner):
+                        return list(super().items())
+                h = H(); h.update(self._headers); return h
+
+        def fake_urlopen(req, timeout=8):
+            origin = req.headers.get('Origin') if hasattr(req, 'headers') else None
+            if origin:
+                return FakeResp(200, {'Access-Control-Allow-Origin': 'https://evil.example', 'Access-Control-Allow-Credentials': 'true'})
+            return FakeResp(200, {'Server': 'nginx/1.18'})
+
+        report = RESULTS_DIR / 'reports' / 'application-security-testing' / 'app.example.com.html'
+        report.unlink(missing_ok=True)
+        with patch('worker.urllib_request.urlopen', side_effect=fake_urlopen):
+            result = _application_security_tests(['app.example.com'])
+            asset = next(a for a in result['assets'] if a['domain'] == 'app.example.com')
+            self.assertEqual(asset.get('report_url'), '/reports/application-security-testing/app.example.com')
+            self.assertTrue(report.exists())
+            html = report.read_text(encoding='utf-8')
+            self.assertIn('Steps to Reproduce', html)
+            self.assertIn('app.example.com', html)
+            self.assertIn('curl', html)
+        report.unlink(missing_ok=True)
 
     def test_api_endpoint_tests_flag_exposed_debug_endpoint(self):
         from worker import _api_endpoint_tests

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -20,6 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent
 JOBS_DIR = ROOT / 'jobs'
 RESULTS_DIR = ROOT / 'results'
 RUNNING_DIR = RESULTS_DIR / '.running'
+REPORTS_DIR = RESULTS_DIR / 'reports'
 DEFAULT_PROGRAM = 'american-airlines'
 WORKFLOW_SEQUENCE = {
     'aa-passive-discovery': {'step': 1, 'depends_on': []},
@@ -718,6 +720,132 @@ _ERROR_SIGNATURES = (
 )
 
 
+def _reproduction_steps(finding: dict, host: str) -> dict:
+    """Exact manual steps a human can follow to confirm a finding. Non-destructive only."""
+    url = f'https://{host}'
+    ftype = finding.get('type')
+    detail = finding.get('detail')
+    if ftype == 'missing_security_headers':
+        headers = detail if isinstance(detail, list) else [str(detail)]
+        return {
+            'title': 'Missing security headers',
+            'steps': [
+                f'Open a terminal and run: <code>curl -sSI {url}</code>',
+                'Read the response headers printed by curl.',
+                'Confirm these headers are NOT present: <code>' + ', '.join(headers) + '</code>',
+            ],
+            'expected': 'The listed headers do not appear in the response.',
+            'impact': 'Depending on which are missing: clickjacking (X-Frame-Options), MIME sniffing (X-Content-Type-Options), weaker XSS/isolation defenses (CSP), or downgrade attacks (HSTS).',
+            'remediation': 'Set the missing headers at the application or edge/proxy layer.',
+        }
+    if ftype == 'cors_misconfig':
+        return {
+            'title': 'CORS misconfiguration (untrusted origin reflected)',
+            'steps': [
+                f"Run: <code>curl -sS -I -H 'Origin: https://evil.example' {url}</code>",
+                'Inspect the <code>Access-Control-Allow-Origin</code> and <code>Access-Control-Allow-Credentials</code> response headers.',
+                'Confirm the server reflects <code>https://evil.example</code> (or returns <code>*</code> together with credentials true).',
+                f'Observed by the scanner: <code>{detail}</code>',
+            ],
+            'expected': 'Access-Control-Allow-Origin echoes the untrusted origin, indicating cross-origin reads may be possible.',
+            'impact': 'A malicious site could read authenticated responses on behalf of a logged-in user.',
+            'remediation': 'Restrict allowed origins to an explicit allowlist; never reflect arbitrary Origins with credentials enabled.',
+        }
+    if ftype == 'tech_disclosure':
+        return {
+            'title': 'Technology/version disclosure',
+            'steps': [
+                f'Run: <code>curl -sSI {url}</code>',
+                'Look at the <code>Server</code> / <code>X-Powered-By</code> headers.',
+                f'Confirm the disclosure: <code>{detail}</code>',
+            ],
+            'expected': 'The response advertises server or framework version details.',
+            'impact': 'Version disclosure helps an attacker target known CVEs for that stack.',
+            'remediation': 'Suppress or genericize version banners at the app/proxy layer.',
+        }
+    if ftype == 'insecure_cookie':
+        flags = detail if isinstance(detail, list) else [str(detail)]
+        return {
+            'title': 'Insecure cookie flags',
+            'steps': [
+                f'Run: <code>curl -sSI {url}</code>',
+                'Inspect the <code>Set-Cookie</code> header(s).',
+                'Confirm the following are missing: <code>' + ', '.join(flags) + '</code>',
+            ],
+            'expected': 'Session/other cookies are set without one or more of Secure, HttpOnly, SameSite.',
+            'impact': 'Cookies may be exposed over plaintext, readable by scripts, or sent cross-site (CSRF).',
+            'remediation': 'Set Secure, HttpOnly, and an appropriate SameSite on sensitive cookies.',
+        }
+    if ftype == 'error_disclosure':
+        return {
+            'title': 'Verbose error / stack trace disclosure',
+            'steps': [
+                f'Browse to <code>{url}</code> (or the specific request that errored).',
+                'Observe the response body returned by the server.',
+                'Confirm a stack trace or framework error message is shown to the client.',
+            ],
+            'expected': 'A server-side stack trace or detailed error is rendered in the response.',
+            'impact': 'Leaks internal paths, dependencies, and logic useful for further attacks.',
+            'remediation': 'Return generic error pages; log details server-side only.',
+        }
+    return {
+        'title': ftype or 'Finding',
+        'steps': [f'Manually review <code>{url}</code> for: {ftype}'],
+        'expected': 'Analyst confirmation required.',
+        'impact': 'See finding type.',
+        'remediation': 'Review and remediate per finding type.',
+    }
+
+
+def _render_finding_report_html(host: str, findings: list[dict], job_name: str) -> str:
+    from html import escape
+    generated = time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())
+    sections = []
+    for idx, finding in enumerate(findings, start=1):
+        repro = _reproduction_steps(finding, host)
+        severity = escape(str(finding.get('severity', 'info')))
+        steps_html = '\n'.join(f'<li>{step}</li>' for step in repro['steps'])
+        sections.append(f'''
+      <section class="finding sev-{severity}">
+        <h2>{idx}. {escape(repro['title'])} <span class="sev">{severity}</span></h2>
+        <p><strong>Affected asset:</strong> <code>https://{escape(host)}</code></p>
+        <h3>Steps to Reproduce</h3>
+        <ol>{steps_html}</ol>
+        <p><strong>Expected evidence:</strong> {escape(repro['expected'])}</p>
+        <p><strong>Impact:</strong> {escape(repro['impact'])}</p>
+        <p><strong>Remediation:</strong> {escape(repro['remediation'])}</p>
+      </section>''')
+    body = '\n'.join(sections)
+    return f'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Findings write-up: {escape(host)}</title>
+<style>
+  body {{ font-family: Arial, sans-serif; background:#0f172a; color:#e5e7eb; margin:0; padding:32px; }}
+  h1 {{ margin-bottom:4px; }} .meta {{ color:#94a3b8; margin-bottom:24px; }}
+  .finding {{ background:#1f2937; border-left:4px solid #38bdf8; border-radius:8px; padding:16px 20px; margin-bottom:20px; }}
+  .finding.sev-high {{ border-left-color:#ef4444; }} .finding.sev-medium {{ border-left-color:#f59e0b; }}
+  .finding.sev-low {{ border-left-color:#3b82f6; }} .finding.sev-info {{ border-left-color:#64748b; }}
+  .sev {{ font-size:12px; text-transform:uppercase; background:#0b1120; padding:2px 8px; border-radius:999px; margin-left:8px; }}
+  code {{ background:#0b1120; padding:2px 6px; border-radius:4px; }}
+  ol li {{ margin-bottom:6px; }}
+  .disclaimer {{ color:#94a3b8; font-size:13px; margin-top:24px; border-top:1px solid #334155; padding-top:12px; }}
+</style></head><body>
+  <h1>Potential findings: {escape(host)}</h1>
+  <div class="meta">Job: {escape(job_name)} &nbsp;|&nbsp; Generated: {generated} &nbsp;|&nbsp; {len(findings)} finding(s)</div>
+  {body}
+  <p class="disclaimer">These are automated, non-destructive detection signals. Manually reproduce and confirm each item before reporting. Stay within the approved program scope and rules.</p>
+</body></html>'''
+
+
+def _write_finding_report(job_name: str, host: str, findings: list[dict]) -> str | None:
+    if not findings:
+        return None
+    out_dir = REPORTS_DIR / job_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f'{host}.html').write_text(_render_finding_report_html(host, findings, job_name), encoding='utf-8')
+    return f'/reports/{job_name}/{host}'
+
+
 def _application_security_tests(hosts: list[str], *, use_external_tools: bool = False) -> dict:
     deduped_hosts = sorted(set(hosts))
     assets: list[dict] = []
@@ -778,6 +906,9 @@ def _application_security_tests(hosts: list[str], *, use_external_tools: bool = 
             'source_count': len(findings),
             'evidence': [{'source': 'app-test', 'url': url, 'detail': f.get('type')} for f in findings],
         }
+        report_url = _write_finding_report('application-security-testing', host, findings)
+        if report_url:
+            record['report_url'] = report_url
         assets.append(record)
         thread_status.append({'thread_id': thread_name, 'host': host, 'status': record['status'], 'findings': len(findings), 'timestamp': time.time()})
         return record
@@ -1377,7 +1508,7 @@ def main() -> None:
             continue
         RUNNING_DIR.mkdir(parents=True, exist_ok=True)
         lock_path = RUNNING_DIR / f'{job_path.stem}.lock'
-        lock_path.write_text(str(time.time()), encoding='utf-8')
+        lock_path.write_text(str(os.getpid()), encoding='utf-8')
         try:
             allowed_scope = read_scope_file(job.get('program', DEFAULT_PROGRAM))
             result = run_passive_job(job, allowed_scope, use_external_tools=args.external_probes)

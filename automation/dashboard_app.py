@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -75,8 +76,56 @@ def job_workflow_metadata(name: str) -> Dict[str, Any]:
     return {'step': 99, 'label': job_title_label(clean_name), 'depends_on': []}
 
 
+# A lock whose PID is dead (or a legacy lock older than this) is treated as stale.
+STALE_LOCK_SECONDS = 1800
+
+
+def _cleanup_stale_lock(lock_path: Path) -> None:
+    try:
+        lock_path.unlink()
+    except OSError:
+        pass
+
+
+def _lock_is_active(job_name: str) -> bool:
+    """A run is active only if its lock's PID is alive; orphaned locks are cleaned up."""
+    if not RUNNING_DIR.exists():
+        return False
+    lock_path = RUNNING_DIR / f'{job_name}.lock'
+    if not lock_path.exists():
+        return False
+    try:
+        content = lock_path.read_text(encoding='utf-8').strip()
+    except OSError:
+        return False
+    try:
+        pid = int(content)
+    except ValueError:
+        pid = None
+    if pid and pid > 0:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            _cleanup_stale_lock(lock_path)
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+    # Legacy timestamp-based lock: fall back to age.
+    try:
+        age = time.time() - lock_path.stat().st_mtime
+    except OSError:
+        return False
+    if age > STALE_LOCK_SECONDS:
+        _cleanup_stale_lock(lock_path)
+        return False
+    return True
+
+
 def _job_state_for(job_name: str, payload: Dict[str, Any] | None = None) -> str:
-    if RUNNING_DIR.exists() and (RUNNING_DIR / f'{job_name}.lock').exists():
+    if _lock_is_active(job_name):
         return 'running'
     if payload and payload.get('status') == 'waiting_on_dependencies':
         return 'waiting_on_dependencies'
@@ -487,7 +536,8 @@ def rerun_job(job_name: str) -> Dict[str, Any]:
     }, indent=2), encoding='utf-8')
 
     RUNNING_DIR.mkdir(parents=True, exist_ok=True)
-    (RUNNING_DIR / f'{job_name}.lock').write_text(str(int(time.time())), encoding='utf-8')
+    lock_path = RUNNING_DIR / f'{job_name}.lock'
+    lock_path.write_text(str(int(time.time())), encoding='utf-8')
 
     command = [sys.executable, str(ROOT / 'automation' / 'worker.py'), '--force', '--job', job_name]
     if job_name in ACTIVE_JOBS:
@@ -502,6 +552,8 @@ def rerun_job(job_name: str) -> Dict[str, Any]:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+    # Record the worker PID so a crash leaves a detectably-stale lock, not a permanent "running".
+    lock_path.write_text(str(launched.pid), encoding='utf-8')
     return {
         'status': 'queued',
         'job': job_name,
@@ -722,6 +774,9 @@ def index():
                               {% else %}
                                 {{ asset.source or asset.sources|join(', ') }}
                               {% endif %}
+                              {% if asset.report_url %}
+                                <div style="margin-top:6px;"><a href="{{ asset.report_url }}" target="_blank" rel="noopener">📄 View write-up ({{ asset.findings|length }} finding{{ 's' if asset.findings|length != 1 else '' }})</a></div>
+                              {% endif %}
                             </td>
                             <td>{% if asset.kind %}<code>{{ asset.kind }}</code>{% else %}—{% endif %}</td>
                             <td>{% if asset.ports %}{{ asset.ports|join(', ') }}{% else %}—{% endif %}</td>
@@ -895,6 +950,17 @@ def rerun_job_endpoint(job_name: str):
 @app.route('/api/jobs')
 def api_jobs():
     return jsonify(list_jobs())
+
+
+@app.route('/reports/<job_name>/<host>')
+def view_report(job_name: str, host: str):
+    safe_job = re.sub(r'[^a-z0-9\-]', '', job_name.lower())
+    safe_host = re.sub(r'[^a-z0-9.\-]', '', host.lower())
+    reports_dir = (RESULTS_DIR / 'reports').resolve()
+    path = (reports_dir / safe_job / f'{safe_host}.html').resolve()
+    if not str(path).startswith(str(reports_dir)) or not path.exists():
+        return jsonify({'status': 'error', 'message': 'report not found'}), 404
+    return path.read_text(encoding='utf-8'), 200, {'Content-Type': 'text/html; charset=utf-8'}
 
 
 if __name__ == '__main__':
