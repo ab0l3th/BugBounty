@@ -166,6 +166,76 @@ class DashboardJobMetadataTest(unittest.TestCase):
         self.assertEqual(sorted(flagged['a.example.com']['co_hosted']), ['b.example.com'])
         self.assertEqual(flagged['proxy.example.com']['reason'], 'proxy-fronted')
 
+    def test_dashboard_detects_directory_enumeration_step_and_title(self):
+        jobs = list_jobs()
+        dir_job = next((job for job in jobs if job['name'] == 'directory-enumeration-live-hosts'), None)
+        self.assertIsNotNone(dir_job)
+        self.assertEqual(dir_job['workflow_step'], 6)
+        self.assertEqual(dir_job['depends_on'], ['service-enumeration-live-hosts', 'vhost-discovery-shared-infra'])
+        self.assertEqual(job_title_label('directory-enumeration-live-hosts'), 'Directory Enumeration')
+
+    def test_directory_enumeration_uses_combined_step4_and_step5_hosts(self):
+        step4 = ROOT / 'results' / 'service-enumeration-live-hosts.json'
+        step5 = ROOT / 'results' / 'vhost-discovery-shared-infra.json'
+        step4.parent.mkdir(parents=True, exist_ok=True)
+        step4.write_text(__import__('json').dumps({
+            'job': 'service-enumeration-live-hosts',
+            'program': 'american-airlines',
+            'status': 'ok',
+            'discovered': ['app.example.com', 'api.example.com'],
+            'assets': [
+                {'domain': 'app.example.com', 'kind': 'app-server', 'ports': [443]},
+                {'domain': 'api.example.com', 'kind': 'api-gateway', 'ports': [443]},
+            ],
+        }, indent=2), encoding='utf-8')
+        step5.write_text(__import__('json').dumps({
+            'job': 'vhost-discovery-shared-infra',
+            'program': 'american-airlines',
+            'status': 'ok',
+            'discovered': ['api.example.com', 'vhost.example.com'],
+            'assets': [
+                {'domain': 'vhost.example.com', 'kind': 'shared-ip'},
+            ],
+        }, indent=2), encoding='utf-8')
+        try:
+            jobs = list_jobs()
+            dir_job = next(job for job in jobs if job['name'] == 'directory-enumeration-live-hosts')
+            self.assertEqual(dir_job['targets'], ['app.example.com', 'api.example.com', 'vhost.example.com'])
+        finally:
+            step4.unlink(missing_ok=True)
+            step5.unlink(missing_ok=True)
+
+    def test_directory_enumeration_records_interesting_paths(self):
+        from worker import _directory_enumeration
+
+        class FakeResponse:
+            def __init__(self, status):
+                self.status = status
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return False
+            def getcode(self):
+                return self.status
+            def read(self, n=None):
+                return b'body'
+
+        def fake_urlopen(req, timeout=8):
+            if req.full_url.endswith('/login'):
+                return FakeResponse(200)
+            if req.full_url.endswith('/admin'):
+                return FakeResponse(403)
+            raise OSError('404')
+
+        with patch('worker.urllib_request.urlopen', side_effect=fake_urlopen):
+            result = _directory_enumeration(['app.example.com'], wordlist=['/login', '/admin', '/nope'])
+            asset = next(a for a in result['assets'] if a['domain'] == 'app.example.com')
+            found_paths = {p['path']: p['status_code'] for p in asset['paths']}
+            self.assertEqual(found_paths.get('/login'), 200)
+            self.assertEqual(found_paths.get('/admin'), 403)
+            self.assertNotIn('/nope', found_paths)
+            self.assertTrue(result['thread_status'])
+
     def test_service_enumeration_uses_step3_live_asset_output(self):
         result_path = ROOT / 'results' / 'confirm-live-web-assets.json'
         result_path.parent.mkdir(parents=True, exist_ok=True)

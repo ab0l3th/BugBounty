@@ -1,0 +1,13 @@
+name: directory-enumeration-live-hosts
+program: american-airlines
+type: active
+order: 6
+depends_on: [service-enumeration-live-hosts, vhost-discovery-shared-infra]
+targets:
+  - "*.aa.com"
+  - "*.psaairlines.com"
+  - "*.envoyair.com"
+  - "*.piedmont-airlines.com"
+  - "*.cloud.aa.com"
+  - "*.maverick.aa.com"
+  - "aavacations.com"

@@ -113,6 +113,7 @@ This sequence is intentionally ordered and must be followed in order:
 6. Run targeted directory and file enumeration only on the confirmed live targets.
    - Focus on actual app roots rather than broad, noisy scans across every discovered domain.
    - Prioritize likely application paths such as `/admin`, `/login`, `/api`, `/docs`, `/health`, `/backup`, `/config`, and similar known app locations.
+   - Implemented as the `directory-enumeration-live-hosts` job: it takes the combined Step 4 (service enumeration) and Step 5 (vhost) live hosts, then checks a curated app-root path list per host and records interesting HTTP statuses (200/301/302/401/403).
 
 7. Move into application testing only after the live targets and reachable app surface are known.
    - Test authentication flows, exposed APIs, admin panels, and likely misconfigurations.

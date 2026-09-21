@@ -27,10 +27,14 @@ WORKFLOW_SEQUENCE = {
     'confirm-live-web-assets': {'step': 3, 'depends_on': ['aa-passive-discovery', 'american-airlines-passive-dns']},
     'service-enumeration-live-hosts': {'step': 4, 'depends_on': ['confirm-live-web-assets']},
     'vhost-discovery-shared-infra': {'step': 5, 'depends_on': ['service-enumeration-live-hosts']},
+    'directory-enumeration-live-hosts': {'step': 6, 'depends_on': ['service-enumeration-live-hosts', 'vhost-discovery-shared-infra']},
 }
 
 # Jobs that make live connections to targets and must not run in the default passive-only mode.
-ACTIVE_JOBS = {'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra'}
+ACTIVE_JOBS = {'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra', 'directory-enumeration-live-hosts'}
+
+# Statuses that count as a completed job for dependency gating and re-run skipping.
+COMPLETED_STATUSES = {'completed', 'ok', 'no_new_assets', 'no_in_scope_targets', 'no_shared_infra', 'no_paths', 'no_activity'}
 
 
 def job_workflow_dependencies(job_name: str) -> list[str]:
@@ -157,7 +161,7 @@ def should_run_job(job_path: Path, *, force: bool = False) -> bool:
         return True
     status = payload.get('status')
     job_state = payload.get('job_state')
-    if status in {'ok', 'no_new_assets', 'no_in_scope_targets', 'waiting_on_dependencies'} or job_state in {'completed', 'queued', 'running', 'waiting_on_dependencies'}:
+    if status in (COMPLETED_STATUSES | {'waiting_on_dependencies'}) or job_state in {'completed', 'queued', 'running', 'waiting_on_dependencies'}:
         return False
     return True
 
@@ -607,6 +611,82 @@ def _run_vhost_discovery(service_assets: list[dict]) -> dict:
     }
 
 
+# Curated app-root paths; targeted, not a broad brute-force wordlist.
+DEFAULT_CONTENT_WORDLIST = [
+    '/robots.txt', '/sitemap.xml', '/.well-known/security.txt',
+    '/admin', '/login', '/api', '/api/', '/docs', '/health', '/status',
+    '/server-status', '/actuator', '/actuator/health', '/metrics',
+    '/backup', '/config', '/.env', '/.git/HEAD', '/swagger.json',
+    '/openapi.json', '/graphql', '/wp-admin', '/wp-login.php',
+]
+
+# HTTP statuses that indicate a path exists or is worth noting.
+_INTERESTING_STATUS = {200, 201, 204, 301, 302, 307, 308, 401, 403, 405}
+
+
+def _directory_enumeration(hosts: list[str], *, wordlist: list[str] | None = None, use_external_tools: bool = False) -> dict:
+    deduped_hosts = sorted(set(hosts))
+    paths = list(dict.fromkeys(wordlist or DEFAULT_CONTENT_WORDLIST))
+    assets: list[dict] = []
+    probe_log: list[dict] = []
+    thread_status: list[dict] = []
+    max_workers = min(8, max(1, len(deduped_hosts)))
+    headers = {'User-Agent': 'BugBountyPassiveRecon/1.0'}
+
+    def scan_host(host: str) -> dict:
+        thread_name = threading.current_thread().name
+        base = f'https://{host}'
+        found: list[dict] = []
+        for path in paths:
+            url = base + path
+            try:
+                req = urllib_request.Request(url, headers=headers, method='GET')
+                with urllib_request.urlopen(req, timeout=8) as resp:
+                    code = getattr(resp, 'status', resp.getcode())
+                    body = resp.read(2048)
+                    length = len(body) if body else 0
+            except urllib_error.HTTPError as exc:
+                code = exc.code
+                length = 0
+            except (urllib_error.URLError, ValueError, OSError):
+                continue
+            if code in _INTERESTING_STATUS:
+                entry = {'path': path, 'status_code': code, 'length': length, 'url': url}
+                found.append(entry)
+                probe_log.append({'thread_id': thread_name, 'host': host, 'path': path, 'status_code': code, 'status': 'found', 'timestamp': time.time()})
+        record = {
+            'domain': host,
+            'status': 'paths_found' if found else 'no_paths',
+            'kind': 'content',
+            'ports': [],
+            'paths': found,
+            'source': 'dir-enum',
+            'sources': ['dir-enum'],
+            'source_count': len(found),
+            'evidence': [{'source': 'dir-enum', 'url': row['url'], 'status_code': row['status_code']} for row in found],
+        }
+        assets.append(record)
+        thread_status.append({'thread_id': thread_name, 'host': host, 'status': record['status'], 'found': len(found), 'timestamp': time.time()})
+        return record
+
+    if not deduped_hosts:
+        return {'discovered': [], 'assets': [], 'probe_log': [], 'thread_status': [], 'threads': 0}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(scan_host, host) for host in deduped_hosts]
+        for future in as_completed(futures):
+            future.result()
+
+    hits = [a for a in assets if a['paths']]
+    return {
+        'discovered': sorted(a['domain'] for a in hits),
+        'assets': sorted(assets, key=lambda r: r['domain']),
+        'probe_log': probe_log,
+        'thread_status': thread_status,
+        'threads': max_workers,
+    }
+
+
 def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: bool = False) -> dict:
     job_name = (job.get('name') or '').strip()
     job_type = (job.get('type', 'passive') or 'passive').lower()
@@ -782,6 +862,69 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
         response['probe_threads'] = vhost_result.get('threads', 0)
         return response
 
+    if job_name == 'directory-enumeration-live-hosts':
+        step4_path = RESULTS_DIR / 'service-enumeration-live-hosts.json'
+        step5_path = RESULTS_DIR / 'vhost-discovery-shared-infra.json'
+        if not step4_path.exists() or not step5_path.exists():
+            missing = [name for name, p in (
+                ('service-enumeration-live-hosts', step4_path),
+                ('vhost-discovery-shared-infra', step5_path),
+            ) if not p.exists()]
+            return {
+                'job': job_name,
+                'program': job.get('program', DEFAULT_PROGRAM),
+                'type': 'active',
+                'targets': [],
+                'queued': [],
+                'skipped': [],
+                'status': 'waiting_on_dependencies',
+                'job_state': 'waiting_on_dependencies',
+                'discovered': [],
+                'assets': [],
+                'source_count': 0,
+                'dependencies': missing,
+            }
+
+        combined: list[str] = []
+        for path in (step4_path, step5_path):
+            try:
+                payload = json.loads(path.read_text(encoding='utf-8'))
+            except Exception:
+                continue
+            hosts = payload.get('discovered', []) or []
+            if not hosts:
+                hosts = [a.get('domain') for a in (payload.get('assets', []) or []) if isinstance(a, dict) and a.get('domain')]
+            combined.extend(hosts)
+
+        deduped_hosts: list[str] = []
+        seen: set[str] = set()
+        for host in combined:
+            if not host or host in seen:
+                continue
+            seen.add(host)
+            if is_in_scope(host, allowed_scope):
+                deduped_hosts.append(host)
+
+        enum_result = _directory_enumeration(deduped_hosts, use_external_tools=use_external_tools)
+        assets = enum_result.get('assets', [])
+        response = {
+            'job': job_name,
+            'program': job.get('program', DEFAULT_PROGRAM),
+            'type': 'active',
+            'targets': deduped_hosts,
+            'queued': deduped_hosts,
+            'skipped': [host for host in sorted(set(combined)) if host and host not in deduped_hosts],
+            'status': 'ok' if enum_result.get('discovered') else 'no_paths',
+            'discovered': enum_result.get('discovered', []),
+            'assets': assets,
+            'source_count': sum(len(a.get('paths', [])) for a in assets),
+            'depends_on': ['service-enumeration-live-hosts', 'vhost-discovery-shared-infra'],
+        }
+        response['probe_log'] = enum_result.get('probe_log', [])
+        response['thread_status'] = enum_result.get('thread_status', [])
+        response['probe_threads'] = enum_result.get('threads', 0)
+        return response
+
     result = {
         'job': job.get('name'),
         'program': job.get('program', DEFAULT_PROGRAM),
@@ -906,7 +1049,7 @@ def main() -> None:
                     pending.append(dependency)
                     continue
                 state = (payload.get('job_state') or payload.get('status') or '').lower()
-                if state not in {'completed', 'ok', 'no_new_assets', 'no_in_scope_targets'}:
+                if state not in (COMPLETED_STATUSES | {'completed'}):
                     pending.append(dependency)
             if pending:
                 print(json.dumps({'job': job.get('name'), 'status': 'waiting_on_dependencies', 'dependencies': pending}, indent=2))

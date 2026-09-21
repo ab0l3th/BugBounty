@@ -22,7 +22,7 @@ JOBS_DIR = ROOT / 'jobs'
 app = Flask(__name__)
 
 # Jobs that make live connections to targets and must be launched in active mode.
-ACTIVE_JOBS = {'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra'}
+ACTIVE_JOBS = {'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra', 'directory-enumeration-live-hosts'}
 
 WORKFLOW_SEQUENCE = {
     'aa-passive-discovery': {
@@ -50,6 +50,11 @@ WORKFLOW_SEQUENCE = {
         'label': 'Vhost Discovery',
         'depends_on': ['service-enumeration-live-hosts'],
     },
+    'directory-enumeration-live-hosts': {
+        'step': 6,
+        'label': 'Directory Enumeration',
+        'depends_on': ['service-enumeration-live-hosts', 'vhost-discovery-shared-infra'],
+    },
 }
 
 
@@ -73,7 +78,7 @@ def _job_state_for(job_name: str, payload: Dict[str, Any] | None = None) -> str:
         return 'queued'
     if payload and payload.get('job_state') == 'completed':
         return 'completed'
-    if payload and payload.get('status') in {'ok', 'no_new_assets', 'no_in_scope_targets'}:
+    if payload and payload.get('status') in {'ok', 'no_new_assets', 'no_in_scope_targets', 'no_shared_infra', 'no_paths', 'no_activity'}:
         return 'completed'
     return 'queued'
 
@@ -110,6 +115,8 @@ def job_title_label(value: str) -> str:
         return 'Service Enumeration'
     if 'vhost' in text or 'virtual-host' in text:
         return 'Vhost Discovery'
+    if 'directory' in text and 'enumeration' in text:
+        return 'Directory Enumeration'
     if 'aa-passive-discovery' in text:
         return 'Passive Web Discovery'
     if 'passive-dns' in text or ('passive' in text and 'dns' in text and 'discovery' not in text):
@@ -177,6 +184,27 @@ def vhost_targets_from_step4() -> List[str]:
         if item and item not in seen:
             seen.add(item)
             merged.append(item)
+    return merged
+
+
+def combined_live_roots_from_step4_and_step5() -> List[str]:
+    """Union of Step 4 service-enum live hosts and Step 5 confirmed vhosts, order-preserving."""
+    merged: List[str] = []
+    seen: set[str] = set()
+    for result_name in ('service-enumeration-live-hosts', 'vhost-discovery-shared-infra'):
+        path = RESULTS_DIR / f'{result_name}.json'
+        if not path.exists():
+            continue
+        payload = read_result_file(path)
+        if not payload:
+            continue
+        hosts = list(payload.get('discovered', []) or [])
+        if not hosts:
+            hosts = [a.get('domain') for a in (payload.get('assets', []) or []) if isinstance(a, dict) and a.get('domain')]
+        for item in hosts:
+            if item and item not in seen:
+                seen.add(item)
+                merged.append(item)
     return merged
 
 
@@ -269,6 +297,8 @@ def list_jobs() -> List[Dict[str, Any]]:
                 queued_targets = live_web_asset_targets_from_step3()
             elif job_name == 'vhost-discovery-shared-infra':
                 queued_targets = vhost_targets_from_step4()
+            elif job_name == 'directory-enumeration-live-hosts':
+                queued_targets = combined_live_roots_from_step4_and_step5()
             else:
                 queued_targets = definition.get('targets', [])
             if payload:
@@ -388,6 +418,8 @@ def rerun_job(job_name: str) -> Dict[str, Any]:
         queued_targets = live_web_asset_targets_from_step3()
     elif job_name == 'vhost-discovery-shared-infra':
         queued_targets = vhost_targets_from_step4()
+    elif job_name == 'directory-enumeration-live-hosts':
+        queued_targets = combined_live_roots_from_step4_and_step5()
     else:
         queued_targets = []
     result_path.write_text(json.dumps({
@@ -460,7 +492,7 @@ def index():
     jobs = list_jobs()
     summary = summarize_jobs(jobs)
     grouped_jobs = group_jobs_by_program(jobs)
-    workflow_order = [job_workflow_metadata(job_name) for job_name in ['aa-passive-discovery', 'american-airlines-passive-dns', 'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra']]
+    workflow_order = [job_workflow_metadata(job_name) for job_name in ['aa-passive-discovery', 'american-airlines-passive-dns', 'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra', 'directory-enumeration-live-hosts']]
     return render_template_string('''
     <!doctype html>
     <html lang="en">
