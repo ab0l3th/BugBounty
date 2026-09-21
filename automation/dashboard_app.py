@@ -130,6 +130,22 @@ def merged_live_asset_targets() -> List[str]:
     return merged
 
 
+def live_web_asset_targets_from_step3() -> List[str]:
+    path = RESULTS_DIR / 'confirm-live-web-assets.json'
+    if not path.exists():
+        return []
+    payload = read_result_file(path)
+    if not payload:
+        return []
+    merged: List[str] = []
+    seen: set[str] = set()
+    for item in (payload.get('discovered', []) or []) + (payload.get('targets', []) or []) + (payload.get('queued', []) or []):
+        if item and item not in seen:
+            seen.add(item)
+            merged.append(item)
+    return merged
+
+
 def group_jobs_by_program(jobs: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for job in jobs:
@@ -213,7 +229,12 @@ def list_jobs() -> List[Dict[str, Any]]:
             payload = read_result_file(RESULTS_DIR / f'{job_name}.json')
             job_state = _job_state_for(job_name, payload if payload else None)
             metadata = job_workflow_metadata(definition.get('name', job_name))
-            queued_targets = merged_live_asset_targets() if job_name == 'confirm-live-web-assets' else definition.get('targets', [])
+            if job_name == 'confirm-live-web-assets':
+                queued_targets = merged_live_asset_targets()
+            elif job_name == 'service-enumeration-live-hosts':
+                queued_targets = live_web_asset_targets_from_step3()
+            else:
+                queued_targets = definition.get('targets', [])
             if payload:
                 assets = payload.get('assets') or [
                     {'domain': host, 'status': 'in_scope', 'sources': [], 'source': ''}
@@ -316,7 +337,12 @@ def rerun_job(job_name: str) -> Dict[str, Any]:
     program = match.get('program', 'unknown')
     result_path = RESULTS_DIR / f'{job_name}.json'
     result_path.parent.mkdir(parents=True, exist_ok=True)
-    queued_targets = merged_live_asset_targets() if job_name == 'confirm-live-web-assets' else []
+    if job_name == 'confirm-live-web-assets':
+        queued_targets = merged_live_asset_targets()
+    elif job_name == 'service-enumeration-live-hosts':
+        queued_targets = live_web_asset_targets_from_step3()
+    else:
+        queued_targets = []
     result_path.write_text(json.dumps({
         'job': job_name,
         'program': program,

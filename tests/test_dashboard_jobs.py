@@ -110,6 +110,29 @@ class DashboardJobMetadataTest(unittest.TestCase):
         self.assertEqual(service_job['depends_on'], ['confirm-live-web-assets'])
         self.assertEqual(job_title_label('service-enumeration-live-hosts'), 'Service Enumeration')
 
+    def test_service_enumeration_uses_step3_live_asset_output(self):
+        result_path = ROOT / 'results' / 'confirm-live-web-assets.json'
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(__import__('json').dumps({
+            'job': 'confirm-live-web-assets',
+            'program': 'american-airlines',
+            'status': 'ok',
+            'discovered': ['host-001.example.com', 'host-002.example.com', 'host-001.example.com'],
+            'targets': ['host-001.example.com', 'host-002.example.com'],
+            'assets': [
+                {'domain': 'host-001.example.com', 'status': 'live', 'source': 'http-probe', 'sources': ['http-probe']},
+                {'domain': 'host-002.example.com', 'status': 'live', 'source': 'http-probe', 'sources': ['http-probe']},
+            ],
+            'source_count': 2,
+        }, indent=2), encoding='utf-8')
+        try:
+            jobs = list_jobs()
+            service_job = next(job for job in jobs if job['name'] == 'service-enumeration-live-hosts')
+            self.assertEqual(service_job['targets'], ['host-001.example.com', 'host-002.example.com'])
+            self.assertEqual(service_job['queued'], ['host-001.example.com', 'host-002.example.com'])
+        finally:
+            result_path.unlink(missing_ok=True)
+
     def test_confirm_live_web_assets_uses_merged_step1_and_step2_targets(self):
         from worker import run_passive_job
 
