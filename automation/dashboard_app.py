@@ -363,7 +363,22 @@ def index():
     </head>
     <body>
       <div class="wrap">
-        <h1>BugBounty Dashboard</h1>
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:20px;">
+          <h1 style="margin:0;">BugBounty Dashboard</h1>
+          <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; background:#1f2937; border:1px solid #334155; border-radius:10px; padding:8px 12px;">
+            <label for="refresh-interval" style="font-size:14px; color:#cbd5e1;">Auto refresh</label>
+            <select id="refresh-interval" style="background:#0f172a; color:#e5e7eb; border:1px solid #475569; border-radius:6px; padding:6px 8px;">
+              <option value="0">Off</option>
+              <option value="15">15 sec</option>
+              <option value="30">30 sec</option>
+              <option value="60" selected>60 sec</option>
+              <option value="120">2 min</option>
+              <option value="300">5 min</option>
+            </select>
+            <button id="refresh-now" type="button" style="background:#0ea5e9; color:#082f49; border:none; border-radius:6px; padding:8px 12px; font-weight:bold; cursor:pointer;">Refresh data</button>
+            <span id="last-refreshed" style="font-size:12px; color:#cbd5e1;">Last refreshed: --:--:--</span>
+          </div>
+        </div>
         <div class="summary-row">
           <div class="pill">
             <div>Total jobs</div>
@@ -480,6 +495,60 @@ def index():
           </div>
         {% endif %}
       </div>
+      <script>
+        const refreshSelect = document.getElementById('refresh-interval');
+        const refreshButton = document.getElementById('refresh-now');
+        const lastRefreshedLabel = document.getElementById('last-refreshed');
+        const savedValue = localStorage.getItem('bugbounty-refresh-interval') || '60';
+        if (refreshSelect) {
+          refreshSelect.value = savedValue;
+        }
+
+        function formatTime(date) {
+          return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        }
+
+        function setLastRefreshed() {
+          const stamp = new Date();
+          localStorage.setItem('bugbounty-last-refreshed', stamp.toISOString());
+          if (lastRefreshedLabel) {
+            lastRefreshedLabel.textContent = 'Last refreshed: ' + formatTime(stamp);
+          }
+        }
+
+        const savedRefresh = localStorage.getItem('bugbounty-last-refreshed');
+        if (savedRefresh && lastRefreshedLabel) {
+          lastRefreshedLabel.textContent = 'Last refreshed: ' + formatTime(new Date(savedRefresh));
+        } else {
+          setLastRefreshed();
+        }
+
+        let refreshTimer = null;
+        function applyRefreshInterval() {
+          const value = Number(refreshSelect ? refreshSelect.value : 60);
+          localStorage.setItem('bugbounty-refresh-interval', String(value));
+          if (refreshTimer) {
+            clearInterval(refreshTimer);
+            refreshTimer = null;
+          }
+          if (value > 0) {
+            refreshTimer = setInterval(() => {
+              window.location.reload();
+            }, value * 1000);
+          }
+        }
+
+        if (refreshSelect) {
+          refreshSelect.addEventListener('change', applyRefreshInterval);
+        }
+        if (refreshButton) {
+          refreshButton.addEventListener('click', () => {
+            setLastRefreshed();
+            window.location.reload();
+          });
+        }
+        applyRefreshInterval();
+      </script>
     </body>
     </html>
     ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs)
