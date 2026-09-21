@@ -558,9 +558,9 @@ def index():
                     </div>
                   </summary>
                   <div class="job-content">
-                    <form class="rerun-form" action="/jobs/{{ job.name }}/rerun" method="post">
-                      <button class="rerun-button" type="submit">Re-run job</button>
-                    </form>
+                    <div class="rerun-form">
+                      <button class="rerun-button" type="button" onclick="rerunJob('{{ job.name }}', this)">Re-run job</button>
+                    </div>
                     <p><strong>Program:</strong> {{ program_label(job.program) }}</p>
                     <p><strong>Type:</strong> {{ job.type }}</p>
                     <p><strong>Pipeline status:</strong> {{ job.status }}</p>
@@ -657,6 +657,56 @@ def index():
         {% endif %}
       </div>
       <script>
+        const TOKEN_KEY = 'bugbounty-dashboard-token';
+
+        function getToken(forcePrompt) {
+          let token = localStorage.getItem(TOKEN_KEY) || '';
+          if (!token || forcePrompt) {
+            token = (window.prompt('Enter dashboard token (X-BugBounty-Token):', '') || '').trim();
+            if (token) {
+              localStorage.setItem(TOKEN_KEY, token);
+            }
+          }
+          return token;
+        }
+
+        async function rerunJob(jobName, button) {
+          const token = getToken(false);
+          if (!token) {
+            return;
+          }
+          const original = button ? button.textContent : '';
+          if (button) {
+            button.disabled = true;
+            button.textContent = 'Queuing…';
+          }
+          try {
+            const resp = await fetch('/jobs/' + encodeURIComponent(jobName) + '/rerun', {
+              method: 'POST',
+              headers: { 'X-BugBounty-Token': token },
+            });
+            if (resp.status === 401) {
+              localStorage.removeItem(TOKEN_KEY);
+              alert('Unauthorized. Re-enter the dashboard token.');
+              getToken(true);
+              return;
+            }
+            if (!resp.ok) {
+              const detail = await resp.json().catch(() => ({}));
+              alert('Re-run failed: ' + (detail.message || resp.status));
+              return;
+            }
+            window.location.reload();
+          } catch (err) {
+            alert('Re-run request error: ' + err);
+          } finally {
+            if (button) {
+              button.disabled = false;
+              button.textContent = original;
+            }
+          }
+        }
+
         const refreshSelect = document.getElementById('refresh-interval');
         const refreshButton = document.getElementById('refresh-now');
         const lastRefreshedLabel = document.getElementById('last-refreshed');
