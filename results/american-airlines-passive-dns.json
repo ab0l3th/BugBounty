@@ -23,7 +23,9 @@
   "skipped": [],
   "status": "ok",
   "discovered": [
-    "aavacations.com"
+    "aavacations.com",
+    "cloud.aa.com",
+    "maverick.aa.com"
   ],
   "assets": [
     {
@@ -33,8 +35,46 @@
       "sources": [
         "dns.google"
       ],
-      "source_count": 1
+      "source_count": 1,
+      "evidence": [
+        {
+          "source": "dns.google",
+          "url": "https://dns.google/resolve?name=aavacations.com&type=A"
+        }
+      ]
+    },
+    {
+      "domain": "cloud.aa.com",
+      "status": "in_scope",
+      "source": "dns.google",
+      "sources": [
+        "dns.google"
+      ],
+      "source_count": 1,
+      "evidence": [
+        {
+          "source": "dns.google",
+          "url": "https://dns.google/resolve?name=cloud.aa.com&type=A"
+        }
+      ]
+    },
+    {
+      "domain": "maverick.aa.com",
+      "status": "in_scope",
+      "source": "dns.google",
+      "sources": [
+        "dns.google"
+      ],
+      "source_count": 1,
+      "evidence": [
+        {
+          "source": "dns.google",
+          "url": "https://dns.google/resolve?name=maverick.aa.com&type=A"
+        }
+      ]
     }
   ],
-  "source_count": 1
+  "source_count": 1,
+  "enrichment_job": "american-airlines-passive-dns",
+  "enrichment_program": "american-airlines"
 }
