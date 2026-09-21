@@ -1,5 +1,7 @@
 name: github-monitor
 program: github
 type: github
+order: 3
+depends_on: [aa-passive-discovery, american-airlines-passive-dns]
 targets:
   - "ab0l3th/BugBounty"

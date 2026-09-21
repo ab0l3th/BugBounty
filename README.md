@@ -72,6 +72,44 @@ A lightweight dashboard is included for local review over your private network:
 
 It reads the JSON result files from `results/` and serves a simple web view suitable for hosts on your LAN. It is intended for private, in-network access only and is not exposed publicly.
 
+## Testing sequence and dependency order
+
+This sequence is intentionally ordered and must be followed in order:
+
+1. Validate scope and approved targets.
+   - Confirm the in-scope assets and allowed testing surfaces.
+   - Ensure the discovery list is limited to authorized targets only.
+
+2. Enumerate services on the live and relevant hosts.
+   - Check which hosts respond and what services are exposed.
+   - Use service fingerprinting to identify HTTP, APIs, proxies, admin panels, and alternate ports.
+   - Keep only the hosts and ports that are genuinely relevant to the in-scope program.
+
+3. Confirm live web assets first, but only after steps 1 and 2 are complete.
+   - Use the narrowed target list from steps 1 and 2 before validating which domains are worth testing.
+   - Check the relevant domains for live HTTP responses on:
+     - 80 / 443
+     - 8080 / 8443
+     - 8000 / 5000, if internal app patterns apply
+   - Use:
+     - `httpx` or `curl` to verify HTTP status
+     - `nmap` for service fingerprinting when needed
+     - `whatweb` or Wappalyzer-style checks for tech stack
+   - Goal: reduce the list from "all discovered domains" to "real web apps worth testing"
+   - Important: this step must not run before steps 1 and 2 because it depends on the host/service data produced by those steps.
+
+4. Run vhost discovery only when there is evidence of shared infrastructure.
+   - Use vhost checks when multiple apps share the same IP, or when a proxy/CDN is likely fronting the application.
+   - Skip vhost fuzzing for simple single-app domains unless evidence suggests it is necessary.
+
+5. Run targeted directory and file enumeration only on the confirmed live targets.
+   - Focus on actual app roots rather than broad, noisy scans across every discovered domain.
+   - Prioritize likely application paths such as `/admin`, `/login`, `/api`, `/docs`, `/health`, `/backup`, `/config`, and similar known app locations.
+
+6. Move into application testing only after the live targets and reachable app surface are known.
+   - Test authentication flows, exposed APIs, admin panels, and likely misconfigurations.
+   - Keep testing minimal, scoped, and aligned with the approved rules.
+
 ## Initial status
 
 This repository has been initialized as a private, controlled workspace for approved bug bounty and security research workflows.

@@ -21,6 +21,31 @@ JOBS_DIR = ROOT / 'jobs'
 
 app = Flask(__name__)
 
+WORKFLOW_SEQUENCE = {
+    'aa-passive-discovery': {
+        'step': 1,
+        'label': 'Passive Web Discovery',
+        'depends_on': [],
+    },
+    'american-airlines-passive-dns': {
+        'step': 2,
+        'label': 'Passive DNS Discovery',
+        'depends_on': ['aa-passive-discovery'],
+    },
+    'confirm-live-web-assets': {
+        'step': 3,
+        'label': 'Confirm Live Web Assets',
+        'depends_on': ['aa-passive-discovery', 'american-airlines-passive-dns'],
+    },
+}
+
+
+def job_workflow_metadata(name: str) -> Dict[str, Any]:
+    clean_name = (name or '').strip()
+    if clean_name in WORKFLOW_SEQUENCE:
+        return dict(WORKFLOW_SEQUENCE[clean_name])
+    return {'step': 99, 'label': job_title_label(clean_name), 'depends_on': []}
+
 
 def _job_state_for(job_name: str, payload: Dict[str, Any] | None = None) -> str:
     if RUNNING_DIR.exists() and (RUNNING_DIR / f'{job_name}.lock').exists():
@@ -62,6 +87,8 @@ def job_title_label(value: str) -> str:
     text = (value or '').lower().replace('_', '-')
     if 'github' in text and 'monitor' in text:
         return 'GitHub Monitor'
+    if 'confirm-live-web-assets' in text or ('live' in text and 'web' in text and 'assets' in text):
+        return 'Confirm Live Web Assets'
     if 'aa-passive-discovery' in text:
         return 'Passive Web Discovery'
     if 'passive-dns' in text or ('passive' in text and 'dns' in text and 'discovery' not in text):
@@ -107,7 +134,7 @@ def read_result_file(path: Path) -> Dict[str, Any]:
 
 
 def read_job_definition(path: Path) -> Dict[str, Any]:
-    data: Dict[str, Any] = {'name': path.stem, 'program': 'unknown', 'type': 'passive', 'targets': []}
+    data: Dict[str, Any] = {'name': path.stem, 'program': 'unknown', 'type': 'passive', 'targets': [], 'depends_on': [], 'order': 99}
     try:
         lines = path.read_text(encoding='utf-8').splitlines()
     except Exception:
@@ -122,10 +149,27 @@ def read_job_definition(path: Path) -> Dict[str, Any]:
             data['program'] = clean.split(':', 1)[1].strip()
         elif clean.startswith('type:'):
             data['type'] = clean.split(':', 1)[1].strip()
+        elif clean.startswith('order:'):
+            try:
+                data['order'] = int(clean.split(':', 1)[1].strip())
+            except ValueError:
+                data['order'] = 99
+        elif clean.startswith('depends_on:'):
+            value = clean.split(':', 1)[1].strip()
+            if value:
+                parsed = value.strip('[]')
+                if parsed:
+                    data['depends_on'] = [item.strip().strip("'\"") for item in parsed.split(',') if item.strip()]
+                else:
+                    data['depends_on'] = []
         elif clean.startswith('targets:'):
             continue
         elif clean.startswith('- '):
             data['targets'].append(clean[2:].strip().strip("'\""))
+    if not data.get('depends_on'):
+        meta = job_workflow_metadata(data['name'])
+        data['depends_on'] = meta.get('depends_on', [])
+    data['order'] = min(data.get('order', 99), job_workflow_metadata(data['name']).get('step', 99))
     return data
 
 
@@ -140,6 +184,7 @@ def list_jobs() -> List[Dict[str, Any]]:
             definition = read_job_definition(path)
             payload = read_result_file(RESULTS_DIR / f'{job_name}.json')
             job_state = _job_state_for(job_name, payload if payload else None)
+            metadata = job_workflow_metadata(definition.get('name', job_name))
             if payload:
                 assets = payload.get('assets') or [
                     {'domain': host, 'status': 'in_scope', 'sources': [], 'source': ''}
@@ -158,6 +203,8 @@ def list_jobs() -> List[Dict[str, Any]]:
                     'queued': payload.get('queued', []),
                     'skipped': payload.get('skipped', []),
                     'source_count': payload.get('source_count', 0),
+                    'workflow_step': metadata.get('step', definition.get('order', 99)),
+                    'depends_on': metadata.get('depends_on', definition.get('depends_on', [])),
                     'raw': payload,
                 })
             else:
@@ -174,6 +221,8 @@ def list_jobs() -> List[Dict[str, Any]]:
                     'queued': definition.get('targets', []),
                     'skipped': [],
                     'source_count': 0,
+                    'workflow_step': metadata.get('step', definition.get('order', 99)),
+                    'depends_on': metadata.get('depends_on', definition.get('depends_on', [])),
                     'raw': {'job': definition.get('name', job_name), 'job_state': 'queued'},
                 })
 
@@ -190,6 +239,7 @@ def list_jobs() -> List[Dict[str, Any]]:
             {'domain': host, 'status': 'in_scope', 'sources': [], 'source': ''}
             for host in payload.get('discovered', [])
         ]
+        metadata = job_workflow_metadata(payload.get('job', path.stem))
         jobs.append({
             'name': payload.get('job', path.stem),
             'path': path.name,
@@ -203,9 +253,11 @@ def list_jobs() -> List[Dict[str, Any]]:
             'queued': payload.get('queued', []),
             'skipped': payload.get('skipped', []),
             'source_count': payload.get('source_count', 0),
+            'workflow_step': metadata.get('step', 99),
+            'depends_on': metadata.get('depends_on', []),
             'raw': payload,
         })
-    return sorted(jobs, key=lambda item: item['name'])
+    return sorted(jobs, key=lambda item: (item.get('workflow_step', 99), item['name']))
 
 
 def verify_github_signature(payload: bytes, signature: str | None, secret: str) -> bool:
@@ -303,6 +355,7 @@ def index():
     jobs = list_jobs()
     summary = summarize_jobs(jobs)
     grouped_jobs = group_jobs_by_program(jobs)
+    workflow_order = [job_workflow_metadata(job_name) for job_name in ['aa-passive-discovery', 'american-airlines-passive-dns', 'confirm-live-web-assets']]
     return render_template_string('''
     <!doctype html>
     <html lang="en">
@@ -377,6 +430,17 @@ def index():
             </select>
             <button id="refresh-now" type="button" style="background:#0ea5e9; color:#082f49; border:none; border-radius:6px; padding:8px 12px; font-weight:bold; cursor:pointer;">Refresh data</button>
             <span id="last-refreshed" style="font-size:12px; color:#cbd5e1;">Last refreshed: --:--:--</span>
+          </div>
+        </div>
+        <div class="card" style="margin-bottom:20px;">
+          <h2 style="margin-top:0; margin-bottom:12px;">Workflow order</h2>
+          <div style="display:flex; flex-wrap:wrap; gap:10px;">
+            {% for step in workflow_order %}
+              <div style="min-width:180px; background:#0f172a; border:1px solid #334155; border-radius:10px; padding:10px 12px;">
+                <div style="font-size:11px; letter-spacing:0.08em; text-transform:uppercase; color:#94a3b8;">Step {{ step.step }}</div>
+                <div style="font-weight:bold; margin-top:4px;">{{ step.label }}</div>
+              </div>
+            {% endfor %}
           </div>
         </div>
         <div class="summary-row">
@@ -551,7 +615,7 @@ def index():
       </script>
     </body>
     </html>
-    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs)
+    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs, workflow_order=workflow_order)
 
 
 @app.route('/jobs/<job_name>/rerun', methods=['POST'])

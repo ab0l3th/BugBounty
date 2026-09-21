@@ -79,6 +79,13 @@ class DashboardJobMetadataTest(unittest.TestCase):
                 provider_names = {entry['source'] for entry in result['provider_status']}
                 self.assertTrue({'certspotter', 'hackertarget', 'crt.sh', 'dns.google'} <= provider_names)
 
+    def test_dashboard_detects_third_workflow_job_and_order(self):
+        jobs = list_jobs()
+        live_assets_job = next(job for job in jobs if job['name'] == 'confirm-live-web-assets')
+        self.assertEqual(live_assets_job['workflow_step'], 3)
+        self.assertEqual(live_assets_job['depends_on'], ['aa-passive-discovery', 'american-airlines-passive-dns'])
+        self.assertEqual(job_title_label('confirm-live-web-assets'), 'Confirm Live Web Assets')
+
     def test_dashboard_can_queue_rerun_for_job(self):
         with patch('dashboard_app.subprocess.Popen', return_value=type('Proc', (), {'pid': 1234})()) as mock_popen:
             with app.test_client() as client:

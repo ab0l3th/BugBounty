@@ -1,8 +1,8 @@
-name: aa-passive-discovery
+name: confirm-live-web-assets
 program: american-airlines
 type: passive
-order: 1
-depends_on: []
+order: 3
+depends_on: [aa-passive-discovery, american-airlines-passive-dns]
 targets:
   - "*.aa.com"
   - "*.psaairlines.com"

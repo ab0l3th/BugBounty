@@ -5,6 +5,8 @@ import argparse
 import json
 import time
 from pathlib import Path
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 from scope_validator import is_in_scope, parse_scope_pattern
 
@@ -13,6 +15,15 @@ JOBS_DIR = ROOT / 'jobs'
 RESULTS_DIR = ROOT / 'results'
 RUNNING_DIR = RESULTS_DIR / '.running'
 DEFAULT_PROGRAM = 'american-airlines'
+WORKFLOW_SEQUENCE = {
+    'aa-passive-discovery': {'step': 1, 'depends_on': []},
+    'american-airlines-passive-dns': {'step': 2, 'depends_on': ['aa-passive-discovery']},
+    'confirm-live-web-assets': {'step': 3, 'depends_on': ['aa-passive-discovery', 'american-airlines-passive-dns']},
+}
+
+
+def job_workflow_dependencies(job_name: str) -> list[str]:
+    return list(WORKFLOW_SEQUENCE.get(job_name, {}).get('depends_on', []))
 
 
 def read_scope_file(program_name: str = DEFAULT_PROGRAM) -> list[str]:
@@ -31,7 +42,8 @@ def read_scope_file(program_name: str = DEFAULT_PROGRAM) -> list[str]:
 def discover_jobs() -> list[Path]:
     if not JOBS_DIR.exists():
         return []
-    return sorted(JOBS_DIR.glob('*.yaml')) + sorted(JOBS_DIR.glob('*.yml'))
+    job_paths = list(JOBS_DIR.glob('*.yaml')) + list(JOBS_DIR.glob('*.yml'))
+    return sorted(job_paths, key=lambda path: (WORKFLOW_SEQUENCE.get(path.stem, {'step': 99})['step'], path.name))
 
 
 def load_job(path: Path) -> dict:
@@ -46,10 +58,25 @@ def load_job(path: Path) -> dict:
             data['program'] = clean.split(':', 1)[1].strip()
         elif clean.startswith('type:'):
             data['type'] = clean.split(':', 1)[1].strip()
+        elif clean.startswith('order:'):
+            try:
+                data['order'] = int(clean.split(':', 1)[1].strip())
+            except ValueError:
+                data['order'] = 99
+        elif clean.startswith('depends_on:'):
+            value = clean.split(':', 1)[1].strip()
+            if value:
+                parsed = value.strip('[]')
+                if parsed:
+                    data['depends_on'] = [item.strip().strip("'\"") for item in parsed.split(',') if item.strip()]
+                else:
+                    data['depends_on'] = []
         elif clean.startswith('targets:'):
             continue
         elif clean.startswith('- '):
             data['targets'].append(clean[2:].strip().strip("'\""))
+    if not data.get('depends_on'):
+        data['depends_on'] = job_workflow_dependencies(data['name'])
     return data
 
 
@@ -124,12 +151,119 @@ def should_run_job(job_path: Path, *, force: bool = False) -> bool:
     return True
 
 
+def _http_probe_candidates(host: str) -> list[str]:
+    host = host.strip().strip('.')
+    if not host:
+        return []
+    candidates = [f'https://{host}', f'http://{host}']
+    for port in (443, 8443, 80, 8080, 8000, 5000):
+        if port in {80, 443}:
+            continue
+        candidates.append(f'https://{host}:{port}')
+        candidates.append(f'http://{host}:{port}')
+    return list(dict.fromkeys(candidates))
+
+
+def _probe_live_web_assets(hosts: list[str]) -> list[dict]:
+    discovered: list[dict] = []
+    headers = {'User-Agent': 'BugBountyPassiveRecon/1.0'}
+    for host in sorted(set(hosts)):
+        for url in _http_probe_candidates(host):
+            try:
+                req = urllib_request.Request(url, headers=headers, method='GET')
+                with urllib_request.urlopen(req, timeout=8) as resp:
+                    code = getattr(resp, 'status', resp.getcode())
+                    if code and code < 400:
+                        discovered.append({
+                            'domain': host,
+                            'status': 'live',
+                            'source': 'http-probe',
+                            'sources': ['http-probe'],
+                            'source_count': 1,
+                            'evidence': [{
+                                'source': 'http-probe',
+                                'url': url,
+                                'status_code': code,
+                            }],
+                        })
+                        break
+            except (urllib_error.HTTPError, urllib_error.URLError, ValueError):
+                continue
+    return discovered
+
+
 def run_passive_job(job: dict, allowed_scope: list[str]) -> dict:
+    job_name = (job.get('name') or '').strip()
     job_type = (job.get('type', 'passive') or 'passive').lower()
     if job_type in {'github', 'repo', 'monitor'}:
         from github_monitor import github_activity
         repo = (job.get('targets') or [job.get('name', 'ab0l3th/BugBounty')])[0]
         return github_activity(repo)
+
+    if job_name == 'confirm-live-web-assets':
+        dns_result_path = RESULTS_DIR / 'american-airlines-passive-dns.json'
+        if not dns_result_path.exists():
+            return {
+                'job': job_name,
+                'program': job.get('program', DEFAULT_PROGRAM),
+                'type': 'passive',
+                'targets': [],
+                'queued': [],
+                'skipped': [],
+                'status': 'waiting_on_dependencies',
+                'discovered': [],
+                'assets': [],
+                'source_count': 0,
+                'dependencies': ['american-airlines-passive-dns'],
+            }
+        try:
+            dns_result = json.loads(dns_result_path.read_text(encoding='utf-8'))
+        except Exception:
+            return {
+                'job': job_name,
+                'program': job.get('program', DEFAULT_PROGRAM),
+                'type': 'passive',
+                'targets': [],
+                'queued': [],
+                'skipped': [],
+                'status': 'waiting_on_dependencies',
+                'discovered': [],
+                'assets': [],
+                'source_count': 0,
+                'dependencies': ['american-airlines-passive-dns'],
+            }
+
+        dns_targets = dns_result.get('discovered', []) or dns_result.get('targets', []) or []
+        in_scope = [host for host in dns_targets if is_in_scope(host, allowed_scope) or host in dns_targets]
+        live_assets = _probe_live_web_assets(in_scope)
+        deduped = {}
+        for asset in live_assets:
+            domain = asset['domain']
+            existing = deduped.setdefault(domain, {
+                'domain': domain,
+                'status': 'live',
+                'source': 'http-probe',
+                'sources': ['http-probe'],
+                'source_count': 1,
+                'evidence': [],
+            })
+            existing['evidence'] += asset['evidence']
+            existing['sources'] = list(dict.fromkeys(existing['sources'] + asset['sources']))
+            existing['source_count'] = len(existing['sources'])
+        ordered_assets = [deduped[host] for host in sorted(deduped)]
+        return {
+            'job': job_name,
+            'program': job.get('program', DEFAULT_PROGRAM),
+            'type': 'passive',
+            'targets': in_scope,
+            'queued': in_scope,
+            'skipped': [],
+            'status': 'ok' if ordered_assets else 'no_new_assets',
+            'discovered': sorted(deduped),
+            'assets': ordered_assets,
+            'source_count': sum(len(asset.get('sources', [])) for asset in ordered_assets),
+            'depends_on': ['aa-passive-discovery', 'american-airlines-passive-dns'],
+        }
 
     result = {
         'job': job.get('name'),
@@ -226,13 +360,32 @@ def main() -> None:
 
     all_results = []
     for job_path in jobs:
+        job = load_job(job_path)
+        dependencies = job_workflow_dependencies(job.get('name'))
+        if dependencies:
+            pending = []
+            for dependency in dependencies:
+                dependency_path = RESULTS_DIR / f'{dependency}.json'
+                if not dependency_path.exists():
+                    pending.append(dependency)
+                    continue
+                try:
+                    payload = json.loads(dependency_path.read_text(encoding='utf-8'))
+                except Exception:
+                    pending.append(dependency)
+                    continue
+                state = (payload.get('job_state') or payload.get('status') or '').lower()
+                if state not in {'completed', 'ok', 'no_new_assets', 'no_in_scope_targets'}:
+                    pending.append(dependency)
+            if pending:
+                print(json.dumps({'job': job.get('name'), 'status': 'waiting_on_dependencies', 'dependencies': pending}, indent=2))
+                continue
         if not args.force and not should_run_job(job_path):
             continue
         RUNNING_DIR.mkdir(parents=True, exist_ok=True)
         lock_path = RUNNING_DIR / f'{job_path.stem}.lock'
         lock_path.write_text(str(time.time()), encoding='utf-8')
         try:
-            job = load_job(job_path)
             allowed_scope = read_scope_file(job.get('program', DEFAULT_PROGRAM))
             result = run_passive_job(job, allowed_scope)
             if not RESULTS_DIR.exists():

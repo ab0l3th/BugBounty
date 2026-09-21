@@ -1,6 +1,8 @@
 name: american-airlines-passive-dns
 program: american-airlines
 type: passive
+order: 2
+depends_on: [aa-passive-discovery]
 targets:
   - "*.aa.com"
   - "*.psaairlines.com"
