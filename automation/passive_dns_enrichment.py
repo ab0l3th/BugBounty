@@ -29,7 +29,7 @@ def load_allowed_patterns(program_name: str) -> List[str]:
     return result
 
 
-def fetch_url(url: str, timeout: int = 20, retries: int = 3) -> str:
+def fetch_url(url: str, timeout: int = 8, retries: int = 2) -> str:
     headers = {'User-Agent': 'BugBountyPassiveRecon/1.0'}
     last_error: Exception | None = None
     for attempt in range(retries + 1):
@@ -134,12 +134,20 @@ def source_urls(domain: str) -> Dict[str, str]:
 
 
 def candidate_sources(domain: str) -> Dict[str, Set[str]]:
-    sources: Dict[str, Set[str]] = {
-        'crt.sh': crt_sh_candidates(domain),
-        'dns.google': dns_google_candidates(domain),
-        'certspotter': certspotter_candidates(domain),
-        'hackertarget': hackertarget_candidates(domain),
-    }
+    sources: Dict[str, Set[str]] = {}
+    source_factories = [
+        ('certspotter', certspotter_candidates),
+        ('hackertarget', hackertarget_candidates),
+        ('crt.sh', crt_sh_candidates),
+        ('dns.google', dns_google_candidates),
+    ]
+    for name, builder in source_factories:
+        try:
+            candidates = builder(domain)
+        except Exception:
+            continue
+        if candidates:
+            sources[name] = candidates
     return sources
 
 
