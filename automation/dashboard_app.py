@@ -415,6 +415,10 @@ def index():
         .evidence-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
         .evidence-item { background: #111827; border: 1px solid #334155; border-radius: 6px; padding: 6px 8px; }
         .evidence-item a { text-decoration: none; }
+        .collapsible-list { margin-top: 12px; background: #111827; border: 1px solid #334155; border-radius: 8px; overflow: hidden; }
+        .collapsible-list summary { list-style: none; cursor: pointer; padding: 10px 12px; font-weight: bold; color: #e2e8f0; }
+        .collapsible-list summary::-webkit-details-marker { display: none; }
+        .collapsible-list ul { padding: 0 12px 12px; margin: 0; max-height: 260px; overflow-y: auto; }
         table { width: 100%; border-collapse: collapse; }
         th, td { text-align: left; vertical-align: top; padding: 8px; border-bottom: 1px solid #334155; }
         @media (max-width: 640px) {
@@ -545,26 +549,32 @@ def index():
                       </tbody>
                     </table>
 
-                    <h3>In-scope targets</h3>
-                    <ul>
-                      {% for item in job.targets %}
-                        <li><code>{{ item }}</code></li>
-                      {% endfor %}
-                    </ul>
-
-                    <h3>Queued</h3>
-                    <ul>
-                      {% for item in job.queued %}
-                        <li><code>{{ item }}</code></li>
-                      {% endfor %}
-                    </ul>
-                    {% if job.skipped %}
-                      <h3>Skipped</h3>
+                    <details class="collapsible-list">
+                      <summary>In-scope targets ({{ job.targets|length }})</summary>
                       <ul>
-                        {% for item in job.skipped %}
+                        {% for item in job.targets %}
                           <li><code>{{ item }}</code></li>
                         {% endfor %}
                       </ul>
+                    </details>
+
+                    <details class="collapsible-list">
+                      <summary>Queued ({{ job.queued|length }})</summary>
+                      <ul>
+                        {% for item in job.queued %}
+                          <li><code>{{ item }}</code></li>
+                        {% endfor %}
+                      </ul>
+                    </details>
+                    {% if job.skipped %}
+                      <details class="collapsible-list">
+                        <summary>Skipped ({{ job.skipped|length }})</summary>
+                        <ul>
+                          {% for item in job.skipped %}
+                            <li><code>{{ item }}</code></li>
+                          {% endfor %}
+                        </ul>
+                      </details>
                     {% endif %}
                   </div>
                 </details>
