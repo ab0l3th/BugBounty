@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib import error as urllib_error
 from urllib import request as urllib_request
@@ -164,16 +168,61 @@ def _http_probe_candidates(host: str) -> list[str]:
     return list(dict.fromkeys(candidates))
 
 
-def _probe_live_web_assets(hosts: list[str]) -> list[dict]:
+def _command_exists(cmd: str) -> bool:
+    return shutil.which(cmd) is not None
+
+
+def _run_external_probe_tool(host: str, url: str, tool_name: str) -> dict:
+    if tool_name == 'curl':
+        cmd = ['curl', '-sS', '-L', '--max-time', '5', '-o', '/dev/null', '-w', '%{http_code}', '--connect-timeout', '5', url]
+    elif tool_name == 'nmap':
+        cmd = ['nmap', '-Pn', '--top-ports', '20', '-T', 'polite', '-oG', '-', host]
+    elif tool_name == 'whatweb':
+        cmd = ['whatweb', '--no-errors', '--color=never', '--log-verbose', '-q', url]
+    else:
+        return {'tool': tool_name, 'ok': False, 'error': 'unsupported'}
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        return {
+            'tool': tool_name,
+            'ok': result.returncode == 0,
+            'returncode': result.returncode,
+            'stdout': result.stdout.strip(),
+            'stderr': result.stderr.strip(),
+        }
+    except (FileNotFoundError, subprocess.SubprocessError, ValueError) as exc:
+        return {'tool': tool_name, 'ok': False, 'error': str(exc)}
+
+
+def _probe_live_web_assets(hosts: list[str], *, use_external_tools: bool = False) -> dict:
+    deduped_hosts = sorted(set(hosts))
     discovered: list[dict] = []
+    probe_log: list[dict] = []
+    thread_status: list[dict] = []
     headers = {'User-Agent': 'BugBountyPassiveRecon/1.0'}
-    for host in sorted(set(hosts)):
+    max_workers = min(8, max(1, len(deduped_hosts)))
+
+    def probe_host(host: str) -> dict:
+        thread_name = threading.current_thread().name
+        started = {'thread_id': thread_name, 'host': host, 'status': 'started', 'timestamp': time.time()}
+        thread_status.append(started)
         for url in _http_probe_candidates(host):
+            info = {
+                'thread_id': thread_name,
+                'host': host,
+                'url': url,
+                'status': 'checking',
+                'timestamp': time.time(),
+            }
+            probe_log.append(info)
             try:
                 req = urllib_request.Request(url, headers=headers, method='GET')
                 with urllib_request.urlopen(req, timeout=8) as resp:
                     code = getattr(resp, 'status', resp.getcode())
                     if code and code < 400:
+                        info['status'] = 'live'
+                        info['status_code'] = code
                         discovered.append({
                             'domain': host,
                             'status': 'live',
@@ -186,13 +235,98 @@ def _probe_live_web_assets(hosts: list[str]) -> list[dict]:
                                 'status_code': code,
                             }],
                         })
+                        started['status'] = 'live'
+                        started['live_url'] = url
+                        started['status_code'] = code
+                        thread_status.append({
+                            'thread_id': thread_name,
+                            'host': host,
+                            'status': 'live',
+                            'url': url,
+                            'timestamp': time.time(),
+                        })
+                        if use_external_tools:
+                            for tool_name in ('curl', 'nmap', 'whatweb'):
+                                if _command_exists(tool_name):
+                                    extra = _run_external_probe_tool(host, url, tool_name)
+                                    info['external_tool'] = tool_name
+                                    info['external_result'] = extra
+                                    probe_log.append({
+                                        'thread_id': thread_name,
+                                        'host': host,
+                                        'url': url,
+                                        'status': 'external_check',
+                                        'tool': tool_name,
+                                        'external_result': extra,
+                                        'timestamp': time.time(),
+                                    })
+                                    thread_status.append({
+                                        'thread_id': thread_name,
+                                        'host': host,
+                                        'status': 'external_check',
+                                        'tool': tool_name,
+                                        'url': url,
+                                        'timestamp': time.time(),
+                                    })
+                                    break
+                        return {'host': host, 'status': 'live'}
+                    info['status'] = 'http_error'
+                    info['status_code'] = code
+            except (urllib_error.HTTPError, urllib_error.URLError, ValueError, OSError) as exc:
+                info['status'] = 'no_response'
+                info['error'] = str(exc)
+                if use_external_tools:
+                    for tool_name in ('curl', 'nmap', 'whatweb'):
+                        if not _command_exists(tool_name):
+                            continue
+                        extra = _run_external_probe_tool(host, url, tool_name)
+                        info['external_tool'] = tool_name
+                        info['external_result'] = extra
+                        probe_log.append({
+                            'thread_id': thread_name,
+                            'host': host,
+                            'url': url,
+                            'status': 'external_check',
+                            'tool': tool_name,
+                            'external_result': extra,
+                            'timestamp': time.time(),
+                        })
+                        thread_status.append({
+                            'thread_id': thread_name,
+                            'host': host,
+                            'status': 'external_check',
+                            'tool': tool_name,
+                            'url': url,
+                            'timestamp': time.time(),
+                        })
                         break
-            except (urllib_error.HTTPError, urllib_error.URLError, ValueError):
-                continue
-    return discovered
+        started['status'] = 'no_response'
+        thread_status.append({
+            'thread_id': thread_name,
+            'host': host,
+            'status': 'no_response',
+            'timestamp': time.time(),
+        })
+        return {'host': host, 'status': 'no_response'}
+
+    if not deduped_hosts:
+        return {'discovered': [], 'probe_log': [], 'thread_status': [], 'assets': []}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(probe_host, host) for host in deduped_hosts]
+        for future in as_completed(futures):
+            future.result()
+
+    return {
+        'discovered': discovered,
+        'probe_log': probe_log,
+        'thread_status': thread_status,
+        'assets': discovered,
+        'threads': max_workers,
+    }
 
 
-def run_passive_job(job: dict, allowed_scope: list[str]) -> dict:
+def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: bool = False) -> dict:
     job_name = (job.get('name') or '').strip()
     job_type = (job.get('type', 'passive') or 'passive').lower()
     if job_type in {'github', 'repo', 'monitor'}:
@@ -241,7 +375,8 @@ def run_passive_job(job: dict, allowed_scope: list[str]) -> dict:
             if is_in_scope(host, allowed_scope):
                 deduped_targets.append(host)
 
-        live_assets = _probe_live_web_assets(deduped_targets)
+        probe_result = _probe_live_web_assets(deduped_targets, use_external_tools=use_external_tools)
+        live_assets = probe_result.get('assets', probe_result.get('discovered', [])) if isinstance(probe_result, dict) else probe_result
         deduped = {}
         for asset in live_assets:
             domain = asset['domain']
@@ -257,7 +392,7 @@ def run_passive_job(job: dict, allowed_scope: list[str]) -> dict:
             existing['sources'] = list(dict.fromkeys(existing['sources'] + asset['sources']))
             existing['source_count'] = len(existing['sources'])
         ordered_assets = [deduped[host] for host in sorted(deduped)]
-        return {
+        response = {
             'job': job_name,
             'program': job.get('program', DEFAULT_PROGRAM),
             'type': 'passive',
@@ -270,6 +405,11 @@ def run_passive_job(job: dict, allowed_scope: list[str]) -> dict:
             'source_count': sum(len(asset.get('sources', [])) for asset in ordered_assets),
             'depends_on': ['aa-passive-discovery', 'american-airlines-passive-dns'],
         }
+        if isinstance(probe_result, dict):
+            response['probe_log'] = probe_result.get('probe_log', [])
+            response['thread_status'] = probe_result.get('thread_status', [])
+            response['probe_threads'] = probe_result.get('threads', 0)
+        return response
 
     result = {
         'job': job.get('name'),
@@ -358,6 +498,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description='BugBounty passive job worker')
     parser.add_argument('--program', default=None, help='Program folder to use for scope validation')
     parser.add_argument('--force', action='store_true', help='Re-run completed jobs even when result files already exist.')
+    parser.add_argument('--external-probes', action='store_true', help='Enable curl/nmap/whatweb checks alongside Python HTTP probes for live asset confirmation.')
     args = parser.parse_args()
 
     jobs = discover_jobs()
@@ -393,7 +534,7 @@ def main() -> None:
         lock_path.write_text(str(time.time()), encoding='utf-8')
         try:
             allowed_scope = read_scope_file(job.get('program', DEFAULT_PROGRAM))
-            result = run_passive_job(job, allowed_scope)
+            result = run_passive_job(job, allowed_scope, use_external_tools=args.external_probes)
             if not RESULTS_DIR.exists():
                 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
             out_path = RESULTS_DIR / f"{job_path.stem}.json"

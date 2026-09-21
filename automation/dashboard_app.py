@@ -521,6 +521,19 @@ def index():
                     <p><strong>Targets:</strong> {{ job.targets|length }}</p>
                     <p><strong>Discovered:</strong> {{ job.discovered|length }}</p>
 
+                    {% set probe_log = (job.raw.probe_log if job.raw else []) %}
+                    {% set thread_status = (job.raw.thread_status if job.raw else []) %}
+                    {% if probe_log or thread_status %}
+                      <details class="collapsible-list">
+                        <summary>Thread progress ({{ thread_status|length }})</summary>
+                        <ul>
+                          {% for item in thread_status %}
+                            <li><code>{{ item.host }}</code> — {{ item.status }}{% if item.url %} / {{ item.url }}{% endif %}{% if item.thread_id %} [{{ item.thread_id }}]{% endif %}</li>
+                          {% endfor %}
+                        </ul>
+                      </details>
+                    {% endif %}
+
                     <h3>Discovered assets</h3>
                     <table style="width:100%; border-collapse: collapse; margin-top: 10px;">
                       <thead>

@@ -159,6 +159,64 @@ class DashboardJobMetadataTest(unittest.TestCase):
         finally:
             result_path.unlink(missing_ok=True)
 
+    def test_probe_live_web_assets_records_thread_progress(self):
+        from worker import _probe_live_web_assets
+
+        class FakeResponse:
+            def __init__(self, status):
+                self.status = status
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return False
+
+            def getcode(self):
+                return self.status
+
+        def fake_urlopen(req, timeout=8):
+            url = req.full_url
+            if 'alpha.example.com' in url:
+                return FakeResponse(200)
+            raise OSError('no response')
+
+        with patch('worker.urllib_request.urlopen', side_effect=fake_urlopen):
+            result = _probe_live_web_assets(['alpha.example.com', 'beta.example.com'])
+            self.assertIn('probe_log', result)
+            self.assertIn('thread_status', result)
+            self.assertTrue(any(entry.get('host') == 'alpha.example.com' for entry in result['probe_log']))
+            self.assertTrue(any(status.get('host') == 'beta.example.com' for status in result['thread_status']))
+
+    def test_probe_live_web_assets_can_record_external_tool_results(self):
+        from worker import _probe_live_web_assets
+
+        class FakeResponse:
+            def __init__(self, status):
+                self.status = status
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return False
+
+            def getcode(self):
+                return self.status
+
+        def fake_urlopen(req, timeout=8):
+            raise OSError('no response')
+
+        with patch('worker.urllib_request.urlopen', side_effect=fake_urlopen), \
+             patch('worker.shutil.which', side_effect=lambda tool: '/usr/bin/' + tool if tool in {'curl', 'nmap', 'whatweb'} else None), \
+             patch('worker.subprocess.run') as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = 'HTTP/1.1 200 OK'
+            mock_run.return_value.stderr = ''
+            result = _probe_live_web_assets(['alpha.example.com'], use_external_tools=True)
+            self.assertTrue(any(entry.get('external_tool') == 'curl' for entry in result['probe_log']))
+            self.assertTrue(any(entry.get('tool') == 'curl' for entry in result['thread_status']))
+
     def test_dashboard_can_queue_rerun_for_job(self):
         with patch('dashboard_app.subprocess.Popen', return_value=type('Proc', (), {'pid': 1234})()) as mock_popen:
             with app.test_client() as client:
