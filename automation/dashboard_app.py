@@ -573,6 +573,8 @@ def index():
                         <tr>
                           <th align="left">Domain</th>
                           <th align="left">Source</th>
+                          <th align="left">Service</th>
+                          <th align="left">Ports</th>
                           <th align="left">Status</th>
                         </tr>
                       </thead>
@@ -591,10 +593,12 @@ def index():
                                 {{ asset.source or asset.sources|join(', ') }}
                               {% endif %}
                             </td>
+                            <td>{% if asset.kind %}<code>{{ asset.kind }}</code>{% else %}—{% endif %}</td>
+                            <td>{% if asset.ports %}{{ asset.ports|join(', ') }}{% else %}—{% endif %}</td>
                             <td>{{ asset.status }}</td>
                           </tr>
                         {% else %}
-                          <tr><td colspan="3">No newly discovered assets.</td></tr>
+                          <tr><td colspan="5">No newly discovered assets.</td></tr>
                         {% endfor %}
                       </tbody>
                     </table>

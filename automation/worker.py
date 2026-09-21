@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib import error as urllib_error
 from urllib import request as urllib_request
+from urllib.parse import urlsplit
 
 from scope_validator import is_in_scope, parse_scope_pattern
 
@@ -379,15 +380,21 @@ def _enumerate_live_services(hosts: list[str], *, use_external_tools: bool = Fal
                     code = getattr(resp, 'status', resp.getcode())
                     headers = getattr(resp, 'headers', {})
                     server = headers.get('Server', '') if hasattr(headers, 'get') else ''
+                    parts = urlsplit(url)
+                    port = parts.port or (443 if parts.scheme == 'https' else 80)
+                    source = str(server).strip() or f'{parts.scheme}/{code}'
                     attempt['status'] = 'open'
                     attempt['status_code'] = code
                     attempt['server'] = str(server)
+                    attempt['port'] = port
+                    attempt['source'] = source
                     rows.append({
                         'url': url,
-                        'port': 443 if url.startswith('https://') and url.count(':') == 5 else 80,
+                        'port': port,
                         'status_code': code,
                         'server': str(server),
-                        'service_type': 'http'
+                        'service_type': 'http',
+                        'source': source,
                     })
             except Exception as exc:
                 attempt['status'] = 'closed'
@@ -410,12 +417,18 @@ def _enumerate_live_services(hosts: list[str], *, use_external_tools: bool = Fal
 
         open_ports = sorted({row['port'] for row in rows})
         classification = _classify_service(host, rows)
+        record_sources = list(dict.fromkeys(
+            [classification] + [f'{row["service_type"]}:{row["port"]}' for row in rows]
+        ))
         service_record = {
             'domain': host,
             'status': 'enumerated',
             'kind': classification,
             'ports': open_ports,
             'alternate_hosts': [],
+            'source': classification,
+            'sources': record_sources,
+            'source_count': len(open_ports),
             'evidence': rows,
         }
         results.append(service_record)

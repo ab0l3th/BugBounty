@@ -248,6 +248,40 @@ class DashboardJobMetadataTest(unittest.TestCase):
             self.assertTrue(any(entry.get('external_tool') == 'curl' for entry in result['probe_log']))
             self.assertTrue(any(entry.get('tool') == 'curl' for entry in result['thread_status']))
 
+    def test_service_enumeration_evidence_has_source_and_correct_port(self):
+        from worker import _enumerate_live_services
+
+        class FakeResponse:
+            def __init__(self, status, server):
+                self.status = status
+                self.headers = {'Server': server}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return False
+
+            def getcode(self):
+                return self.status
+
+        def fake_urlopen(req, timeout=8):
+            url = req.full_url
+            if url == 'https://alpha.example.com':
+                return FakeResponse(200, 'nginx')
+            if url == 'https://alpha.example.com:8443':
+                return FakeResponse(200, 'envoy')
+            raise OSError('no response')
+
+        with patch('worker.urllib_request.urlopen', side_effect=fake_urlopen):
+            result = _enumerate_live_services(['alpha.example.com'])
+            asset = next(row for row in result['assets'] if row['domain'] == 'alpha.example.com')
+            self.assertIn(443, asset['ports'])
+            self.assertIn(8443, asset['ports'])
+            self.assertTrue(asset['evidence'])
+            self.assertTrue(all(item.get('source') for item in asset['evidence']))
+            self.assertTrue(asset.get('source'))
+
     def test_dashboard_can_queue_rerun_for_job(self):
         with patch('dashboard_app.subprocess.Popen', return_value=type('Proc', (), {'pid': 1234})()) as mock_popen:
             with app.test_client() as client:
