@@ -78,6 +78,29 @@ def read_result_file(path: Path) -> Dict[str, Any]:
         return {}
 
 
+def read_job_definition(path: Path) -> Dict[str, Any]:
+    data: Dict[str, Any] = {'name': path.stem, 'program': 'unknown', 'type': 'passive', 'targets': []}
+    try:
+        lines = path.read_text(encoding='utf-8').splitlines()
+    except Exception:
+        return data
+    for line in lines:
+        clean = line.strip()
+        if not clean or clean.startswith('#'):
+            continue
+        if clean.startswith('name:'):
+            data['name'] = clean.split(':', 1)[1].strip()
+        elif clean.startswith('program:'):
+            data['program'] = clean.split(':', 1)[1].strip()
+        elif clean.startswith('type:'):
+            data['type'] = clean.split(':', 1)[1].strip()
+        elif clean.startswith('targets:'):
+            continue
+        elif clean.startswith('- '):
+            data['targets'].append(clean[2:].strip().strip("'\""))
+    return data
+
+
 def list_jobs() -> List[Dict[str, Any]]:
     jobs: List[Dict[str, Any]] = []
     seen: set[str] = set()
@@ -86,6 +109,7 @@ def list_jobs() -> List[Dict[str, Any]]:
         for path in sorted(JOBS_DIR.glob('*.yaml')) + sorted(JOBS_DIR.glob('*.yml')):
             job_name = path.stem
             seen.add(job_name)
+            definition = read_job_definition(path)
             payload = read_result_file(RESULTS_DIR / f'{job_name}.json')
             job_state = _job_state_for(job_name, payload if payload else None)
             if payload:
@@ -94,15 +118,15 @@ def list_jobs() -> List[Dict[str, Any]]:
                     for host in payload.get('discovered', [])
                 ]
                 jobs.append({
-                    'name': payload.get('job', job_name),
+                    'name': payload.get('job', definition.get('name', job_name)),
                     'path': path.name,
                     'status': payload.get('status', 'unknown'),
                     'job_state': job_state,
-                    'type': payload.get('type', 'unknown'),
-                    'program': payload.get('program', 'unknown'),
+                    'type': payload.get('type', definition.get('type', 'unknown')),
+                    'program': payload.get('program', definition.get('program', 'unknown')),
                     'discovered': payload.get('discovered', []),
                     'assets': assets,
-                    'targets': payload.get('targets', []),
+                    'targets': payload.get('targets', definition.get('targets', [])),
                     'queued': payload.get('queued', []),
                     'skipped': payload.get('skipped', []),
                     'source_count': payload.get('source_count', 0),
@@ -110,19 +134,19 @@ def list_jobs() -> List[Dict[str, Any]]:
                 })
             else:
                 jobs.append({
-                    'name': job_name,
+                    'name': definition.get('name', job_name),
                     'path': path.name,
                     'status': 'queued',
                     'job_state': 'queued',
-                    'type': 'passive',
-                    'program': 'unknown',
+                    'type': definition.get('type', 'passive'),
+                    'program': definition.get('program', 'unknown'),
                     'discovered': [],
                     'assets': [],
-                    'targets': [],
-                    'queued': [],
+                    'targets': definition.get('targets', []),
+                    'queued': definition.get('targets', []),
                     'skipped': [],
                     'source_count': 0,
-                    'raw': {'job': job_name, 'job_state': 'queued'},
+                    'raw': {'job': definition.get('name', job_name), 'job_state': 'queued'},
                 })
 
     if not RESULTS_DIR.exists():
