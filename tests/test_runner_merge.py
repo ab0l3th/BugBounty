@@ -39,6 +39,23 @@ class RunnerMergeTest(unittest.TestCase):
         self.assertEqual(len(merged['assets']), 3)
         self.assertGreaterEqual(merged['source_count'], 2)
 
+    def test_diff_ignores_volatile_probe_and_timestamp_fields(self):
+        base = {
+            'job': 'confirm-live-web-assets',
+            'status': 'ok',
+            'discovered': ['a.aa.com'],
+            'assets': [{'domain': 'a.aa.com', 'sources': ['http-probe'], 'status': 'live'}],
+        }
+        noisy = dict(base)
+        noisy['probe_log'] = [{'host': 'a.aa.com', 'timestamp': 123456.789}]
+        noisy['thread_status'] = [{'host': 'a.aa.com', 'timestamp': 987654.321}]
+        self.assertFalse(runner.diff_changed(noisy, base))
+
+    def test_diff_detects_new_discovery(self):
+        previous = {'status': 'ok', 'discovered': ['a.aa.com'], 'assets': []}
+        current = {'status': 'ok', 'discovered': ['a.aa.com', 'b.aa.com'], 'assets': []}
+        self.assertTrue(runner.diff_changed(current, previous))
+
 
 if __name__ == '__main__':
     unittest.main()

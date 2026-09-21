@@ -93,7 +93,27 @@ def merge_result_payloads(previous: dict | None, current: dict) -> dict:
 
 
 def diff_changed(current: dict, previous: dict) -> bool:
-    return current != previous
+    return stable_signature(current) != stable_signature(previous)
+
+
+def stable_signature(payload: dict) -> dict:
+    """Comparable view that ignores volatile fields (timestamps, probe/thread logs)."""
+    assets = []
+    for asset in payload.get('assets', []) or []:
+        if not isinstance(asset, dict):
+            continue
+        assets.append((
+            asset.get('domain'),
+            tuple(sorted(asset.get('sources', []) or [])),
+            tuple(sorted(asset.get('ports', []) or [])),
+            asset.get('kind'),
+            asset.get('status'),
+        ))
+    return {
+        'discovered': sorted(payload.get('discovered', []) or []),
+        'status': payload.get('status'),
+        'assets': sorted(assets),
+    }
 
 
 def send_notification(job: str, payload: dict) -> None:

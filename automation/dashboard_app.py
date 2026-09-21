@@ -21,6 +21,9 @@ JOBS_DIR = ROOT / 'jobs'
 
 app = Flask(__name__)
 
+# Jobs that make live connections to targets and must be launched in active mode.
+ACTIVE_JOBS = {'confirm-live-web-assets', 'service-enumeration-live-hosts'}
+
 WORKFLOW_SEQUENCE = {
     'aa-passive-discovery': {
         'step': 1,
@@ -317,6 +320,15 @@ def verify_github_signature(payload: bytes, signature: str | None, secret: str) 
     return hmac.compare_digest(signature, expected)
 
 
+def _authorized_for_state_change() -> bool:
+    """Require a shared-secret header for state-changing endpoints; fail closed if unset."""
+    token = os.environ.get('BUGBOUNTY_DASHBOARD_TOKEN', '').strip()
+    if not token:
+        return False
+    provided = request.headers.get('X-BugBounty-Token', '')
+    return hmac.compare_digest(provided, token)
+
+
 def trigger_repo_sync_on_push() -> None:
     commands = [
         ['git', 'fetch', '--all', '--prune'],
@@ -362,6 +374,8 @@ def rerun_job(job_name: str) -> Dict[str, Any]:
     (RUNNING_DIR / f'{job_name}.lock').write_text(str(int(time.time())), encoding='utf-8')
 
     command = [sys.executable, str(ROOT / 'automation' / 'worker.py'), '--force']
+    if job_name in ACTIVE_JOBS:
+        command.append('--allow-active')
     if program and program != 'unknown':
         command.extend(['--program', str(program)])
 
@@ -703,6 +717,8 @@ def index():
 
 @app.route('/jobs/<job_name>/rerun', methods=['POST'])
 def rerun_job_endpoint(job_name: str):
+    if not _authorized_for_state_change():
+        return jsonify({'status': 'error', 'message': 'unauthorized'}), 401
     try:
         result = rerun_job(job_name)
     except KeyError:
@@ -718,6 +734,6 @@ def api_jobs():
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='BugBounty LAN dashboard')
     parser.add_argument('--port', type=int, default=8001, help='Port to bind for the local LAN UI')
-    parser.add_argument('--host', default='0.0.0.0', help='Host interface to bind')
+    parser.add_argument('--host', default='127.0.0.1', help='Host interface to bind (default localhost; pass 0.0.0.0 to expose on the LAN)')
     args = parser.parse_args()
     app.run(host=args.host, port=args.port, debug=False)

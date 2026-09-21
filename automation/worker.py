@@ -27,6 +27,9 @@ WORKFLOW_SEQUENCE = {
     'service-enumeration-live-hosts': {'step': 4, 'depends_on': ['confirm-live-web-assets']},
 }
 
+# Jobs that make live connections to targets and must not run in the default passive-only mode.
+ACTIVE_JOBS = {'confirm-live-web-assets', 'service-enumeration-live-hosts'}
+
 
 def job_workflow_dependencies(job_name: str) -> list[str]:
     return list(WORKFLOW_SEQUENCE.get(job_name, {}).get('depends_on', []))
@@ -477,7 +480,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             return {
                 'job': job_name,
                 'program': job.get('program', DEFAULT_PROGRAM),
-                'type': 'passive',
+                'type': 'active',
                 'targets': [],
                 'queued': [],
                 'skipped': [],
@@ -529,7 +532,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
         response = {
             'job': job_name,
             'program': job.get('program', DEFAULT_PROGRAM),
-            'type': 'passive',
+            'type': 'active',
             'targets': deduped_targets,
             'queued': deduped_targets,
             'skipped': [host for host in sorted(set(merged_candidates)) if host and host not in deduped_targets],
@@ -551,7 +554,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             return {
                 'job': job_name,
                 'program': job.get('program', DEFAULT_PROGRAM),
-                'type': 'passive',
+                'type': 'active',
                 'targets': [],
                 'queued': [],
                 'skipped': [],
@@ -576,7 +579,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
         response = {
             'job': job_name,
             'program': job.get('program', DEFAULT_PROGRAM),
-            'type': 'passive',
+            'type': 'active',
             'targets': deduped_hosts,
             'queued': deduped_hosts,
             'skipped': [],
@@ -678,8 +681,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description='BugBounty passive job worker')
     parser.add_argument('--program', default=None, help='Program folder to use for scope validation')
     parser.add_argument('--force', action='store_true', help='Re-run completed jobs even when result files already exist.')
+    parser.add_argument('--allow-active', action='store_true', help='Permit jobs that make live connections to targets (steps 3 and 4). Off by default for passive-only safety.')
     parser.add_argument('--external-probes', action='store_true', help='Enable curl/nmap/whatweb checks alongside Python HTTP probes for live asset confirmation.')
     args = parser.parse_args()
+
+    # External probes are inherently active, so they imply active mode.
+    allow_active = args.allow_active or args.external_probes
 
     jobs = discover_jobs()
     if args.program:
@@ -688,6 +695,12 @@ def main() -> None:
     all_results = []
     for job_path in jobs:
         job = load_job(job_path)
+        if job.get('name') in ACTIVE_JOBS and not allow_active:
+            lock_path = RUNNING_DIR / f'{job_path.stem}.lock'
+            if lock_path.exists():
+                lock_path.unlink()
+            print(json.dumps({'job': job.get('name'), 'status': 'skipped_active', 'reason': 'requires --allow-active'}, indent=2))
+            continue
         dependencies = job_workflow_dependencies(job.get('name'))
         if dependencies:
             pending = []
