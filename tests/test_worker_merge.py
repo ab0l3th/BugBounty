@@ -99,6 +99,18 @@ class WorkerMergeTest(unittest.TestCase):
         self.assertEqual(set(merged['discovered']), {'a.aa.com', 'legacy.aa.com', 'new.aa.com'})
         self.assertEqual(len(merged['assets']), 3)
 
+    def test_should_run_job_skips_existing_completed_results(self):
+        path = Path('jobs/aa-passive-discovery.yaml')
+        result_path = Path('results/aa-passive-discovery.json')
+        previous = {'status': 'ok', 'job_state': 'completed'}
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(__import__('json').dumps(previous), encoding='utf-8')
+        try:
+            self.assertFalse(worker.should_run_job(path, force=False))
+            self.assertTrue(worker.should_run_job(path, force=True))
+        finally:
+            result_path.unlink(missing_ok=True)
+
 
 if __name__ == '__main__':
     unittest.main()

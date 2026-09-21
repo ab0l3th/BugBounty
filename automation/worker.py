@@ -105,6 +105,23 @@ def merge_result_payloads(previous: dict | None, current: dict) -> dict:
     return merged
 
 
+def should_run_job(job_path: Path, *, force: bool = False) -> bool:
+    if force:
+        return True
+    result_path = RESULTS_DIR / f'{job_path.stem}.json'
+    if not result_path.exists():
+        return True
+    try:
+        payload = json.loads(result_path.read_text(encoding='utf-8'))
+    except Exception:
+        return True
+    status = payload.get('status')
+    job_state = payload.get('job_state')
+    if status in {'ok', 'no_new_assets', 'no_in_scope_targets'} or job_state in {'completed', 'queued', 'running'}:
+        return False
+    return True
+
+
 def run_passive_job(job: dict, allowed_scope: list[str]) -> dict:
     job_type = (job.get('type', 'passive') or 'passive').lower()
     if job_type in {'github', 'repo', 'monitor'}:
@@ -198,6 +215,7 @@ def run_passive_job(job: dict, allowed_scope: list[str]) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description='BugBounty passive job worker')
     parser.add_argument('--program', default=None, help='Program folder to use for scope validation')
+    parser.add_argument('--force', action='store_true', help='Re-run completed jobs even when result files already exist.')
     args = parser.parse_args()
 
     jobs = discover_jobs()
@@ -206,6 +224,8 @@ def main() -> None:
 
     all_results = []
     for job_path in jobs:
+        if not args.force and not should_run_job(job_path):
+            continue
         job = load_job(job_path)
         allowed_scope = read_scope_file(job.get('program', DEFAULT_PROGRAM))
         result = run_passive_job(job, allowed_scope)
