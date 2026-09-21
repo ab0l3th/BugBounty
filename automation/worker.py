@@ -201,8 +201,11 @@ def run_passive_job(job: dict, allowed_scope: list[str]) -> dict:
         return github_activity(repo)
 
     if job_name == 'confirm-live-web-assets':
-        dns_result_path = RESULTS_DIR / 'american-airlines-passive-dns.json'
-        if not dns_result_path.exists():
+        required_paths = [
+            RESULTS_DIR / 'aa-passive-discovery.json',
+            RESULTS_DIR / 'american-airlines-passive-dns.json',
+        ]
+        if any(not path.exists() for path in required_paths):
             return {
                 'job': job_name,
                 'program': job.get('program', DEFAULT_PROGRAM),
@@ -214,28 +217,30 @@ def run_passive_job(job: dict, allowed_scope: list[str]) -> dict:
                 'discovered': [],
                 'assets': [],
                 'source_count': 0,
-                'dependencies': ['american-airlines-passive-dns'],
-            }
-        try:
-            dns_result = json.loads(dns_result_path.read_text(encoding='utf-8'))
-        except Exception:
-            return {
-                'job': job_name,
-                'program': job.get('program', DEFAULT_PROGRAM),
-                'type': 'passive',
-                'targets': [],
-                'queued': [],
-                'skipped': [],
-                'status': 'waiting_on_dependencies',
-                'discovered': [],
-                'assets': [],
-                'source_count': 0,
-                'dependencies': ['american-airlines-passive-dns'],
+                'dependencies': ['aa-passive-discovery', 'american-airlines-passive-dns'],
             }
 
-        dns_targets = dns_result.get('discovered', []) or dns_result.get('targets', []) or []
-        in_scope = [host for host in dns_targets if is_in_scope(host, allowed_scope) or host in dns_targets]
-        live_assets = _probe_live_web_assets(in_scope)
+        merged_candidates: list[str] = []
+        for path in required_paths:
+            try:
+                payload = json.loads(path.read_text(encoding='utf-8'))
+            except Exception:
+                continue
+            discovered = payload.get('discovered', []) or []
+            targets = payload.get('targets', []) or []
+            merged_candidates.extend(discovered)
+            merged_candidates.extend(targets)
+
+        deduped_targets = []
+        seen: set[str] = set()
+        for host in merged_candidates:
+            if not host or host in seen:
+                continue
+            seen.add(host)
+            if is_in_scope(host, allowed_scope):
+                deduped_targets.append(host)
+
+        live_assets = _probe_live_web_assets(deduped_targets)
         deduped = {}
         for asset in live_assets:
             domain = asset['domain']
@@ -255,9 +260,9 @@ def run_passive_job(job: dict, allowed_scope: list[str]) -> dict:
             'job': job_name,
             'program': job.get('program', DEFAULT_PROGRAM),
             'type': 'passive',
-            'targets': in_scope,
-            'queued': in_scope,
-            'skipped': [],
+            'targets': deduped_targets,
+            'queued': deduped_targets,
+            'skipped': [host for host in sorted(set(merged_candidates)) if host and host not in deduped_targets],
             'status': 'ok' if ordered_assets else 'no_new_assets',
             'discovered': sorted(deduped),
             'assets': ordered_assets,

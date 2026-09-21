@@ -86,6 +86,40 @@ class DashboardJobMetadataTest(unittest.TestCase):
         self.assertEqual(live_assets_job['depends_on'], ['aa-passive-discovery', 'american-airlines-passive-dns'])
         self.assertEqual(job_title_label('confirm-live-web-assets'), 'Confirm Live Web Assets')
 
+    def test_confirm_live_web_assets_uses_merged_step1_and_step2_targets(self):
+        from worker import run_passive_job
+
+        root = ROOT / 'results'
+        root.mkdir(exist_ok=True)
+
+        (root / 'aa-passive-discovery.json').write_text(__import__('json').dumps({
+            'job': 'aa-passive-discovery',
+            'program': 'american-airlines',
+            'status': 'ok',
+            'discovered': ['alpha.example.com', 'beta.example.com'],
+            'targets': ['alpha.example.com', 'beta.example.com'],
+            'assets': []
+        }, indent=2), encoding='utf-8')
+        (root / 'american-airlines-passive-dns.json').write_text(__import__('json').dumps({
+            'job': 'american-airlines-passive-dns',
+            'program': 'american-airlines',
+            'status': 'ok',
+            'discovered': ['beta.example.com', 'gamma.example.com'],
+            'targets': ['beta.example.com', 'gamma.example.com'],
+            'assets': []
+        }, indent=2), encoding='utf-8')
+
+        with patch('worker._probe_live_web_assets', return_value=[
+            {'domain': 'alpha.example.com', 'status': 'live', 'source': 'http-probe', 'sources': ['http-probe'], 'source_count': 1, 'evidence': [{'source': 'http-probe', 'url': 'https://alpha.example.com'}]},
+            {'domain': 'gamma.example.com', 'status': 'live', 'source': 'http-probe', 'sources': ['http-probe'], 'source_count': 1, 'evidence': [{'source': 'http-probe', 'url': 'https://gamma.example.com'}]},
+        ]):
+            result = run_passive_job({'name': 'confirm-live-web-assets', 'program': 'american-airlines', 'type': 'passive', 'targets': []}, ['*.example.com'])
+            self.assertEqual(result['targets'], ['alpha.example.com', 'beta.example.com', 'gamma.example.com'])
+            self.assertEqual(result['discovered'], ['alpha.example.com', 'gamma.example.com'])
+
+        (root / 'aa-passive-discovery.json').unlink(missing_ok=True)
+        (root / 'american-airlines-passive-dns.json').unlink(missing_ok=True)
+
     def test_dashboard_can_queue_rerun_for_job(self):
         with patch('dashboard_app.subprocess.Popen', return_value=type('Proc', (), {'pid': 1234})()) as mock_popen:
             with app.test_client() as client:
