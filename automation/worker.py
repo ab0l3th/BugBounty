@@ -650,10 +650,12 @@ def _probe_vhost(ip: str, host_header: str, scheme: str = 'https') -> dict:
                 'status_code': code,
                 'length': len(body),
                 'server': str(server),
+                'source': f'{host_header} → {code}',
+                'url': url,
                 'ok': True,
             }
     except (urllib_error.HTTPError, urllib_error.URLError, ValueError, OSError, http.client.HTTPException) as exc:
-        return {'host_header': host_header, 'ip': ip, 'ok': False, 'error': str(exc)}
+        return {'host_header': host_header, 'ip': ip, 'source': f'{host_header} (no response)', 'url': url, 'ok': False, 'error': str(exc)}
 
 
 def _run_vhost_discovery(service_assets: list[dict]) -> dict:

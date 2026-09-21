@@ -248,6 +248,11 @@ class DashboardJobMetadataTest(unittest.TestCase):
         result = _probe_vhost('2001:db8::904b', 'host.example.com')
         self.assertIn('ok', result)
         self.assertFalse(result['ok'])
+        # Evidence must carry source/url so the dashboard Source column renders.
+        self.assertIn('source', result)
+        self.assertIn('url', result)
+        self.assertTrue(result['source'])
+        self.assertTrue(result['url'].startswith('http'))
 
     def test_run_vhost_discovery_survives_ipv6_candidate(self):
         # A single malformed/unreachable probe must not crash the whole run.
