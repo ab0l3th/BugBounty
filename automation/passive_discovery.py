@@ -4,9 +4,11 @@ from __future__ import annotations
 import json
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Iterable, List, Set
 from urllib import request
+from urllib.error import HTTPError
 
 ROOT = Path(__file__).resolve().parent.parent
 AUTOMATION_DIR = Path(__file__).resolve().parent
@@ -31,12 +33,23 @@ def load_allowed_domains() -> List[str]:
     return rows
 
 
-def fetch_url(url: str, timeout: int = 15) -> str:
-    try:
-        with request.urlopen(url, timeout=timeout) as resp:
-            return resp.read().decode('utf-8', errors='replace')
-    except Exception:
-        return ''
+def fetch_url(url: str, timeout: int = 15, retries: int = 3) -> str:
+    headers = {'User-Agent': 'BugBountyPassiveRecon/1.0'}
+    for attempt in range(retries + 1):
+        try:
+            req = request.Request(url, headers=headers)
+            with request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode('utf-8', errors='replace')
+        except HTTPError as exc:
+            if exc.code not in {429, 500, 502, 503, 504}:
+                return ''
+            if attempt < retries:
+                time.sleep(2 ** attempt)
+                continue
+            return ''
+        except Exception:
+            return ''
+    return ''
 
 
 def extract_domains(text: str) -> Set[str]:
@@ -56,6 +69,8 @@ def filter_scope(domains: Iterable[str], allowed_patterns: Iterable[str]) -> Lis
 def public_sources_for(domain: str) -> List[str]:
     return [
         f'https://crt.sh/?q=%25.{domain}&output=json',
+        f'https://api.certspotter.com/v1/issuances?domain={domain}&include_subdomains=true&expand=dns_names',
+        f'https://api.hackertarget.com/hostsearch/?q={domain}',
         f'https://www.google.com/search?q=site%3A{domain}',
         f'https://dns.google/resolve?name={domain}&type=A',
     ]
@@ -65,6 +80,10 @@ def source_label_for(url: str) -> str:
     lowered = url.lower()
     if 'crt.sh' in lowered:
         return 'crt.sh'
+    if 'certspotter' in lowered:
+        return 'certspotter'
+    if 'hackertarget' in lowered:
+        return 'hackertarget'
     if 'google' in lowered and 'search' in lowered:
         return 'google-search'
     if 'dns.google' in lowered:

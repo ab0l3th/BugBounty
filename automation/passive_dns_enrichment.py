@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Dict, List, Set
 from urllib import request
+from urllib.error import HTTPError
 
 from asset_normalizer import extract_domains, filter_scope, normalize_assets
 from scope_validator import is_in_scope, parse_scope_pattern
@@ -27,12 +29,26 @@ def load_allowed_patterns(program_name: str) -> List[str]:
     return result
 
 
-def fetch_url(url: str, timeout: int = 20) -> str:
-    try:
-        with request.urlopen(url, timeout=timeout) as resp:
-            return resp.read().decode('utf-8', errors='replace')
-    except Exception:
-        return ''
+def fetch_url(url: str, timeout: int = 20, retries: int = 3) -> str:
+    headers = {'User-Agent': 'BugBountyPassiveRecon/1.0'}
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            req = request.Request(url, headers=headers)
+            with request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode('utf-8', errors='replace')
+        except HTTPError as exc:
+            last_error = exc
+            if exc.code not in {429, 500, 502, 503, 504}:
+                break
+            if attempt < retries:
+                time.sleep(2 ** attempt)
+                continue
+            break
+        except Exception as exc:
+            last_error = exc
+            break
+    return ''
 
 
 def crt_sh_candidates(domain: str) -> Set[str]:
@@ -75,10 +91,45 @@ def dns_google_candidates(domain: str) -> Set[str]:
     return found
 
 
+def certspotter_candidates(domain: str) -> Set[str]:
+    url = f'https://api.certspotter.com/v1/issuances?domain={domain}&include_subdomains=true&expand=dns_names'
+    data = fetch_url(url)
+    if not data:
+        return set()
+    try:
+        payload = json.loads(data)
+    except Exception:
+        return set()
+    found: Set[str] = set()
+    for item in payload:
+        dns_names = item.get('dns_names', []) if isinstance(item, dict) else []
+        if isinstance(dns_names, list):
+            for name in dns_names:
+                found |= extract_domains(str(name))
+    return found
+
+
+def hackertarget_candidates(domain: str) -> Set[str]:
+    url = f'https://api.hackertarget.com/hostsearch/?q={domain}'
+    data = fetch_url(url)
+    if not data:
+        return set()
+    found: Set[str] = set()
+    for line in data.splitlines():
+        if not line.strip() or ',' not in line:
+            continue
+        candidate = line.split(',', 1)[0].strip()
+        if candidate:
+            found |= extract_domains(candidate)
+    return found
+
+
 def source_urls(domain: str) -> Dict[str, str]:
     return {
         'crt.sh': f'https://crt.sh/?q=%25.{domain}&output=json',
         'dns.google': f'https://dns.google/resolve?name={domain}&type=A',
+        'certspotter': f'https://api.certspotter.com/v1/issuances?domain={domain}&include_subdomains=true&expand=dns_names',
+        'hackertarget': f'https://api.hackertarget.com/hostsearch/?q={domain}',
     }
 
 
@@ -86,6 +137,8 @@ def candidate_sources(domain: str) -> Dict[str, Set[str]]:
     sources: Dict[str, Set[str]] = {
         'crt.sh': crt_sh_candidates(domain),
         'dns.google': dns_google_candidates(domain),
+        'certspotter': certspotter_candidates(domain),
+        'hackertarget': hackertarget_candidates(domain),
     }
     return sources
 
