@@ -499,6 +499,50 @@ class DashboardJobMetadataTest(unittest.TestCase):
             debug = [f for f in asset['findings'] if f['type'] == 'debug_endpoint']
             self.assertTrue(any(f['path'] == '/actuator/env' and f['exposes_data'] for f in debug))
 
+    def test_api_debug_endpoint_ignores_login_redirect(self):
+        from worker import _api_endpoint_tests
+
+        class FakeResp:
+            def __init__(self, status, headers, body=b'', final_url='https://api.example.com/login'):
+                self.status = status
+                self._headers = headers
+                self._body = body
+                self._final = final_url
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def getcode(self):
+                return self.status
+            def geturl(self):
+                return self._final
+            def read(self, n=None):
+                return self._body
+            @property
+            def headers(self):
+                class H(dict):
+                    def items(inner):
+                        return list(super().items())
+                h = H(); h.update(self._headers); return h
+
+        # Every debug path 200s but is really a redirect to an HTML login page.
+        def fake_urlopen(req, timeout=8):
+            return FakeResp(200, {'Content-Type': 'text/html'}, b'<html><form><input type="password"></form></html>')
+
+        with patch('worker.urllib_request.urlopen', side_effect=fake_urlopen):
+            result = _api_endpoint_tests(['api.example.com'])
+            asset = next(a for a in result['assets'] if a['domain'] == 'api.example.com')
+            debug = [f for f in asset['findings'] if f['type'] == 'debug_endpoint']
+            self.assertEqual(debug, [])
+            self.assertEqual(asset['status'], 'no_findings')
+
+    def test_highest_severity_returns_top_rank(self):
+        from dashboard_app import highest_severity
+        self.assertEqual(highest_severity([{'severity': 'low'}, {'severity': 'high'}, {'severity': 'medium'}]), 'High')
+        self.assertEqual(highest_severity([{'severity': 'info'}]), 'Info')
+        self.assertIsNone(highest_severity([]))
+        self.assertIsNone(highest_severity(None))
+
     def test_service_enumeration_uses_step3_live_asset_output(self):
         result_path = ROOT / 'results' / 'confirm-live-web-assets.json'
         result_path.parent.mkdir(parents=True, exist_ok=True)

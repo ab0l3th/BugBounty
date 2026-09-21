@@ -803,6 +803,13 @@ def _fetch_headers_body(url: str, *, extra_headers: dict | None = None, method: 
         rh = getattr(resp, 'headers', None)
         if rh is not None and hasattr(rh, 'items'):
             hdrs = {str(k).lower(): str(v) for k, v in rh.items()}
+        # Record the final URL so callers can detect redirects (e.g. to a login page).
+        geturl = getattr(resp, 'geturl', None)
+        if callable(geturl):
+            try:
+                hdrs['x-final-url'] = str(geturl())
+            except Exception:
+                pass
         text = raw.decode('utf-8', 'replace') if isinstance(raw, (bytes, bytearray)) else str(raw)
         return code, hdrs, text
 
@@ -1044,6 +1051,19 @@ def _looks_like_data(content_type: str, body: str) -> bool:
     return stripped.startswith('{') or stripped.startswith('[')
 
 
+_LOGIN_URL_MARKERS = ('login', 'signin', 'sign-in', 'sso', 'oauth', 'auth/realms', 'account/login', 'session/new', 'adfs', 'saml', 'idp')
+_LOGIN_BODY_MARKERS = ('type="password"', "type='password'", 'name="password"', 'id="password"')
+
+
+def _is_login_redirect(requested_url: str, final_url: str, body: str) -> bool:
+    """True when a 200 response is really a login/auth page, often reached via redirect."""
+    final = (final_url or '').lower()
+    redirected = bool(final) and final.rstrip('/') != (requested_url or '').lower().rstrip('/')
+    url_login = any(marker in final for marker in _LOGIN_URL_MARKERS)
+    body_login = any(marker in body.lower() for marker in _LOGIN_BODY_MARKERS)
+    return (redirected and url_login) or body_login
+
+
 def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False) -> dict:
     deduped_hosts = sorted(set(hosts))
     assets: list[dict] = []
@@ -1065,6 +1085,10 @@ def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False) -
                 continue
             if code == 200:
                 exposes = _looks_like_data(hdrs.get('content-type', ''), body)
+                # A redirect/landing on a login page is not a real debug exposure.
+                if not exposes and _is_login_redirect(url, hdrs.get('x-final-url', url), body):
+                    probe_log.append({'thread_id': thread_name, 'host': host, 'path': path, 'status_code': code, 'status': 'login_redirect', 'timestamp': time.time()})
+                    continue
                 findings.append({'type': 'debug_endpoint', 'path': path, 'status_code': code, 'exposes_data': bool(exposes), 'severity': 'high' if exposes else 'medium'})
                 probe_log.append({'thread_id': thread_name, 'host': host, 'path': path, 'status_code': code, 'status': 'found', 'timestamp': time.time()})
                 if path in ('/v2/api-docs', '/v3/api-docs', '/openapi.json', '/swagger.json') and exposes:

@@ -151,6 +151,22 @@ def summarize_jobs(jobs: List[Dict[str, Any]]) -> Dict[str, int]:
     return summary
 
 
+_SEVERITY_ORDER = {'critical': 5, 'high': 4, 'medium': 3, 'low': 2, 'info': 1}
+
+
+def highest_severity(findings: List[Dict[str, Any]] | None) -> str | None:
+    """Return the highest-ranked severity label among an asset's findings, or None."""
+    best_rank = 0
+    best = None
+    for finding in findings or []:
+        sev = str((finding or {}).get('severity', '')).lower()
+        rank = _SEVERITY_ORDER.get(sev, 0)
+        if rank > best_rank:
+            best_rank = rank
+            best = sev
+    return best.capitalize() if best else None
+
+
 def program_label(value: str) -> str:
     text = (value or 'unknown').replace('_', '-').strip()
     if not text:
@@ -905,6 +921,7 @@ def index():
                           <th align="left">Service</th>
                           <th align="left">Ports</th>
                           <th align="left">Status</th>
+                          <th align="left">Highest Rated Vuln</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -928,9 +945,15 @@ def index():
                             <td>{% if asset.kind %}<code>{{ asset.kind }}</code>{% else %}—{% endif %}</td>
                             <td>{% if asset.ports %}{{ asset.ports|join(', ') }}{% else %}—{% endif %}</td>
                             <td>{{ asset.status }}</td>
+                            <td>
+                              {% set sev = highest_severity(asset.findings) %}
+                              {% if sev %}
+                                <span class="status {{ 'bad' if sev in ['Critical', 'High'] else 'warn' if sev == 'Medium' else 'ok' }}">{{ sev }}</span>
+                              {% else %}—{% endif %}
+                            </td>
                           </tr>
                         {% else %}
-                          <tr><td colspan="5">No newly discovered assets.</td></tr>
+                          <tr><td colspan="6">No newly discovered assets.</td></tr>
                         {% endfor %}
                       </tbody>
                     </table>
@@ -1080,7 +1103,7 @@ def index():
       </script>
     </body>
     </html>
-    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs, workflow_order=workflow_order)
+    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs, workflow_order=workflow_order, highest_severity=highest_severity)
 
 
 @app.route('/jobs/<job_name>/rerun', methods=['POST'])
