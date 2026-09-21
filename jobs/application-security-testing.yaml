@@ -1,0 +1,13 @@
+name: application-security-testing
+program: american-airlines
+type: active
+order: 7
+depends_on: [directory-enumeration-live-hosts]
+targets:
+  - "*.aa.com"
+  - "*.psaairlines.com"
+  - "*.envoyair.com"
+  - "*.piedmont-airlines.com"
+  - "*.cloud.aa.com"
+  - "*.maverick.aa.com"
+  - "aavacations.com"

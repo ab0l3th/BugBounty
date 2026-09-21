@@ -22,7 +22,7 @@ JOBS_DIR = ROOT / 'jobs'
 app = Flask(__name__)
 
 # Jobs that make live connections to targets and must be launched in active mode.
-ACTIVE_JOBS = {'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra', 'directory-enumeration-live-hosts'}
+ACTIVE_JOBS = {'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra', 'directory-enumeration-live-hosts', 'application-security-testing', 'api-endpoint-testing'}
 
 WORKFLOW_SEQUENCE = {
     'aa-passive-discovery': {
@@ -54,6 +54,16 @@ WORKFLOW_SEQUENCE = {
         'step': 6,
         'label': 'Directory Enumeration',
         'depends_on': ['service-enumeration-live-hosts', 'vhost-discovery-shared-infra'],
+    },
+    'application-security-testing': {
+        'step': 7,
+        'label': 'Application Testing',
+        'depends_on': ['directory-enumeration-live-hosts'],
+    },
+    'api-endpoint-testing': {
+        'step': 8,
+        'label': 'API Testing',
+        'depends_on': ['directory-enumeration-live-hosts'],
     },
 }
 
@@ -117,6 +127,10 @@ def job_title_label(value: str) -> str:
         return 'Vhost Discovery'
     if 'directory' in text and 'enumeration' in text:
         return 'Directory Enumeration'
+    if 'application' in text and ('security' in text or 'testing' in text):
+        return 'Application Testing'
+    if text.startswith('api-') or 'api-endpoint' in text or ('api' in text and 'testing' in text):
+        return 'API Testing'
     if 'aa-passive-discovery' in text:
         return 'Passive Web Discovery'
     if 'passive-dns' in text or ('passive' in text and 'dns' in text and 'discovery' not in text):
@@ -206,6 +220,33 @@ def combined_live_roots_from_step4_and_step5() -> List[str]:
                 seen.add(item)
                 merged.append(item)
     return merged
+
+
+_API_PATH_HINTS = ('/api', '/swagger', '/graphql', '/openapi', '/v2/api-docs', '/v3/api-docs', '/actuator')
+
+
+def api_candidate_hosts_from_step4_and_step6() -> List[str]:
+    """API hosts: Step 4 api-gateway classifications plus Step 6 hosts exposing API-ish paths."""
+    candidates: List[str] = []
+    seen: set[str] = set()
+    step4 = read_result_file(RESULTS_DIR / 'service-enumeration-live-hosts.json')
+    for asset in (step4.get('assets', []) or []):
+        if isinstance(asset, dict) and asset.get('kind') == 'api-gateway' and asset.get('domain'):
+            host = asset['domain']
+            if host not in seen:
+                seen.add(host)
+                candidates.append(host)
+    step6 = read_result_file(RESULTS_DIR / 'directory-enumeration-live-hosts.json')
+    for asset in (step6.get('assets', []) or []):
+        if not isinstance(asset, dict) or not asset.get('domain'):
+            continue
+        paths = [p.get('path', '') for p in (asset.get('paths', []) or []) if isinstance(p, dict)]
+        if any(any(path.startswith(hint) for hint in _API_PATH_HINTS) for path in paths):
+            host = asset['domain']
+            if host not in seen:
+                seen.add(host)
+                candidates.append(host)
+    return candidates
 
 
 def group_jobs_by_program(jobs: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
@@ -299,6 +340,10 @@ def list_jobs() -> List[Dict[str, Any]]:
                 queued_targets = vhost_targets_from_step4()
             elif job_name == 'directory-enumeration-live-hosts':
                 queued_targets = combined_live_roots_from_step4_and_step5()
+            elif job_name == 'application-security-testing':
+                queued_targets = combined_live_roots_from_step4_and_step5()
+            elif job_name == 'api-endpoint-testing':
+                queued_targets = api_candidate_hosts_from_step4_and_step6()
             else:
                 queued_targets = definition.get('targets', [])
             if payload:
@@ -420,6 +465,10 @@ def rerun_job(job_name: str) -> Dict[str, Any]:
         queued_targets = vhost_targets_from_step4()
     elif job_name == 'directory-enumeration-live-hosts':
         queued_targets = combined_live_roots_from_step4_and_step5()
+    elif job_name == 'application-security-testing':
+        queued_targets = combined_live_roots_from_step4_and_step5()
+    elif job_name == 'api-endpoint-testing':
+        queued_targets = api_candidate_hosts_from_step4_and_step6()
     else:
         queued_targets = []
     result_path.write_text(json.dumps({
@@ -492,7 +541,7 @@ def index():
     jobs = list_jobs()
     summary = summarize_jobs(jobs)
     grouped_jobs = group_jobs_by_program(jobs)
-    workflow_order = [job_workflow_metadata(job_name) for job_name in ['aa-passive-discovery', 'american-airlines-passive-dns', 'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra', 'directory-enumeration-live-hosts']]
+    workflow_order = [job_workflow_metadata(job_name) for job_name in ['aa-passive-discovery', 'american-airlines-passive-dns', 'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra', 'directory-enumeration-live-hosts', 'application-security-testing', 'api-endpoint-testing']]
     return render_template_string('''
     <!doctype html>
     <html lang="en">

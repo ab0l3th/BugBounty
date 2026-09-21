@@ -28,13 +28,15 @@ WORKFLOW_SEQUENCE = {
     'service-enumeration-live-hosts': {'step': 4, 'depends_on': ['confirm-live-web-assets']},
     'vhost-discovery-shared-infra': {'step': 5, 'depends_on': ['service-enumeration-live-hosts']},
     'directory-enumeration-live-hosts': {'step': 6, 'depends_on': ['service-enumeration-live-hosts', 'vhost-discovery-shared-infra']},
+    'application-security-testing': {'step': 7, 'depends_on': ['directory-enumeration-live-hosts']},
+    'api-endpoint-testing': {'step': 8, 'depends_on': ['directory-enumeration-live-hosts']},
 }
 
 # Jobs that make live connections to targets and must not run in the default passive-only mode.
-ACTIVE_JOBS = {'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra', 'directory-enumeration-live-hosts'}
+ACTIVE_JOBS = {'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra', 'directory-enumeration-live-hosts', 'application-security-testing', 'api-endpoint-testing'}
 
 # Statuses that count as a completed job for dependency gating and re-run skipping.
-COMPLETED_STATUSES = {'completed', 'ok', 'no_new_assets', 'no_in_scope_targets', 'no_shared_infra', 'no_paths', 'no_activity'}
+COMPLETED_STATUSES = {'completed', 'ok', 'no_new_assets', 'no_in_scope_targets', 'no_shared_infra', 'no_paths', 'no_findings', 'no_activity'}
 
 
 def job_workflow_dependencies(job_name: str) -> list[str]:
@@ -687,6 +689,272 @@ def _directory_enumeration(hosts: list[str], *, wordlist: list[str] | None = Non
     }
 
 
+def _fetch_headers_body(url: str, *, extra_headers: dict | None = None, method: str = 'GET', data=None, timeout: int = 8) -> tuple[int, dict, str]:
+    """Single HTTP fetch returning (status, lowercased-headers, text). Non-destructive."""
+    headers = {'User-Agent': 'BugBountyPassiveRecon/1.0'}
+    if extra_headers:
+        headers.update(extra_headers)
+    body_bytes = data.encode('utf-8') if isinstance(data, str) else data
+    req = urllib_request.Request(url, data=body_bytes, headers=headers, method=method)
+    with urllib_request.urlopen(req, timeout=timeout) as resp:
+        code = getattr(resp, 'status', resp.getcode())
+        raw = resp.read(8192)
+        hdrs: dict = {}
+        rh = getattr(resp, 'headers', None)
+        if rh is not None and hasattr(rh, 'items'):
+            hdrs = {str(k).lower(): str(v) for k, v in rh.items()}
+        text = raw.decode('utf-8', 'replace') if isinstance(raw, (bytes, bytearray)) else str(raw)
+        return code, hdrs, text
+
+
+# --- Step 7: application security (non-destructive misconfiguration/exposure detection) ---
+_SECURITY_HEADERS = [
+    'content-security-policy', 'strict-transport-security', 'x-frame-options',
+    'x-content-type-options', 'referrer-policy', 'permissions-policy',
+]
+_ERROR_SIGNATURES = (
+    'traceback (most recent call last)', 'exception in thread', 'java.lang.',
+    'sqlstate', 'stack trace', 'syntaxerror', 'fatal error:', 'undefined index',
+)
+
+
+def _application_security_tests(hosts: list[str], *, use_external_tools: bool = False) -> dict:
+    deduped_hosts = sorted(set(hosts))
+    assets: list[dict] = []
+    probe_log: list[dict] = []
+    thread_status: list[dict] = []
+    max_workers = min(8, max(1, len(deduped_hosts)))
+
+    def test_host(host: str) -> dict:
+        thread_name = threading.current_thread().name
+        url = f'https://{host}'
+        findings: list[dict] = []
+        try:
+            code, hdrs, body = _fetch_headers_body(url)
+        except urllib_error.HTTPError as exc:
+            code = exc.code
+            hdrs = {str(k).lower(): str(v) for k, v in (exc.headers.items() if exc.headers else [])}
+            body = ''
+        except (urllib_error.URLError, ValueError, OSError) as exc:
+            record = {'domain': host, 'status': 'no_response', 'kind': 'app-test', 'ports': [], 'findings': [], 'source': 'app-test', 'sources': ['app-test'], 'source_count': 0, 'evidence': [], 'error': str(exc)}
+            assets.append(record)
+            thread_status.append({'thread_id': thread_name, 'host': host, 'status': 'no_response', 'timestamp': time.time()})
+            return record
+
+        missing = [h for h in _SECURITY_HEADERS if h not in hdrs]
+        if missing:
+            findings.append({'type': 'missing_security_headers', 'detail': missing, 'severity': 'low'})
+        for header in ('server', 'x-powered-by', 'x-aspnet-version'):
+            if hdrs.get(header):
+                findings.append({'type': 'tech_disclosure', 'detail': f'{header}: {hdrs[header]}', 'severity': 'info'})
+        set_cookie = hdrs.get('set-cookie', '')
+        if set_cookie:
+            lowered = set_cookie.lower()
+            flags = [name for name, token in (('missing Secure', 'secure'), ('missing HttpOnly', 'httponly'), ('missing SameSite', 'samesite')) if token not in lowered]
+            if flags:
+                findings.append({'type': 'insecure_cookie', 'detail': flags, 'severity': 'low'})
+        if any(sig in body.lower() for sig in _ERROR_SIGNATURES):
+            findings.append({'type': 'error_disclosure', 'detail': 'stack trace or error signature in response', 'severity': 'medium'})
+
+        # CORS reflection check with an untrusted Origin (read-only).
+        try:
+            _, cors_hdrs, _ = _fetch_headers_body(url, extra_headers={'Origin': 'https://evil.example'})
+            acao = cors_hdrs.get('access-control-allow-origin', '')
+            acac = cors_hdrs.get('access-control-allow-credentials', '')
+            if acao == 'https://evil.example' or (acao == '*' and acac.lower() == 'true'):
+                findings.append({'type': 'cors_misconfig', 'detail': f'ACAO={acao} ACAC={acac}', 'severity': 'medium'})
+                probe_log.append({'thread_id': thread_name, 'host': host, 'check': 'cors', 'status': 'misconfig', 'timestamp': time.time()})
+        except Exception:
+            pass
+
+        record = {
+            'domain': host,
+            'status': 'findings' if findings else 'no_findings',
+            'kind': 'app-test',
+            'ports': [],
+            'findings': findings,
+            'source': 'app-test',
+            'sources': ['app-test'],
+            'source_count': len(findings),
+            'evidence': [{'source': 'app-test', 'url': url, 'detail': f.get('type')} for f in findings],
+        }
+        assets.append(record)
+        thread_status.append({'thread_id': thread_name, 'host': host, 'status': record['status'], 'findings': len(findings), 'timestamp': time.time()})
+        return record
+
+    if not deduped_hosts:
+        return {'discovered': [], 'assets': [], 'probe_log': [], 'thread_status': [], 'threads': 0}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(test_host, host) for host in deduped_hosts]
+        for future in as_completed(futures):
+            future.result()
+
+    hits = [a for a in assets if a.get('findings')]
+    return {
+        'discovered': sorted(a['domain'] for a in hits),
+        'assets': sorted(assets, key=lambda r: r['domain']),
+        'probe_log': probe_log,
+        'thread_status': thread_status,
+        'threads': max_workers,
+    }
+
+
+# --- Step 8: API endpoint testing (debug endpoints + unauthenticated data exposure signals) ---
+_API_DEBUG_PATHS = [
+    '/actuator', '/actuator/env', '/actuator/health', '/actuator/mappings', '/actuator/heapdump',
+    '/debug', '/api/debug', '/v2/api-docs', '/v3/api-docs', '/openapi.json',
+    '/swagger.json', '/swagger-ui.html', '/graphql', '/trace', '/console', '/__debug__',
+]
+_GRAPHQL_INTROSPECTION = '{"query":"{__schema{types{name}}}"}'
+
+
+def _looks_like_data(content_type: str, body: str) -> bool:
+    if 'json' in content_type.lower():
+        return True
+    stripped = body.strip()
+    return stripped.startswith('{') or stripped.startswith('[')
+
+
+def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False) -> dict:
+    deduped_hosts = sorted(set(hosts))
+    assets: list[dict] = []
+    probe_log: list[dict] = []
+    thread_status: list[dict] = []
+    max_workers = min(8, max(1, len(deduped_hosts)))
+
+    def test_host(host: str) -> dict:
+        thread_name = threading.current_thread().name
+        findings: list[dict] = []
+        openapi_paths: list[str] = []
+        for path in _API_DEBUG_PATHS:
+            url = f'https://{host}{path}'
+            try:
+                code, hdrs, body = _fetch_headers_body(url)
+            except urllib_error.HTTPError as exc:
+                code, hdrs, body = exc.code, {}, ''
+            except (urllib_error.URLError, ValueError, OSError):
+                continue
+            if code == 200:
+                exposes = _looks_like_data(hdrs.get('content-type', ''), body)
+                findings.append({'type': 'debug_endpoint', 'path': path, 'status_code': code, 'exposes_data': bool(exposes), 'severity': 'high' if exposes else 'medium'})
+                probe_log.append({'thread_id': thread_name, 'host': host, 'path': path, 'status_code': code, 'status': 'found', 'timestamp': time.time()})
+                if path in ('/v2/api-docs', '/v3/api-docs', '/openapi.json', '/swagger.json') and exposes:
+                    try:
+                        spec = json.loads(body)
+                        if isinstance(spec, dict) and isinstance(spec.get('paths'), dict):
+                            openapi_paths = list(spec['paths'].keys())
+                    except Exception:
+                        pass
+
+        # GraphQL introspection (read-only query).
+        try:
+            code, hdrs, body = _fetch_headers_body(f'https://{host}/graphql', extra_headers={'Content-Type': 'application/json'}, method='POST', data=_GRAPHQL_INTROSPECTION)
+            if code == 200 and '__schema' in body:
+                findings.append({'type': 'graphql_introspection', 'detail': 'introspection enabled', 'severity': 'medium'})
+        except Exception:
+            pass
+
+        # Unauthenticated access to documented API endpoints (bounded, read-only GET).
+        for doc_path in openapi_paths[:15]:
+            if not isinstance(doc_path, str) or not doc_path.startswith('/') or '{' in doc_path:
+                continue
+            url = f'https://{host}{doc_path}'
+            try:
+                code, hdrs, body = _fetch_headers_body(url)
+            except urllib_error.HTTPError as exc:
+                code, hdrs, body = exc.code, {}, ''
+            except (urllib_error.URLError, ValueError, OSError):
+                continue
+            if code == 200 and _looks_like_data(hdrs.get('content-type', ''), body):
+                findings.append({'type': 'unauthenticated_endpoint', 'path': doc_path, 'status_code': code, 'severity': 'high'})
+
+        record = {
+            'domain': host,
+            'status': 'findings' if findings else 'no_findings',
+            'kind': 'api-test',
+            'ports': [],
+            'findings': findings,
+            'source': 'api-test',
+            'sources': ['api-test'],
+            'source_count': len(findings),
+            'evidence': [{'source': 'api-test', 'url': f'https://{host}{f.get("path", "")}', 'detail': f.get('type')} for f in findings],
+        }
+        assets.append(record)
+        thread_status.append({'thread_id': thread_name, 'host': host, 'status': record['status'], 'findings': len(findings), 'timestamp': time.time()})
+        return record
+
+    if not deduped_hosts:
+        return {'discovered': [], 'assets': [], 'probe_log': [], 'thread_status': [], 'threads': 0}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(test_host, host) for host in deduped_hosts]
+        for future in as_completed(futures):
+            future.result()
+
+    hits = [a for a in assets if a.get('findings')]
+    return {
+        'discovered': sorted(a['domain'] for a in hits),
+        'assets': sorted(assets, key=lambda r: r['domain']),
+        'probe_log': probe_log,
+        'thread_status': thread_status,
+        'threads': max_workers,
+    }
+
+
+def _load_result(name: str) -> dict:
+    path = RESULTS_DIR / f'{name}.json'
+    try:
+        return json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return {}
+
+
+def _hosts_from_result(payload: dict) -> list[str]:
+    hosts = list(payload.get('discovered', []) or [])
+    if not hosts:
+        hosts = [a.get('domain') for a in (payload.get('assets', []) or []) if isinstance(a, dict) and a.get('domain')]
+    return [h for h in hosts if isinstance(h, str) and h.strip()]
+
+
+def _combined_live_hosts() -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for name in ('service-enumeration-live-hosts', 'vhost-discovery-shared-infra'):
+        for host in _hosts_from_result(_load_result(name)):
+            if host not in seen:
+                seen.add(host)
+                merged.append(host)
+    return merged
+
+
+_API_PATH_HINTS = ('/api', '/swagger', '/graphql', '/openapi', '/v2/api-docs', '/v3/api-docs', '/actuator')
+
+
+def _api_candidate_hosts() -> list[str]:
+    """API hosts: step 4 api-gateway classifications plus step 6 hosts exposing API-ish paths."""
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    for asset in _load_result('service-enumeration-live-hosts').get('assets', []) or []:
+        if isinstance(asset, dict) and asset.get('kind') == 'api-gateway' and asset.get('domain'):
+            host = asset['domain']
+            if host not in seen:
+                seen.add(host)
+                candidates.append(host)
+
+    for asset in _load_result('directory-enumeration-live-hosts').get('assets', []) or []:
+        if not isinstance(asset, dict) or not asset.get('domain'):
+            continue
+        paths = [p.get('path', '') for p in (asset.get('paths', []) or []) if isinstance(p, dict)]
+        if any(any(path.startswith(hint) for hint in _API_PATH_HINTS) for path in paths):
+            host = asset['domain']
+            if host not in seen:
+                seen.add(host)
+                candidates.append(host)
+    return candidates
+
+
 def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: bool = False) -> dict:
     job_name = (job.get('name') or '').strip()
     job_type = (job.get('type', 'passive') or 'passive').lower()
@@ -923,6 +1191,57 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
         response['probe_log'] = enum_result.get('probe_log', [])
         response['thread_status'] = enum_result.get('thread_status', [])
         response['probe_threads'] = enum_result.get('threads', 0)
+        return response
+
+    if job_name == 'application-security-testing':
+        dep_path = RESULTS_DIR / 'directory-enumeration-live-hosts.json'
+        if not dep_path.exists():
+            return {
+                'job': job_name, 'program': job.get('program', DEFAULT_PROGRAM), 'type': 'active',
+                'targets': [], 'queued': [], 'skipped': [], 'status': 'waiting_on_dependencies',
+                'job_state': 'waiting_on_dependencies', 'discovered': [], 'assets': [], 'source_count': 0,
+                'dependencies': ['directory-enumeration-live-hosts'],
+            }
+        hosts = _combined_live_hosts()
+        deduped_hosts = [h for h in hosts if is_in_scope(h, allowed_scope)]
+        test_result = _application_security_tests(deduped_hosts, use_external_tools=use_external_tools)
+        assets = test_result.get('assets', [])
+        response = {
+            'job': job_name, 'program': job.get('program', DEFAULT_PROGRAM), 'type': 'active',
+            'targets': deduped_hosts, 'queued': deduped_hosts, 'skipped': [],
+            'status': 'ok' if test_result.get('discovered') else 'no_findings',
+            'discovered': test_result.get('discovered', []), 'assets': assets,
+            'source_count': sum(len(a.get('findings', [])) for a in assets),
+            'depends_on': ['directory-enumeration-live-hosts'],
+        }
+        response['probe_log'] = test_result.get('probe_log', [])
+        response['thread_status'] = test_result.get('thread_status', [])
+        response['probe_threads'] = test_result.get('threads', 0)
+        return response
+
+    if job_name == 'api-endpoint-testing':
+        dep_path = RESULTS_DIR / 'directory-enumeration-live-hosts.json'
+        if not dep_path.exists():
+            return {
+                'job': job_name, 'program': job.get('program', DEFAULT_PROGRAM), 'type': 'active',
+                'targets': [], 'queued': [], 'skipped': [], 'status': 'waiting_on_dependencies',
+                'job_state': 'waiting_on_dependencies', 'discovered': [], 'assets': [], 'source_count': 0,
+                'dependencies': ['directory-enumeration-live-hosts'],
+            }
+        api_hosts = [h for h in _api_candidate_hosts() if is_in_scope(h, allowed_scope)]
+        test_result = _api_endpoint_tests(api_hosts, use_external_tools=use_external_tools)
+        assets = test_result.get('assets', [])
+        response = {
+            'job': job_name, 'program': job.get('program', DEFAULT_PROGRAM), 'type': 'active',
+            'targets': api_hosts, 'queued': api_hosts, 'skipped': [],
+            'status': 'ok' if test_result.get('discovered') else 'no_findings',
+            'discovered': test_result.get('discovered', []), 'assets': assets,
+            'source_count': sum(len(a.get('findings', [])) for a in assets),
+            'depends_on': ['directory-enumeration-live-hosts'],
+        }
+        response['probe_log'] = test_result.get('probe_log', [])
+        response['thread_status'] = test_result.get('thread_status', [])
+        response['probe_threads'] = test_result.get('threads', 0)
         return response
 
     result = {

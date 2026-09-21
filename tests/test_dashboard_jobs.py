@@ -236,6 +236,123 @@ class DashboardJobMetadataTest(unittest.TestCase):
             self.assertNotIn('/nope', found_paths)
             self.assertTrue(result['thread_status'])
 
+    def test_dashboard_detects_application_testing_step_and_title(self):
+        jobs = list_jobs()
+        app_job = next((job for job in jobs if job['name'] == 'application-security-testing'), None)
+        self.assertIsNotNone(app_job)
+        self.assertEqual(app_job['workflow_step'], 7)
+        self.assertEqual(app_job['depends_on'], ['directory-enumeration-live-hosts'])
+        self.assertEqual(job_title_label('application-security-testing'), 'Application Testing')
+
+    def test_dashboard_detects_api_testing_step_and_title(self):
+        jobs = list_jobs()
+        api_job = next((job for job in jobs if job['name'] == 'api-endpoint-testing'), None)
+        self.assertIsNotNone(api_job)
+        self.assertEqual(api_job['workflow_step'], 8)
+        self.assertEqual(api_job['depends_on'], ['directory-enumeration-live-hosts'])
+        self.assertEqual(job_title_label('api-endpoint-testing'), 'API Testing')
+
+    def test_api_testing_targets_api_gateways_and_api_path_hosts(self):
+        step4 = ROOT / 'results' / 'service-enumeration-live-hosts.json'
+        step6 = ROOT / 'results' / 'directory-enumeration-live-hosts.json'
+        step4.parent.mkdir(parents=True, exist_ok=True)
+        step4.write_text(__import__('json').dumps({
+            'job': 'service-enumeration-live-hosts', 'program': 'american-airlines', 'status': 'ok',
+            'discovered': ['api.example.com', 'www.example.com'],
+            'assets': [
+                {'domain': 'api.example.com', 'kind': 'api-gateway', 'ports': [443]},
+                {'domain': 'www.example.com', 'kind': 'static-site', 'ports': [443]},
+            ],
+        }, indent=2), encoding='utf-8')
+        step6.write_text(__import__('json').dumps({
+            'job': 'directory-enumeration-live-hosts', 'program': 'american-airlines', 'status': 'ok',
+            'discovered': ['portal.example.com'],
+            'assets': [
+                {'domain': 'portal.example.com', 'kind': 'content', 'paths': [{'path': '/api', 'status_code': 200}, {'path': '/login', 'status_code': 200}]},
+                {'domain': 'www.example.com', 'kind': 'content', 'paths': [{'path': '/login', 'status_code': 200}]},
+            ],
+        }, indent=2), encoding='utf-8')
+        try:
+            jobs = list_jobs()
+            api_job = next(job for job in jobs if job['name'] == 'api-endpoint-testing')
+            # api.example.com (api-gateway) + portal.example.com (/api path); www excluded
+            self.assertEqual(sorted(api_job['targets']), ['api.example.com', 'portal.example.com'])
+        finally:
+            step4.unlink(missing_ok=True)
+            step6.unlink(missing_ok=True)
+
+    def test_application_security_tests_flag_missing_headers_and_cors(self):
+        from worker import _application_security_tests
+
+        class FakeResp:
+            def __init__(self, status, headers, body=b'ok'):
+                self.status = status
+                self._headers = headers
+                self._body = body
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def getcode(self):
+                return self.status
+            def read(self, n=None):
+                return self._body
+            @property
+            def headers(self):
+                class H(dict):
+                    def items(inner):
+                        return list(super().items())
+                h = H(); h.update(self._headers); return h
+
+        def fake_urlopen(req, timeout=8):
+            origin = req.headers.get('Origin') if hasattr(req, 'headers') else None
+            if origin:
+                return FakeResp(200, {'Access-Control-Allow-Origin': 'https://evil.example', 'Access-Control-Allow-Credentials': 'true'})
+            return FakeResp(200, {'Server': 'nginx/1.18'})
+
+        with patch('worker.urllib_request.urlopen', side_effect=fake_urlopen):
+            result = _application_security_tests(['app.example.com'])
+            asset = next(a for a in result['assets'] if a['domain'] == 'app.example.com')
+            types = {f['type'] for f in asset['findings']}
+            self.assertIn('missing_security_headers', types)
+            self.assertIn('cors_misconfig', types)
+            self.assertIn('tech_disclosure', types)
+
+    def test_api_endpoint_tests_flag_exposed_debug_endpoint(self):
+        from worker import _api_endpoint_tests
+
+        class FakeResp:
+            def __init__(self, status, headers, body=b'{}'):
+                self.status = status
+                self._headers = headers
+                self._body = body
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def getcode(self):
+                return self.status
+            def read(self, n=None):
+                return self._body
+            @property
+            def headers(self):
+                class H(dict):
+                    def items(inner):
+                        return list(super().items())
+                h = H(); h.update(self._headers); return h
+
+        def fake_urlopen(req, timeout=8):
+            url = req.full_url
+            if url.endswith('/actuator/env'):
+                return FakeResp(200, {'Content-Type': 'application/json'}, b'{"activeProfiles":["prod"],"propertySources":[]}')
+            raise OSError('404')
+
+        with patch('worker.urllib_request.urlopen', side_effect=fake_urlopen):
+            result = _api_endpoint_tests(['api.example.com'])
+            asset = next(a for a in result['assets'] if a['domain'] == 'api.example.com')
+            debug = [f for f in asset['findings'] if f['type'] == 'debug_endpoint']
+            self.assertTrue(any(f['path'] == '/actuator/env' and f['exposes_data'] for f in debug))
+
     def test_service_enumeration_uses_step3_live_asset_output(self):
         result_path = ROOT / 'results' / 'confirm-live-web-assets.json'
         result_path.parent.mkdir(parents=True, exist_ok=True)

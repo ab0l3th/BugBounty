@@ -118,6 +118,16 @@ This sequence is intentionally ordered and must be followed in order:
 7. Move into application testing only after the live targets and reachable app surface are known.
    - Test authentication flows, exposed APIs, admin panels, and likely misconfigurations.
    - Keep testing minimal, scoped, and aligned with the approved rules.
+   - Implemented as the `application-security-testing` job: non-destructive detection across the combined live hosts — missing security headers, tech/version disclosure, insecure cookie flags, CORS reflection with an untrusted Origin, and error/stack-trace disclosure. It flags signals for manual confirmation; it does not exploit, brute-force, or modify data.
+
+8. API endpoint testing on API hosts.
+   - Implemented as the `api-endpoint-testing` job: targets Step 4 `api-gateway` hosts plus Step 6 hosts exposing API-ish paths (`/api`, `/swagger`, `/graphql`, `/openapi`, `/actuator`).
+   - Detects exposed debug endpoints (e.g., `/actuator/env`, `/v2/api-docs`) and whether they return data, GraphQL introspection, and unauthenticated access to documented endpoints parsed from an exposed OpenAPI/Swagger spec (bounded, read-only GETs).
+   - All checks are non-destructive detection signals for manual review, not exploitation.
+
+## Safety note on active testing (steps 3-8)
+
+Steps 3 through 8 make live connections to targets and are therefore active, not passive. They are off by default and only run with the worker's `--allow-active` flag (the dashboard supplies this automatically for those steps). The application and API testing stages gather non-destructive detection signals only; confirmation and exploitation remain manual and must stay within the approved program scope and rules.
 
 ## Initial status
 
