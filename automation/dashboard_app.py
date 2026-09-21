@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -22,6 +23,10 @@ app = Flask(__name__)
 
 
 def _job_state_for(job_name: str, payload: Dict[str, Any] | None = None) -> str:
+    if payload and payload.get('status') == 'queued':
+        return 'queued'
+    if payload and payload.get('job_state') == 'queued':
+        return 'queued'
     if RUNNING_DIR.exists() and (RUNNING_DIR / f'{job_name}.lock').exists():
         return 'running'
     if payload and payload.get('job_state') == 'completed':
@@ -224,6 +229,26 @@ def rerun_job(job_name: str) -> Dict[str, Any]:
         raise KeyError(f'Unknown job: {job_name}')
 
     program = match.get('program', 'unknown')
+    result_path = RESULTS_DIR / f'{job_name}.json'
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text(json.dumps({
+        'job': job_name,
+        'program': program,
+        'type': 'passive',
+        'targets': [],
+        'queued': [],
+        'skipped': [],
+        'discovered': [],
+        'assets': [],
+        'status': 'queued',
+        'job_state': 'queued',
+        'source_count': 0,
+        'queued_at': int(time.time()),
+    }, indent=2), encoding='utf-8')
+
+    RUNNING_DIR.mkdir(parents=True, exist_ok=True)
+    (RUNNING_DIR / f'{job_name}.lock').write_text(str(int(time.time())), encoding='utf-8')
+
     command = [sys.executable, str(ROOT / 'automation' / 'worker.py'), '--force']
     if program and program != 'unknown':
         command.extend(['--program', str(program)])

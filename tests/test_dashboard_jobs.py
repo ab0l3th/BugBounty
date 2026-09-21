@@ -15,6 +15,13 @@ from passive_dns_enrichment import passive_dns_enrichment
 
 class DashboardJobMetadataTest(unittest.TestCase):
     def test_list_jobs_uses_yaml_metadata_for_queued_jobs(self):
+        result_path = ROOT / 'results' / 'aa-passive-discovery.json'
+        lock_path = ROOT / 'results' / '.running' / 'aa-passive-discovery.lock'
+        if result_path.exists():
+            result_path.unlink()
+        if lock_path.exists():
+            lock_path.unlink()
+
         jobs = list_jobs()
         names = {job['name'] for job in jobs}
         self.assertIn('aa-passive-discovery', names)
@@ -55,6 +62,10 @@ class DashboardJobMetadataTest(unittest.TestCase):
                 self.assertEqual(response.status_code, 202)
                 self.assertIn('queued', response.get_json()['status'])
                 mock_popen.assert_called_once()
+
+                payload = __import__('json').loads((Path(__file__).resolve().parents[1] / 'results' / 'aa-passive-discovery.json').read_text())
+                self.assertEqual(payload['status'], 'queued')
+                self.assertEqual(payload['job_state'], 'queued')
 
 
 if __name__ == '__main__':

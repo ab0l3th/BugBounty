@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 from scope_validator import is_in_scope, parse_scope_pattern
@@ -10,6 +11,7 @@ from scope_validator import is_in_scope, parse_scope_pattern
 ROOT = Path(__file__).resolve().parent.parent
 JOBS_DIR = ROOT / 'jobs'
 RESULTS_DIR = ROOT / 'results'
+RUNNING_DIR = RESULTS_DIR / '.running'
 DEFAULT_PROGRAM = 'american-airlines'
 
 
@@ -226,21 +228,28 @@ def main() -> None:
     for job_path in jobs:
         if not args.force and not should_run_job(job_path):
             continue
-        job = load_job(job_path)
-        allowed_scope = read_scope_file(job.get('program', DEFAULT_PROGRAM))
-        result = run_passive_job(job, allowed_scope)
-        if not RESULTS_DIR.exists():
-            RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        out_path = RESULTS_DIR / f"{job_path.stem}.json"
-        previous = None
-        if out_path.exists():
-            try:
-                previous = json.loads(out_path.read_text(encoding='utf-8'))
-            except Exception:
-                previous = None
-        merged_result = merge_result_payloads(previous, result)
-        out_path.write_text(json.dumps(merged_result, indent=2), encoding='utf-8')
-        all_results.append(merged_result)
+        RUNNING_DIR.mkdir(parents=True, exist_ok=True)
+        lock_path = RUNNING_DIR / f'{job_path.stem}.lock'
+        lock_path.write_text(str(time.time()), encoding='utf-8')
+        try:
+            job = load_job(job_path)
+            allowed_scope = read_scope_file(job.get('program', DEFAULT_PROGRAM))
+            result = run_passive_job(job, allowed_scope)
+            if not RESULTS_DIR.exists():
+                RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+            out_path = RESULTS_DIR / f"{job_path.stem}.json"
+            previous = None
+            if out_path.exists():
+                try:
+                    previous = json.loads(out_path.read_text(encoding='utf-8'))
+                except Exception:
+                    previous = None
+            merged_result = merge_result_payloads(previous, result)
+            out_path.write_text(json.dumps(merged_result, indent=2), encoding='utf-8')
+            all_results.append(merged_result)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
 
     print(json.dumps(all_results, indent=2))
 
