@@ -217,6 +217,28 @@ def trigger_repo_sync_on_push() -> None:
         subprocess.run(command, cwd=str(ROOT), check=True)
 
 
+def rerun_job(job_name: str) -> Dict[str, Any]:
+    jobs = list_jobs()
+    match = next((job for job in jobs if job.get('name') == job_name), None)
+    if not match:
+        raise KeyError(f'Unknown job: {job_name}')
+
+    program = match.get('program', 'unknown')
+    command = [sys.executable, str(ROOT / 'automation' / 'worker.py'), '--force']
+    if program and program != 'unknown':
+        command.extend(['--program', str(program)])
+
+    completed = subprocess.run(command, cwd=str(ROOT), capture_output=True, text=True, check=False)
+    return {
+        'status': 'queued' if completed.returncode == 0 else 'error',
+        'job': job_name,
+        'program': program,
+        'returncode': completed.returncode,
+        'stdout': completed.stdout.strip(),
+        'stderr': completed.stderr.strip(),
+    }
+
+
 @app.route('/webhook/github', methods=['POST'])
 def github_webhook():
     raw = request.get_data(cache=True, as_text=False)
@@ -280,6 +302,8 @@ def index():
         .ok { background: #14532d; color: #dcfce7; }
         .warn { background: #78350f; color: #fef3c7; }
         .bad { background: #7f1d1d; color: #fee2e2; }
+        .rerun-form { margin-top: 8px; }
+        .rerun-button { background: #0ea5e9; color: #082f49; border: none; border-radius: 6px; padding: 8px 12px; font-weight: bold; cursor: pointer; }
         ul { margin: 10px 0 0 20px; }
         code { background: #0b1120; border-radius: 4px; padding: 2px 6px; }
         a { color: #7dd3fc; }
@@ -348,6 +372,9 @@ def index():
                     </div>
                   </summary>
                   <div class="job-content">
+                    <form class="rerun-form" action="/jobs/{{ job.name }}/rerun" method="post">
+                      <button class="rerun-button" type="submit">Re-run job</button>
+                    </form>
                     <p><strong>Program:</strong> {{ program_label(job.program) }}</p>
                     <p><strong>Type:</strong> {{ job.type }}</p>
                     <p><strong>Pipeline status:</strong> {{ job.status }}</p>
@@ -423,6 +450,15 @@ def index():
     </body>
     </html>
     ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs)
+
+
+@app.route('/jobs/<job_name>/rerun', methods=['POST'])
+def rerun_job_endpoint(job_name: str):
+    try:
+        result = rerun_job(job_name)
+    except KeyError:
+        return jsonify({'status': 'error', 'message': f'Unknown job: {job_name}'}), 404
+    return jsonify(result)
 
 
 @app.route('/api/jobs')

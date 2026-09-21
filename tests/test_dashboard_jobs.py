@@ -6,8 +6,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / 'automation') not in sys.path:
     sys.path.insert(0, str(ROOT / 'automation'))
 
-from dashboard_app import job_title_label, list_jobs
+from unittest.mock import patch
+
+from dashboard_app import app, job_title_label, list_jobs
 from passive_discovery import public_sources_for
+from passive_dns_enrichment import passive_dns_enrichment
 
 
 class DashboardJobMetadataTest(unittest.TestCase):
@@ -32,6 +35,26 @@ class DashboardJobMetadataTest(unittest.TestCase):
         self.assertIn('api.hackertarget.com', labels)
         self.assertIn('dns.google', labels)
         self.assertNotIn('www.google.com', labels)
+
+    def test_passive_dns_enrichment_records_provider_statuses(self):
+        with patch('passive_dns_enrichment.load_allowed_patterns', return_value=['*.aa.com'], create=True):
+            with patch('passive_dns_enrichment.certspotter_candidates', return_value={'www.aa.com'}), \
+                 patch('passive_dns_enrichment.hackertarget_candidates', return_value={'api.aa.com'}), \
+                 patch('passive_dns_enrichment.crt_sh_candidates', return_value={'crt.aa.com'}), \
+                 patch('passive_dns_enrichment.dns_google_candidates', return_value={'dns.aa.com'}), \
+                 patch('passive_dns_enrichment.is_in_scope', side_effect=lambda host, patterns: True):
+                result = passive_dns_enrichment('american-airlines')
+                self.assertIn('provider_status', result)
+                provider_names = {entry['source'] for entry in result['provider_status']}
+                self.assertTrue({'certspotter', 'hackertarget', 'crt.sh', 'dns.google'} <= provider_names)
+
+    def test_dashboard_can_queue_rerun_for_job(self):
+        with patch('dashboard_app.subprocess.run', return_value=type('Proc', (), {'returncode': 0, 'stdout': '[]', 'stderr': ''})()) as mock_run:
+            with app.test_client() as client:
+                response = client.post('/jobs/aa-passive-discovery/rerun')
+                self.assertEqual(response.status_code, 200)
+                self.assertIn('queued', response.get_json()['status'])
+                mock_run.assert_called_once()
 
 
 if __name__ == '__main__':
