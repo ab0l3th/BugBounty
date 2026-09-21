@@ -139,7 +139,11 @@ def index():
         .summary-row { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 16px; margin-bottom: 20px; }
         .pill { background: #0f172a; border: 1px solid #334155; border-radius: 10px; padding: 16px; text-align: center; }
         .pill strong { display: block; font-size: 28px; margin-top: 8px; }
-        .job { margin-bottom: 18px; padding: 16px; background: #0f172a; border-left: 4px solid #38bdf8; border-radius: 8px; }
+        .job { margin-bottom: 18px; padding: 0; background: #0f172a; border-left: 4px solid #38bdf8; border-radius: 8px; overflow: hidden; }
+        summary { list-style: none; cursor: pointer; padding: 16px; display: block; }
+        summary::-webkit-details-marker { display: none; }
+        .job-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+        .job-content { padding: 0 16px 16px; }
         .status { display: inline-block; padding: 4px 8px; border-radius: 999px; font-size: 12px; font-weight: bold; }
         .ok { background: #14532d; color: #dcfce7; }
         .warn { background: #78350f; color: #fef3c7; }
@@ -156,7 +160,10 @@ def index():
           body { padding: 16px; }
           .summary-row { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
           .pill strong { font-size: 22px; }
-          .job { padding: 12px; }
+          .job { padding: 0; }
+          .job-header { flex-direction: column; align-items: flex-start; }
+          summary { padding: 12px; }
+          .job-content { padding: 0 12px 12px; }
           table, thead, tbody, th, td, tr { display: block; }
           thead { display: none; }
           tr { margin-bottom: 10px; border-bottom: 1px solid #334155; padding-bottom: 8px; }
@@ -187,70 +194,76 @@ def index():
         </div>
         {% if jobs %}
           {% for job in jobs %}
-            <div class="job">
-              <h2>{{ job.name }}</h2>
-              <div class="status {{ 'ok' if job.job_state == 'completed' else 'warn' if job.job_state == 'running' else 'bad' }}">{{ job.job_state }}</div>
-              <p><strong>Program:</strong> {{ job.program }}</p>
-              <p><strong>Type:</strong> {{ job.type }}</p>
-              <p><strong>Pipeline status:</strong> {{ job.status }}</p>
-              <p><strong>Source count:</strong> {{ job.source_count }}</p>
-              <p><strong>Targets:</strong> {{ job.targets|length }}</p>
-              <p><strong>Discovered:</strong> {{ job.discovered|length }}</p>
+            <details class="job">
+              <summary>
+                <div class="job-header">
+                  <h2>{{ job.name }}</h2>
+                  <div class="status {{ 'ok' if job.job_state == 'completed' else 'warn' if job.job_state == 'running' else 'bad' }}">{{ job.job_state }}</div>
+                </div>
+              </summary>
+              <div class="job-content">
+                <p><strong>Program:</strong> {{ job.program }}</p>
+                <p><strong>Type:</strong> {{ job.type }}</p>
+                <p><strong>Pipeline status:</strong> {{ job.status }}</p>
+                <p><strong>Source count:</strong> {{ job.source_count }}</p>
+                <p><strong>Targets:</strong> {{ job.targets|length }}</p>
+                <p><strong>Discovered:</strong> {{ job.discovered|length }}</p>
 
-              <h3>Discovered assets</h3>
-              <table style="width:100%; border-collapse: collapse; margin-top: 10px;">
-                <thead>
-                  <tr>
-                    <th align="left">Domain</th>
-                    <th align="left">Source</th>
-                    <th align="left">Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {% for asset in job.assets %}
+                <h3>Discovered assets</h3>
+                <table style="width:100%; border-collapse: collapse; margin-top: 10px;">
+                  <thead>
                     <tr>
-                      <td><code>{{ asset.domain }}</code></td>
-                      <td>
-                        {% if asset.evidence %}
-                          <div class="evidence-list">
-                            {% for item in asset.evidence %}
-                              <span class="evidence-item"><a href="{{ item.url }}" target="_blank" rel="noopener">{{ item.source }}</a></span>
-                            {% endfor %}
-                          </div>
-                        {% else %}
-                          {{ asset.source or asset.sources|join(', ') }}
-                        {% endif %}
-                      </td>
-                      <td>{{ asset.status }}</td>
+                      <th align="left">Domain</th>
+                      <th align="left">Source</th>
+                      <th align="left">Status</th>
                     </tr>
-                  {% else %}
-                    <tr><td colspan="3">No newly discovered assets.</td></tr>
-                  {% endfor %}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {% for asset in job.assets %}
+                      <tr>
+                        <td><code>{{ asset.domain }}</code></td>
+                        <td>
+                          {% if asset.evidence %}
+                            <div class="evidence-list">
+                              {% for item in asset.evidence %}
+                                <span class="evidence-item"><a href="{{ item.url }}" target="_blank" rel="noopener">{{ item.source }}</a></span>
+                              {% endfor %}
+                            </div>
+                          {% else %}
+                            {{ asset.source or asset.sources|join(', ') }}
+                          {% endif %}
+                        </td>
+                        <td>{{ asset.status }}</td>
+                      </tr>
+                    {% else %}
+                      <tr><td colspan="3">No newly discovered assets.</td></tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
 
-              <h3>In-scope targets</h3>
-              <ul>
-                {% for item in job.targets %}
-                  <li><code>{{ item }}</code></li>
-                {% endfor %}
-              </ul>
-
-              <h3>Queued</h3>
-              <ul>
-                {% for item in job.queued %}
-                  <li><code>{{ item }}</code></li>
-                {% endfor %}
-              </ul>
-              {% if job.skipped %}
-                <h3>Skipped</h3>
+                <h3>In-scope targets</h3>
                 <ul>
-                  {% for item in job.skipped %}
+                  {% for item in job.targets %}
                     <li><code>{{ item }}</code></li>
                   {% endfor %}
                 </ul>
-              {% endif %}
-            </div>
+
+                <h3>Queued</h3>
+                <ul>
+                  {% for item in job.queued %}
+                    <li><code>{{ item }}</code></li>
+                  {% endfor %}
+                </ul>
+                {% if job.skipped %}
+                  <h3>Skipped</h3>
+                  <ul>
+                    {% for item in job.skipped %}
+                      <li><code>{{ item }}</code></li>
+                    {% endfor %}
+                  </ul>
+                {% endif %}
+              </div>
+            </details>
           {% endfor %}
         {% else %}
           <div class="card">
