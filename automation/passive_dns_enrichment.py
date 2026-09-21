@@ -151,6 +151,35 @@ def candidate_sources(domain: str) -> Dict[str, Set[str]]:
     return sources
 
 
+def provider_status(domain: str) -> List[Dict[str, object]]:
+    source_factories = [
+        ('certspotter', certspotter_candidates),
+        ('hackertarget', hackertarget_candidates),
+        ('crt.sh', crt_sh_candidates),
+        ('dns.google', dns_google_candidates),
+    ]
+    statuses: List[Dict[str, object]] = []
+    for name, builder in source_factories:
+        error_name = None
+        try:
+            candidates = builder(domain)
+            status = 'ok' if candidates else 'empty'
+            count = len(candidates)
+        except Exception as exc:
+            status = 'error'
+            count = 0
+            candidates = set()
+            error_name = type(exc).__name__
+        statuses.append({
+            'source': name,
+            'status': status,
+            'count': count,
+            'url': source_urls(domain).get(name, ''),
+            'error': error_name,
+        })
+    return statuses
+
+
 def passive_dns_enrichment(program_name: str) -> Dict[str, object]:
     patterns = load_allowed_patterns(program_name)
     if not patterns:
@@ -166,10 +195,12 @@ def passive_dns_enrichment(program_name: str) -> Dict[str, object]:
         }
 
     seen: Dict[str, set[str]] = {}
+    provider_statuses: List[Dict[str, object]] = []
     for pattern in patterns:
         domain = pattern[2:] if pattern.startswith('*.') else pattern
         if not domain:
             continue
+        provider_statuses.extend(provider_status(domain))
         for source_name, candidates in candidate_sources(domain).items():
             for candidate in candidates:
                 if not candidate or not is_in_scope(candidate, patterns):
@@ -202,6 +233,7 @@ def passive_dns_enrichment(program_name: str) -> Dict[str, object]:
         'targets': patterns,
         'discovered': discovered,
         'assets': assets,
+        'provider_status': provider_statuses,
         'status': 'ok' if discovered else 'no_new_assets',
         'source_count': len({s for row in assets for s in row['sources']}),
     }
