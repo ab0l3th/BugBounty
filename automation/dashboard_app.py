@@ -102,6 +102,23 @@ def job_title_label(value: str) -> str:
     return value.replace('_', ' ').replace('-', ' ').title()
 
 
+def merged_live_asset_targets() -> List[str]:
+    merged: List[str] = []
+    seen: set[str] = set()
+    for result_name in ('aa-passive-discovery', 'american-airlines-passive-dns'):
+        path = RESULTS_DIR / f'{result_name}.json'
+        if not path.exists():
+            continue
+        payload = read_result_file(path)
+        if not payload:
+            continue
+        for item in (payload.get('discovered', []) or []) + (payload.get('targets', []) or []):
+            if item and item not in seen:
+                seen.add(item)
+                merged.append(item)
+    return merged
+
+
 def group_jobs_by_program(jobs: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for job in jobs:
@@ -185,6 +202,7 @@ def list_jobs() -> List[Dict[str, Any]]:
             payload = read_result_file(RESULTS_DIR / f'{job_name}.json')
             job_state = _job_state_for(job_name, payload if payload else None)
             metadata = job_workflow_metadata(definition.get('name', job_name))
+            queued_targets = merged_live_asset_targets() if job_name == 'confirm-live-web-assets' else definition.get('targets', [])
             if payload:
                 assets = payload.get('assets') or [
                     {'domain': host, 'status': 'in_scope', 'sources': [], 'source': ''}
@@ -199,8 +217,8 @@ def list_jobs() -> List[Dict[str, Any]]:
                     'program': payload.get('program', definition.get('program', 'unknown')),
                     'discovered': payload.get('discovered', []),
                     'assets': assets,
-                    'targets': payload.get('targets', definition.get('targets', [])),
-                    'queued': payload.get('queued', []),
+                    'targets': payload.get('targets', queued_targets),
+                    'queued': payload.get('queued', queued_targets),
                     'skipped': payload.get('skipped', []),
                     'source_count': payload.get('source_count', 0),
                     'workflow_step': metadata.get('step', definition.get('order', 99)),
@@ -217,8 +235,8 @@ def list_jobs() -> List[Dict[str, Any]]:
                     'program': definition.get('program', 'unknown'),
                     'discovered': [],
                     'assets': [],
-                    'targets': definition.get('targets', []),
-                    'queued': definition.get('targets', []),
+                    'targets': queued_targets,
+                    'queued': queued_targets,
                     'skipped': [],
                     'source_count': 0,
                     'workflow_step': metadata.get('step', definition.get('order', 99)),
@@ -287,12 +305,13 @@ def rerun_job(job_name: str) -> Dict[str, Any]:
     program = match.get('program', 'unknown')
     result_path = RESULTS_DIR / f'{job_name}.json'
     result_path.parent.mkdir(parents=True, exist_ok=True)
+    queued_targets = merged_live_asset_targets() if job_name == 'confirm-live-web-assets' else []
     result_path.write_text(json.dumps({
         'job': job_name,
         'program': program,
         'type': 'passive',
-        'targets': [],
-        'queued': [],
+        'targets': queued_targets,
+        'queued': queued_targets,
         'skipped': [],
         'discovered': [],
         'assets': [],
