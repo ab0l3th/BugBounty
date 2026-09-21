@@ -52,6 +52,12 @@ def load_job(path: Path) -> dict:
 
 
 def run_passive_job(job: dict, allowed_scope: list[str]) -> dict:
+    job_type = (job.get('type', 'passive') or 'passive').lower()
+    if job_type in {'github', 'repo', 'monitor'}:
+        from github_monitor import github_activity
+        repo = (job.get('targets') or [job.get('name', 'ab0l3th/BugBounty')])[0]
+        return github_activity(repo)
+
     result = {
         'job': job.get('name'),
         'program': job.get('program', DEFAULT_PROGRAM),

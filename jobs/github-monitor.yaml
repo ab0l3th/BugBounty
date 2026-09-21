@@ -1,0 +1,5 @@
+name: github-monitor
+program: github
+type: github
+targets:
+  - "ab0l3th/BugBounty"

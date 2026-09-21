@@ -39,18 +39,25 @@ def program_label(value: str) -> str:
     text = (value or 'unknown').replace('_', '-').strip()
     if not text:
         return 'Unknown Program'
-    if text.lower() in {'aa', 'american-airlines'}:
+    lowered = text.lower()
+    if lowered in {'aa', 'american-airlines'}:
         return 'American Airlines'
+    if lowered in {'github', 'git-hub'}:
+        return 'GitHub'
     parts = [part for part in text.split('-') if part]
     return ' '.join(part.capitalize() for part in parts) if parts else 'Unknown Program'
 
 
 def job_title_label(value: str) -> str:
     text = (value or '').lower().replace('_', '-')
+    if 'github' in text and 'monitor' in text:
+        return 'GitHub Monitor'
     if 'passive-dns' in text or ('dns' in text and 'passive' in text):
         return 'Passive DNS Discovery'
     if 'passive-discovery' in text or ('passive' in text and 'discovery' in text):
         return 'Passive Discovery'
+    if 'github' in text:
+        return 'GitHub Monitor'
     if 'dns' in text:
         return 'Passive DNS Discovery'
     return value.replace('_', ' ').replace('-', ' ').title()
