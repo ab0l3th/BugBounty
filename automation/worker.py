@@ -1224,10 +1224,10 @@ def _port_scan_tests(hosts: list[str], *, use_external_tools: bool = False) -> d
             'kind': 'port-scan',
             'ports': sorted(set(open_ports)),
             'findings': findings,
-            'source': 'port-scan',
-            'sources': ['port-scan'],
+            'source': ', '.join(f"{f['ip']}:{f['port']} {f['service']}" for f in findings) if findings else 'port-scan',
+            'sources': [f"{f['ip']}:{f['port']} {f['service']}" for f in findings] or ['port-scan'],
             'source_count': len(findings),
-            'evidence': [{'source': 'port-scan', 'url': f"{f['ip']}:{f['port']}", 'detail': f"{f['service']} ({f['severity']})"} for f in findings],
+            'evidence': [],
         }
         assets.append(record)
         thread_status.append({'thread_id': thread_name, 'host': host, 'status': record['status'], 'open_ports': record['ports'], 'timestamp': time.time()})
@@ -1243,7 +1243,7 @@ def _port_scan_tests(hosts: list[str], *, use_external_tools: bool = False) -> d
     hits = [a for a in assets if a.get('findings')]
     return {
         'discovered': sorted(a['domain'] for a in hits),
-        'assets': sorted(assets, key=lambda r: r['domain']),
+        'assets': sorted(hits, key=lambda r: r['domain']),
         'probe_log': _cap_log(probe_log),
         'thread_status': _cap_log(thread_status),
         'threads': max_workers,

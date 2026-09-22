@@ -568,9 +568,8 @@ class DashboardJobMetadataTest(unittest.TestCase):
              patch('worker._tcp_port_open', side_effect=lambda ip, port, timeout=1.5: False):
             result = _port_scan_tests(['host.example.com'])
 
-        asset = next(a for a in result['assets'] if a['domain'] == 'host.example.com')
-        self.assertEqual(asset['findings'], [])
-        self.assertEqual(asset['status'], 'no_findings')
+        # Hosts with no open ports are not reported at all.
+        self.assertEqual(result['assets'], [])
         self.assertEqual(result['discovered'], [])
 
     def test_service_enumeration_uses_step3_live_asset_output(self):
