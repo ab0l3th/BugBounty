@@ -74,6 +74,14 @@ WORKFLOW_SEQUENCE = {
 }
 
 
+# Caps on how many rows are rendered per job on the dashboard home page. The full
+# data stays in the result JSON; these only bound the HTML payload so the page
+# stays small enough to auto-refresh without timing out.
+ASSET_RENDER_CAP = 150
+EVIDENCE_RENDER_CAP = 15
+THREAD_RENDER_CAP = 100
+
+
 def job_workflow_metadata(name: str) -> Dict[str, Any]:
     clean_name = (name or '').strip()
     if clean_name in WORKFLOW_SEQUENCE:
@@ -914,9 +922,12 @@ def index():
                       <details class="collapsible-list">
                         <summary>Thread progress ({{ thread_status|length }})</summary>
                         <ul>
-                          {% for item in thread_status %}
+                          {% for item in thread_status[:thread_render_cap] %}
                             <li><code>{{ item.host }}</code> — {{ item.status }}{% if item.url %} / {{ item.url }}{% endif %}{% if item.thread_id %} [{{ item.thread_id }}]{% endif %}</li>
                           {% endfor %}
+                          {% if thread_status|length > thread_render_cap %}
+                            <li>… {{ thread_status|length - thread_render_cap }} more not shown</li>
+                          {% endif %}
                         </ul>
                       </details>
                     {% endif %}
@@ -934,15 +945,18 @@ def index():
                         </tr>
                       </thead>
                       <tbody>
-                        {% for asset in job.assets %}
+                        {% for asset in job.assets[:asset_render_cap] %}
                           <tr>
                             <td><code>{{ asset.domain }}</code></td>
                             <td>
                               {% if asset.evidence %}
                                 <div class="evidence-list">
-                                  {% for item in asset.evidence %}
+                                  {% for item in asset.evidence[:evidence_render_cap] %}
                                     <span class="evidence-item"><a href="{{ item.url }}" target="_blank" rel="noopener">{{ item.source }}</a></span>
                                   {% endfor %}
+                                  {% if asset.evidence|length > evidence_render_cap %}
+                                    <span class="evidence-item">+{{ asset.evidence|length - evidence_render_cap }} more</span>
+                                  {% endif %}
                                 </div>
                               {% else %}
                                 {{ asset.source or asset.sources|join(', ') }}
@@ -966,6 +980,9 @@ def index():
                         {% endfor %}
                       </tbody>
                     </table>
+                    {% if job.assets|length > asset_render_cap %}
+                      <p style="margin-top:8px; color:#9ca3af;">Showing first {{ asset_render_cap }} of {{ job.assets|length }} assets. Full data in the result file.</p>
+                    {% endif %}
 
                     <details class="collapsible-list">
                       <summary>In-scope targets ({{ job.targets|length }})</summary>
@@ -1112,7 +1129,7 @@ def index():
       </script>
     </body>
     </html>
-    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs, workflow_order=workflow_order, highest_severity=highest_severity)
+    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs, workflow_order=workflow_order, highest_severity=highest_severity, asset_render_cap=ASSET_RENDER_CAP, evidence_render_cap=EVIDENCE_RENDER_CAP, thread_render_cap=THREAD_RENDER_CAP)
 
 
 @app.route('/jobs/<job_name>/rerun', methods=['POST'])
