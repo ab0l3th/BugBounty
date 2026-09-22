@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import hmac
 import json
@@ -355,11 +356,22 @@ def summarize_program_jobs(jobs: List[Dict[str, Any]]) -> Dict[str, int]:
     return summary
 
 
-def read_result_file(path: Path) -> Dict[str, Any]:
+@functools.lru_cache(maxsize=64)
+def _read_result_cached(path_str: str, mtime: float, size: int) -> Dict[str, Any]:
     try:
-        return json.loads(path.read_text(encoding='utf-8'))
+        return json.loads(Path(path_str).read_text(encoding='utf-8'))
     except Exception:
         return {}
+
+
+def read_result_file(path: Path) -> Dict[str, Any]:
+    # Cache by path+mtime+size so large result files are parsed once per page load,
+    # not once per helper that inspects them (was O(jobs) reparses of multi-MB files).
+    try:
+        stat = path.stat()
+    except OSError:
+        return {}
+    return _read_result_cached(str(path), stat.st_mtime, stat.st_size)
 
 
 def read_job_definition(path: Path) -> Dict[str, Any]:
