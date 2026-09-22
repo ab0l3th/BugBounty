@@ -33,10 +33,11 @@ WORKFLOW_SEQUENCE = {
     'directory-enumeration-live-hosts': {'step': 6, 'depends_on': ['service-enumeration-live-hosts', 'vhost-discovery-shared-infra']},
     'application-security-testing': {'step': 7, 'depends_on': ['directory-enumeration-live-hosts']},
     'api-endpoint-testing': {'step': 8, 'depends_on': ['directory-enumeration-live-hosts']},
+    'port-scan-live-hosts': {'step': 9, 'depends_on': ['service-enumeration-live-hosts']},
 }
 
 # Jobs that make live connections to targets and must not run in the default passive-only mode.
-ACTIVE_JOBS = {'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra', 'directory-enumeration-live-hosts', 'application-security-testing', 'api-endpoint-testing'}
+ACTIVE_JOBS = {'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra', 'directory-enumeration-live-hosts', 'application-security-testing', 'api-endpoint-testing', 'port-scan-live-hosts'}
 
 # Statuses that count as a completed job for dependency gating and re-run skipping.
 COMPLETED_STATUSES = {'completed', 'ok', 'no_new_assets', 'no_in_scope_targets', 'no_shared_infra', 'no_paths', 'no_findings', 'no_activity'}
@@ -1153,6 +1154,102 @@ def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False) -
     }
 
 
+# Ports that should not be exposed on a public web endpoint. Web ports 80/443 are
+# expected and never flagged. Value is (service, severity).
+_UNEXPECTED_PORTS: dict[int, tuple[str, str]] = {
+    21: ('ftp', 'high'),
+    22: ('ssh', 'medium'),
+    23: ('telnet', 'high'),
+    25: ('smtp', 'low'),
+    1433: ('mssql', 'critical'),
+    2375: ('docker-api', 'critical'),
+    2376: ('docker-tls', 'high'),
+    3306: ('mysql', 'critical'),
+    3389: ('rdp', 'high'),
+    5432: ('postgresql', 'critical'),
+    5601: ('kibana', 'high'),
+    5900: ('vnc', 'high'),
+    5984: ('couchdb', 'high'),
+    6379: ('redis', 'critical'),
+    8000: ('http-dev', 'low'),
+    8080: ('http-alt', 'low'),
+    8443: ('https-alt', 'low'),
+    8888: ('http-alt', 'low'),
+    9000: ('dev-service', 'medium'),
+    9200: ('elasticsearch', 'critical'),
+    11211: ('memcached', 'high'),
+    15672: ('rabbitmq-mgmt', 'medium'),
+    27017: ('mongodb', 'critical'),
+}
+
+
+def _tcp_port_open(ip: str, port: int, timeout: float = 1.5) -> bool:
+    family = socket.AF_INET6 if ':' in ip else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        return sock.connect_ex((ip, port)) == 0
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def _port_scan_tests(hosts: list[str], *, use_external_tools: bool = False) -> dict:
+    """Resolve the IP(s) behind each live host and flag unexpected open ports."""
+    deduped_hosts = sorted(set(hosts))
+    assets: list[dict] = []
+    probe_log: list[dict] = []
+    thread_status: list[dict] = []
+    max_workers = _bounded_workers(len(deduped_hosts))
+
+    def scan_host(host: str) -> dict:
+        thread_name = threading.current_thread().name
+        findings: list[dict] = []
+        open_ports: list[int] = []
+        for ip in sorted(_resolve_host_ips(host)):
+            for port, (service, severity) in sorted(_UNEXPECTED_PORTS.items()):
+                attempt = {'thread_id': thread_name, 'host': host, 'ip': ip, 'port': port, 'status': 'checking', 'timestamp': time.time()}
+                probe_log.append(attempt)
+                if _tcp_port_open(ip, port):
+                    attempt['status'] = 'open'
+                    open_ports.append(port)
+                    findings.append({'type': 'open_port', 'ip': ip, 'port': port, 'service': service, 'severity': severity})
+                else:
+                    attempt['status'] = 'closed'
+
+        record = {
+            'domain': host,
+            'status': 'findings' if findings else 'no_findings',
+            'kind': 'port-scan',
+            'ports': sorted(set(open_ports)),
+            'findings': findings,
+            'source': 'port-scan',
+            'sources': ['port-scan'],
+            'source_count': len(findings),
+            'evidence': [{'source': 'port-scan', 'url': f"{f['ip']}:{f['port']}", 'detail': f"{f['service']} ({f['severity']})"} for f in findings],
+        }
+        assets.append(record)
+        thread_status.append({'thread_id': thread_name, 'host': host, 'status': record['status'], 'open_ports': record['ports'], 'timestamp': time.time()})
+        return record
+
+    if not deduped_hosts:
+        return {'discovered': [], 'assets': [], 'probe_log': [], 'thread_status': [], 'threads': 0}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(scan_host, host) for host in deduped_hosts]
+        _drain_futures(futures, probe_log)
+
+    hits = [a for a in assets if a.get('findings')]
+    return {
+        'discovered': sorted(a['domain'] for a in hits),
+        'assets': sorted(assets, key=lambda r: r['domain']),
+        'probe_log': _cap_log(probe_log),
+        'thread_status': _cap_log(thread_status),
+        'threads': max_workers,
+    }
+
+
 def _load_result(name: str) -> dict:
     path = RESULTS_DIR / f'{name}.json'
     try:
@@ -1494,6 +1591,33 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             'discovered': test_result.get('discovered', []), 'assets': assets,
             'source_count': sum(len(a.get('findings', [])) for a in assets),
             'depends_on': ['directory-enumeration-live-hosts'],
+        }
+        response['probe_log'] = test_result.get('probe_log', [])
+        response['thread_status'] = test_result.get('thread_status', [])
+        response['probe_threads'] = test_result.get('threads', 0)
+        return response
+
+    if job_name == 'port-scan-live-hosts':
+        dep_path = RESULTS_DIR / 'service-enumeration-live-hosts.json'
+        if not dep_path.exists():
+            return {
+                'job': job_name, 'program': job.get('program', DEFAULT_PROGRAM), 'type': 'active',
+                'targets': [], 'queued': [], 'skipped': [], 'status': 'waiting_on_dependencies',
+                'job_state': 'waiting_on_dependencies', 'discovered': [], 'assets': [], 'source_count': 0,
+                'dependencies': ['service-enumeration-live-hosts'],
+            }
+        hosts = _combined_live_hosts()
+        deduped_hosts = [h for h in hosts if is_in_scope(h, allowed_scope)]
+        deduped_hosts, _truncated = _cap_hosts(deduped_hosts)
+        test_result = _port_scan_tests(deduped_hosts, use_external_tools=use_external_tools)
+        assets = test_result.get('assets', [])
+        response = {
+            'job': job_name, 'program': job.get('program', DEFAULT_PROGRAM), 'type': 'active',
+            'targets': deduped_hosts, 'queued': deduped_hosts, 'skipped': [],
+            'status': 'ok' if test_result.get('discovered') else 'no_findings',
+            'discovered': test_result.get('discovered', []), 'assets': assets,
+            'source_count': sum(len(a.get('findings', [])) for a in assets),
+            'depends_on': ['service-enumeration-live-hosts'],
         }
         response['probe_log'] = test_result.get('probe_log', [])
         response['thread_status'] = test_result.get('thread_status', [])

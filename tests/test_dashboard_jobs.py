@@ -543,6 +543,36 @@ class DashboardJobMetadataTest(unittest.TestCase):
         self.assertIsNone(highest_severity([]))
         self.assertIsNone(highest_severity(None))
 
+    def test_port_scan_flags_unexpected_open_port(self):
+        from worker import _port_scan_tests
+
+        # host resolves to one IP; only the Redis port (6379) is open.
+        def fake_open(ip, port, timeout=1.5):
+            return ip == '203.0.113.5' and port == 6379
+
+        with patch('worker._resolve_host_ips', side_effect=lambda h: {'203.0.113.5'}), \
+             patch('worker._tcp_port_open', side_effect=fake_open):
+            result = _port_scan_tests(['host.example.com'])
+
+        asset = next(a for a in result['assets'] if a['domain'] == 'host.example.com')
+        open_ports = [f for f in asset['findings'] if f['type'] == 'open_port']
+        self.assertTrue(any(f['port'] == 6379 and f['service'] == 'redis' and f['severity'] == 'critical' for f in open_ports))
+        self.assertIn(6379, asset['ports'])
+        self.assertEqual(asset['status'], 'findings')
+        self.assertIn('host.example.com', result['discovered'])
+
+    def test_port_scan_no_findings_when_all_closed(self):
+        from worker import _port_scan_tests
+
+        with patch('worker._resolve_host_ips', side_effect=lambda h: {'203.0.113.9'}), \
+             patch('worker._tcp_port_open', side_effect=lambda ip, port, timeout=1.5: False):
+            result = _port_scan_tests(['host.example.com'])
+
+        asset = next(a for a in result['assets'] if a['domain'] == 'host.example.com')
+        self.assertEqual(asset['findings'], [])
+        self.assertEqual(asset['status'], 'no_findings')
+        self.assertEqual(result['discovered'], [])
+
     def test_service_enumeration_uses_step3_live_asset_output(self):
         result_path = ROOT / 'results' / 'confirm-live-web-assets.json'
         result_path.parent.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,13 @@
+name: port-scan-live-hosts
+program: american-airlines
+type: active
+order: 9
+depends_on: [service-enumeration-live-hosts]
+targets:
+  - "*.aa.com"
+  - "*.psaairlines.com"
+  - "*.envoyair.com"
+  - "*.piedmont-airlines.com"
+  - "*.cloud.aa.com"
+  - "*.maverick.aa.com"
+  - "aavacations.com"

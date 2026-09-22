@@ -23,7 +23,7 @@ JOBS_DIR = ROOT / 'jobs'
 app = Flask(__name__)
 
 # Jobs that make live connections to targets and must be launched in active mode.
-ACTIVE_JOBS = {'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra', 'directory-enumeration-live-hosts', 'application-security-testing', 'api-endpoint-testing'}
+ACTIVE_JOBS = {'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra', 'directory-enumeration-live-hosts', 'application-security-testing', 'api-endpoint-testing', 'port-scan-live-hosts'}
 
 WORKFLOW_SEQUENCE = {
     'aa-passive-discovery': {
@@ -65,6 +65,11 @@ WORKFLOW_SEQUENCE = {
         'step': 8,
         'label': 'API Testing',
         'depends_on': ['directory-enumeration-live-hosts'],
+    },
+    'port-scan-live-hosts': {
+        'step': 9,
+        'label': 'Port Scan',
+        'depends_on': ['service-enumeration-live-hosts'],
     },
 }
 
@@ -413,6 +418,8 @@ def list_jobs() -> List[Dict[str, Any]]:
                 queued_targets = combined_live_roots_from_step4_and_step5()
             elif job_name == 'api-endpoint-testing':
                 queued_targets = api_candidate_hosts_from_step4_and_step6()
+            elif job_name == 'port-scan-live-hosts':
+                queued_targets = combined_live_roots_from_step4_and_step5()
             else:
                 queued_targets = definition.get('targets', [])
             if payload:
@@ -538,6 +545,8 @@ def rerun_job(job_name: str) -> Dict[str, Any]:
         queued_targets = combined_live_roots_from_step4_and_step5()
     elif job_name == 'api-endpoint-testing':
         queued_targets = api_candidate_hosts_from_step4_and_step6()
+    elif job_name == 'port-scan-live-hosts':
+        queued_targets = combined_live_roots_from_step4_and_step5()
     else:
         queued_targets = []
     result_path.write_text(json.dumps({
@@ -749,7 +758,7 @@ def index():
     jobs = list_jobs()
     summary = summarize_jobs(jobs)
     grouped_jobs = group_jobs_by_program(jobs)
-    workflow_order = [job_workflow_metadata(job_name) for job_name in ['aa-passive-discovery', 'american-airlines-passive-dns', 'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra', 'directory-enumeration-live-hosts', 'application-security-testing', 'api-endpoint-testing']]
+    workflow_order = [job_workflow_metadata(job_name) for job_name in ['aa-passive-discovery', 'american-airlines-passive-dns', 'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra', 'directory-enumeration-live-hosts', 'application-security-testing', 'api-endpoint-testing', 'port-scan-live-hosts']]
     return render_template_string('''
     <!doctype html>
     <html lang="en">
