@@ -70,7 +70,7 @@ WORKFLOW_SEQUENCE = {
     'port-scan-live-hosts': {
         'step': 9,
         'label': 'Port Scan',
-        'depends_on': ['service-enumeration-live-hosts'],
+      'depends_on': ['vhost-discovery-shared-infra', 'directory-enumeration-live-hosts', 'application-security-testing'],
     },
 }
 

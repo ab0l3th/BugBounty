@@ -123,6 +123,18 @@ class DashboardJobMetadataTest(unittest.TestCase):
         finally:
             result_path.unlink(missing_ok=True)
 
+    def test_port_scan_waits_for_later_application_stages_but_api_does_not(self):
+        from worker import job_workflow_dependencies
+
+        self.assertEqual(
+            job_workflow_dependencies('port-scan-live-hosts'),
+            ['vhost-discovery-shared-infra', 'directory-enumeration-live-hosts', 'application-security-testing'],
+        )
+        self.assertEqual(
+            job_workflow_dependencies('api-endpoint-testing'),
+            ['directory-enumeration-live-hosts'],
+        )
+
     def test_resource_caps_bound_hosts_and_workers(self):
         import worker as w
         with patch.object(w, 'MAX_HOSTS_PER_RUN', 3), patch.object(w, 'MAX_WORKERS', 2):

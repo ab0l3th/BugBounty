@@ -33,7 +33,7 @@ WORKFLOW_SEQUENCE = {
     'directory-enumeration-live-hosts': {'step': 6, 'depends_on': ['service-enumeration-live-hosts', 'vhost-discovery-shared-infra']},
     'application-security-testing': {'step': 7, 'depends_on': ['directory-enumeration-live-hosts']},
     'api-endpoint-testing': {'step': 8, 'depends_on': ['directory-enumeration-live-hosts']},
-    'port-scan-live-hosts': {'step': 9, 'depends_on': ['service-enumeration-live-hosts']},
+    'port-scan-live-hosts': {'step': 9, 'depends_on': ['vhost-discovery-shared-infra', 'directory-enumeration-live-hosts', 'application-security-testing']},
 }
 
 # Jobs that make live connections to targets and must not run in the default passive-only mode.
