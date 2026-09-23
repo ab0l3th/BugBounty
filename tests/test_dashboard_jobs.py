@@ -548,6 +548,30 @@ class DashboardJobMetadataTest(unittest.TestCase):
             self.assertEqual(debug, [])
             self.assertEqual(asset['status'], 'no_findings')
 
+    def test_login_page_classifier_distinguishes_sso_and_application_login(self):
+        from worker import _login_page_fingerprint, _record_login_redirect
+
+        sso = _login_page_fingerprint(
+            'https://app.example.com/actuator/health',
+            'https://login.aa.com/sso/signin',
+            '<title>American Airlines Sign In</title><form action="/sso"><input type="password">',
+        )
+        app = _login_page_fingerprint(
+            'https://app.example.com/admin',
+            'https://app.example.com/login',
+            '<title>Customer Portal Login</title><form action="/login"><input type="password">',
+        )
+        self.assertEqual(sso['classification'], 'corporate_sso')
+        self.assertEqual(app['classification'], 'application_login')
+        self.assertEqual(sso['final_host'], 'login.aa.com')
+        self.assertTrue(app['password_form'])
+
+        probe_log = []
+        seen = set()
+        _record_login_redirect(probe_log, seen, thread_name='test', host='app.example.com', requested_url='https://app.example.com/a', final_url='https://login.aa.com/sso/signin', body='<title>American Airlines Sign In</title>')
+        _record_login_redirect(probe_log, seen, thread_name='test', host='app.example.com', requested_url='https://app.example.com/b', final_url='https://login.aa.com/sso/signin', body='<title>American Airlines Sign In</title>')
+        self.assertEqual(len(probe_log), 1)
+
     def test_directory_enumeration_ignores_login_redirect(self):
         from worker import _directory_enumeration
 

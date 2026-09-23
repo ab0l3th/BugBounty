@@ -5,6 +5,7 @@ import argparse
 import http.client
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -345,6 +346,7 @@ def _probe_live_web_assets(hosts: list[str], *, use_external_tools: bool = False
     deduped_hosts = sorted(set(hosts))
     discovered: list[dict] = []
     probe_log: list[dict] = []
+    login_seen: set[str] = set()
     thread_status: list[dict] = []
     headers = {'User-Agent': 'BugBountyPassiveRecon/1.0'}
     max_workers = _bounded_workers(len(deduped_hosts))
@@ -419,6 +421,8 @@ def _probe_live_web_assets(hosts: list[str], *, use_external_tools: bool = False
                                     })
                                     break
                         return {'host': host, 'status': 'live'}
+                    if code and code < 400:
+                        _record_login_redirect(probe_log, login_seen, thread_name=thread_name, host=host, requested_url=url, final_url=final_url, body=body_text)
                     info['status'] = 'http_error'
                     info['status_code'] = code
             except (urllib_error.HTTPError, urllib_error.URLError, ValueError, OSError) as exc:
@@ -505,6 +509,7 @@ def _enumerate_live_services(hosts: list[str], *, use_external_tools: bool = Fal
     deduped_hosts = sorted(set(hosts))
     results: list[dict] = []
     probe_log: list[dict] = []
+    login_seen: set[str] = set()
     thread_status: list[dict] = []
     max_workers = _bounded_workers(len(deduped_hosts))
 
@@ -534,6 +539,7 @@ def _enumerate_live_services(hosts: list[str], *, use_external_tools: bool = Fal
                     body_text = _response_text(resp, 2048)
                     final_url = _response_final_url(resp, url)
                     if _is_login_redirect(url, final_url, body_text):
+                        _record_login_redirect(probe_log, login_seen, thread_name=thread_name, host=host, requested_url=url, final_url=final_url, body=body_text)
                         attempt['status'] = 'login_redirect'
                         continue
                     attempt['server'] = str(server)
@@ -694,7 +700,7 @@ def _probe_vhost(ip: str, host_header: str, scheme: str = 'https') -> dict:
             final_url = _response_final_url(resp, url)
             body_text = body.decode('utf-8', 'replace') if isinstance(body, (bytes, bytearray)) else str(body)
             if _is_login_redirect(url, final_url, body_text):
-                return {'host_header': host_header, 'ip': ip, 'source': f'{host_header} (login redirect)', 'url': url, 'ok': False, 'status': 'login_redirect'}
+                return {'host_header': host_header, 'ip': ip, 'source': f'{host_header} (login redirect)', 'url': url, 'ok': False, 'status': 'login_redirect', 'login': _login_page_fingerprint(url, final_url, body_text)}
             return {
                 'host_header': host_header,
                 'ip': ip,
@@ -784,6 +790,7 @@ def _directory_enumeration(hosts: list[str], *, wordlist: list[str] | None = Non
     paths = list(dict.fromkeys(wordlist or DEFAULT_CONTENT_WORDLIST))
     assets: list[dict] = []
     probe_log: list[dict] = []
+    login_seen: set[str] = set()
     thread_status: list[dict] = []
     max_workers = _bounded_workers(len(deduped_hosts))
     headers = {'User-Agent': 'BugBountyPassiveRecon/1.0'}
@@ -813,6 +820,8 @@ def _directory_enumeration(hosts: list[str], *, wordlist: list[str] | None = Non
                 entry = {'path': path, 'status_code': code, 'length': length, 'url': url}
                 found.append(entry)
                 probe_log.append({'thread_id': thread_name, 'host': host, 'path': path, 'status_code': code, 'status': 'found', 'timestamp': time.time()})
+            elif code in _INTERESTING_STATUS:
+                _record_login_redirect(probe_log, login_seen, thread_name=thread_name, host=host, requested_url=url, final_url=final_url, body=body_text, path=path)
         record = {
             'domain': host,
             'status': 'paths_found' if found else 'no_paths',
@@ -1012,6 +1021,7 @@ def _application_security_tests(hosts: list[str], *, use_external_tools: bool = 
     deduped_hosts = sorted(set(hosts))
     assets: list[dict] = []
     probe_log: list[dict] = []
+    login_seen: set[str] = set()
     thread_status: list[dict] = []
     max_workers = _bounded_workers(len(deduped_hosts))
 
@@ -1033,6 +1043,7 @@ def _application_security_tests(hosts: list[str], *, use_external_tools: bool = 
             return record
 
         if _is_login_redirect(url, hdrs.get('x-final-url', url), body):
+            _record_login_redirect(probe_log, login_seen, thread_name=thread_name, host=host, requested_url=url, final_url=hdrs.get('x-final-url', url), body=body)
             record = {'domain': host, 'status': 'no_findings', 'kind': 'app-test', 'ports': [], 'findings': [], 'source': 'app-test', 'sources': ['app-test'], 'source_count': 0, 'evidence': []}
             assets.append(record)
             thread_status.append({'thread_id': thread_name, 'host': host, 'status': 'login_redirect', 'timestamp': time.time()})
@@ -1125,6 +1136,57 @@ _LOGIN_BODY_MARKERS = (
 )
 
 
+def _login_page_fingerprint(requested_url: str, final_url: str, body: str) -> dict | None:
+    if not _is_login_redirect(requested_url, final_url, body):
+        return None
+    requested = urlsplit(requested_url)
+    final = urlsplit(final_url or requested_url)
+    lowered_body = body.lower()
+    title_match = re.search(r'<title[^>]*>\s*([^<]{1,120})', body, re.IGNORECASE)
+    action_match = re.search(r'<form[^>]+action=["\']([^"\']{1,200})', body, re.IGNORECASE)
+    title = ' '.join((title_match.group(1) if title_match else '').split())
+    action = action_match.group(1) if action_match else ''
+    final_host = (final.hostname or '').lower()
+    requested_host = (requested.hostname or '').lower()
+    aa_markers = ('american airlines', 'aa.com', 'aadvantage', 'aadis', 'adfs', 'okta', 'sso')
+    corporate = final_host.endswith('.aa.com') or any(marker in lowered_body for marker in aa_markers)
+    same_host = final_host == requested_host
+    if corporate:
+        classification = 'corporate_sso'
+    elif same_host:
+        classification = 'application_login'
+    else:
+        classification = 'external_sso'
+    key = '|'.join((classification, final_host, final.path.lower(), title.lower(), action.lower()))
+    return {
+        'classification': classification,
+        'final_host': final_host,
+        'final_path': final.path or '/',
+        'title': title[:120],
+        'form_action': action[:200],
+        'password_form': 'type="password"' in lowered_body or "type='password'" in lowered_body,
+        'fingerprint': key,
+    }
+
+
+def _record_login_redirect(probe_log: list[dict], seen: set[str], *, thread_name: str, host: str, requested_url: str, final_url: str, body: str, path: str | None = None) -> dict | None:
+    fingerprint = _login_page_fingerprint(requested_url, final_url, body)
+    if not fingerprint:
+        return None
+    if fingerprint['fingerprint'] not in seen:
+        seen.add(fingerprint['fingerprint'])
+        probe_log.append({
+            'thread_id': thread_name,
+            'host': host,
+            'path': path,
+            'status': 'login_redirect',
+            'requested_url': requested_url,
+            **fingerprint,
+            'timestamp': time.time(),
+        })
+    return fingerprint
+
+
 def _is_login_redirect(requested_url: str, final_url: str, body: str) -> bool:
     """True when a 200 response is really a login/auth page, often reached via redirect."""
     final = (final_url or '').lower()
@@ -1138,6 +1200,7 @@ def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False, p
     deduped_hosts = sorted(set(hosts))
     assets: list[dict] = []
     probe_log: list[dict] = []
+    login_seen: set[str] = set()
     thread_status: list[dict] = []
     max_workers = _bounded_workers(len(deduped_hosts))
 
@@ -1157,7 +1220,7 @@ def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False, p
                 exposes = _looks_like_data(hdrs.get('content-type', ''), body)
                 # A redirect/landing on a login page is not a real debug exposure.
                 if not exposes and _is_login_redirect(url, hdrs.get('x-final-url', url), body):
-                    probe_log.append({'thread_id': thread_name, 'host': host, 'path': path, 'status_code': code, 'status': 'login_redirect', 'timestamp': time.time()})
+                    _record_login_redirect(probe_log, login_seen, thread_name=thread_name, host=host, requested_url=url, final_url=hdrs.get('x-final-url', url), body=body, path=path)
                     continue
                 findings.append({'type': 'debug_endpoint', 'path': path, 'status_code': code, 'exposes_data': bool(exposes), 'severity': 'high' if exposes else 'medium'})
                 probe_log.append({'thread_id': thread_name, 'host': host, 'path': path, 'status_code': code, 'status': 'found', 'timestamp': time.time()})
