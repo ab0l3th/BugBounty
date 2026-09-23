@@ -898,7 +898,7 @@ def index():
         {% if jobs %}
           {% for program_name, program_jobs in grouped_jobs.items() %}
             {% set program_summary = summarize_program_jobs(program_jobs) %}
-            <details class="program-group" open>
+            <details class="program-group" data-state-key="program-{{ program_name }}" open>
               <summary class="program-header">{{ program_label(program_name) }} <span class="program-count">({{ program_summary.jobs }} jobs)</span></summary>
               {% if program_summary.passive_dns_jobs %}
                 <div class="program-summary-card">
@@ -907,7 +907,7 @@ def index():
                 </div>
               {% endif %}
               {% for job in program_jobs %}
-                <details class="job">
+                <details class="job" data-state-key="job-{{ job.name }}">
                   <summary>
                     <div class="job-header">
                       <div class="job-title-wrap">
@@ -931,7 +931,7 @@ def index():
                     {% set probe_log = (job.raw.probe_log if job.raw else []) %}
                     {% set thread_status = (job.raw.thread_status if job.raw else []) %}
                     {% if probe_log or thread_status %}
-                      <details class="collapsible-list">
+                      <details class="collapsible-list" data-state-key="threads-{{ job.name }}">
                         <summary>Thread progress ({{ thread_status|length }})</summary>
                         <ul>
                           {% for item in thread_status[:thread_render_cap] %}
@@ -996,7 +996,7 @@ def index():
                       <p style="margin-top:8px; color:#9ca3af;">Showing first {{ asset_render_cap }} of {{ job.assets|length }} assets. Full data in the result file.</p>
                     {% endif %}
 
-                    <details class="collapsible-list">
+                    <details class="collapsible-list" data-state-key="targets-{{ job.name }}">
                       <summary>In-scope targets ({{ job.targets|length }})</summary>
                       <ul>
                         {% for item in job.targets %}
@@ -1005,7 +1005,7 @@ def index():
                       </ul>
                     </details>
 
-                    <details class="collapsible-list">
+                    <details class="collapsible-list" data-state-key="queued-{{ job.name }}">
                       <summary>Queued ({{ job.queued|length }})</summary>
                       <ul>
                         {% for item in job.queued %}
@@ -1014,7 +1014,7 @@ def index():
                       </ul>
                     </details>
                     {% if job.skipped %}
-                      <details class="collapsible-list">
+                      <details class="collapsible-list" data-state-key="skipped-{{ job.name }}">
                         <summary>Skipped ({{ job.skipped|length }})</summary>
                         <ul>
                           {% for item in job.skipped %}
@@ -1113,6 +1113,35 @@ def index():
           setLastRefreshed();
         }
 
+        const viewStateKey = 'bugbounty-dashboard-view-state';
+        function saveViewState() {
+          const open = {};
+          document.querySelectorAll('details[data-state-key]').forEach((element) => {
+            open[element.dataset.stateKey] = element.open;
+          });
+          sessionStorage.setItem(viewStateKey, JSON.stringify({ open, scrollY: window.scrollY }));
+        }
+
+        function restoreViewState() {
+          try {
+            const state = JSON.parse(sessionStorage.getItem(viewStateKey) || '{}');
+            const open = state.open || {};
+            document.querySelectorAll('details[data-state-key]').forEach((element) => {
+              if (Object.prototype.hasOwnProperty.call(open, element.dataset.stateKey)) {
+                element.open = Boolean(open[element.dataset.stateKey]);
+              }
+            });
+            if (Number.isFinite(state.scrollY)) {
+              requestAnimationFrame(() => window.scrollTo(0, state.scrollY));
+            }
+          } catch (err) {
+            sessionStorage.removeItem(viewStateKey);
+          }
+        }
+
+        restoreViewState();
+        window.addEventListener('beforeunload', saveViewState);
+
         let refreshTimer = null;
         function applyRefreshInterval() {
           const value = Number(refreshSelect ? refreshSelect.value : 60);
@@ -1123,6 +1152,7 @@ def index():
           }
           if (value > 0) {
             refreshTimer = setInterval(() => {
+              saveViewState();
               window.location.reload();
             }, value * 1000);
           }
@@ -1133,6 +1163,7 @@ def index():
         }
         if (refreshButton) {
           refreshButton.addEventListener('click', () => {
+            saveViewState();
             setLastRefreshed();
             window.location.reload();
           });
