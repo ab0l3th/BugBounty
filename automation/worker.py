@@ -72,6 +72,22 @@ def _cap_log(entries: list) -> list:
     return entries[:MAX_LOG_ENTRIES] if MAX_LOG_ENTRIES and len(entries) > MAX_LOG_ENTRIES else entries
 
 
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f'.{path.name}.tmp')
+    temporary.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+    temporary.replace(path)
+
+
+def _emit_progress(progress, snapshot: dict) -> None:
+    if progress is None:
+        return
+    try:
+        progress(snapshot)
+    except Exception:
+        pass
+
+
 def _drain_futures(futures, log: list | None = None) -> None:
     """Consume thread futures, swallowing per-task exceptions so one failure isn't fatal."""
     for future in as_completed(futures):
@@ -325,7 +341,7 @@ def _response_text(resp, limit: int) -> str:
     return body.decode('utf-8', 'replace') if isinstance(body, (bytes, bytearray)) else str(body)
 
 
-def _probe_live_web_assets(hosts: list[str], *, use_external_tools: bool = False) -> dict:
+def _probe_live_web_assets(hosts: list[str], *, use_external_tools: bool = False, progress=None) -> dict:
     deduped_hosts = sorted(set(hosts))
     discovered: list[dict] = []
     probe_log: list[dict] = []
@@ -377,6 +393,7 @@ def _probe_live_web_assets(hosts: list[str], *, use_external_tools: bool = False
                             'url': url,
                             'timestamp': time.time(),
                         })
+                        _emit_progress(progress, {'assets': list(discovered), 'discovered': [row['domain'] for row in discovered], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
                         if use_external_tools:
                             for tool_name in ('curl', 'nmap', 'whatweb'):
                                 if _command_exists(tool_name):
@@ -484,7 +501,7 @@ def _classify_service(host: str, probe_rows: list[dict]) -> str:
     return 'static-site'
 
 
-def _enumerate_live_services(hosts: list[str], *, use_external_tools: bool = False) -> dict:
+def _enumerate_live_services(hosts: list[str], *, use_external_tools: bool = False, progress=None) -> dict:
     deduped_hosts = sorted(set(hosts))
     results: list[dict] = []
     probe_log: list[dict] = []
@@ -574,6 +591,7 @@ def _enumerate_live_services(hosts: list[str], *, use_external_tools: bool = Fal
             'ports': open_ports,
             'timestamp': time.time(),
         })
+        _emit_progress(progress, {'assets': list(results), 'discovered': [row['domain'] for row in results], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
         return service_record
 
     if not deduped_hosts:
@@ -691,7 +709,7 @@ def _probe_vhost(ip: str, host_header: str, scheme: str = 'https') -> dict:
         return {'host_header': host_header, 'ip': ip, 'source': f'{host_header} (no response)', 'url': url, 'ok': False, 'error': str(exc)}
 
 
-def _run_vhost_discovery(service_assets: list[dict]) -> dict:
+def _run_vhost_discovery(service_assets: list[dict], *, progress=None) -> dict:
     candidates = _select_vhost_candidates(service_assets)
     probe_log: list[dict] = []
     thread_status: list[dict] = []
@@ -723,6 +741,7 @@ def _run_vhost_discovery(service_assets: list[dict]) -> dict:
         }
         assets.append(record)
         thread_status.append({'thread_id': thread_name, 'host': host, 'status': record['status'], 'reason': candidate['reason'], 'timestamp': time.time()})
+        _emit_progress(progress, {'assets': list(assets), 'discovered': [row['domain'] for row in assets], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
         return record
 
     if not candidates:
@@ -760,7 +779,7 @@ DEFAULT_CONTENT_WORDLIST = [
 _INTERESTING_STATUS = {200, 201, 204, 301, 302, 307, 308, 401, 403, 405}
 
 
-def _directory_enumeration(hosts: list[str], *, wordlist: list[str] | None = None, use_external_tools: bool = False) -> dict:
+def _directory_enumeration(hosts: list[str], *, wordlist: list[str] | None = None, use_external_tools: bool = False, progress=None) -> dict:
     deduped_hosts = sorted(set(hosts))
     paths = list(dict.fromkeys(wordlist or DEFAULT_CONTENT_WORDLIST))
     assets: list[dict] = []
@@ -807,6 +826,7 @@ def _directory_enumeration(hosts: list[str], *, wordlist: list[str] | None = Non
         }
         assets.append(record)
         thread_status.append({'thread_id': thread_name, 'host': host, 'status': record['status'], 'found': len(found), 'timestamp': time.time()})
+        _emit_progress(progress, {'assets': list(assets), 'discovered': [row['domain'] for row in assets if row.get('paths')], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
         return record
 
     if not deduped_hosts:
@@ -988,7 +1008,7 @@ def _write_finding_report(job_name: str, host: str, findings: list[dict]) -> str
     return f'/reports/{job_name}/{host}'
 
 
-def _application_security_tests(hosts: list[str], *, use_external_tools: bool = False) -> dict:
+def _application_security_tests(hosts: list[str], *, use_external_tools: bool = False, progress=None) -> dict:
     deduped_hosts = sorted(set(hosts))
     assets: list[dict] = []
     probe_log: list[dict] = []
@@ -1009,12 +1029,14 @@ def _application_security_tests(hosts: list[str], *, use_external_tools: bool = 
             record = {'domain': host, 'status': 'no_response', 'kind': 'app-test', 'ports': [], 'findings': [], 'source': 'app-test', 'sources': ['app-test'], 'source_count': 0, 'evidence': [], 'error': str(exc)}
             assets.append(record)
             thread_status.append({'thread_id': thread_name, 'host': host, 'status': 'no_response', 'timestamp': time.time()})
+            _emit_progress(progress, {'assets': list(assets), 'discovered': [row['domain'] for row in assets if row.get('findings')], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
             return record
 
         if _is_login_redirect(url, hdrs.get('x-final-url', url), body):
             record = {'domain': host, 'status': 'no_findings', 'kind': 'app-test', 'ports': [], 'findings': [], 'source': 'app-test', 'sources': ['app-test'], 'source_count': 0, 'evidence': []}
             assets.append(record)
             thread_status.append({'thread_id': thread_name, 'host': host, 'status': 'login_redirect', 'timestamp': time.time()})
+            _emit_progress(progress, {'assets': list(assets), 'discovered': [], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
             return record
 
         missing = [h for h in _SECURITY_HEADERS if h not in hdrs]
@@ -1059,6 +1081,7 @@ def _application_security_tests(hosts: list[str], *, use_external_tools: bool = 
             record['report_url'] = report_url
         assets.append(record)
         thread_status.append({'thread_id': thread_name, 'host': host, 'status': record['status'], 'findings': len(findings), 'timestamp': time.time()})
+        _emit_progress(progress, {'assets': list(assets), 'discovered': [row['domain'] for row in assets if row.get('findings')], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
         return record
 
     if not deduped_hosts:
@@ -1111,7 +1134,7 @@ def _is_login_redirect(requested_url: str, final_url: str, body: str) -> bool:
     return (redirected and url_login) or body_login
 
 
-def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False) -> dict:
+def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False, progress=None) -> dict:
     deduped_hosts = sorted(set(hosts))
     assets: list[dict] = []
     probe_log: list[dict] = []
@@ -1181,6 +1204,7 @@ def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False) -
         }
         assets.append(record)
         thread_status.append({'thread_id': thread_name, 'host': host, 'status': record['status'], 'findings': len(findings), 'timestamp': time.time()})
+        _emit_progress(progress, {'assets': list(assets), 'discovered': [row['domain'] for row in assets if row.get('findings')], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
         return record
 
     if not deduped_hosts:
@@ -1241,7 +1265,7 @@ def _tcp_port_open(ip: str, port: int, timeout: float = 1.5) -> bool:
         sock.close()
 
 
-def _port_scan_tests(hosts: list[str], *, use_external_tools: bool = False) -> dict:
+def _port_scan_tests(hosts: list[str], *, use_external_tools: bool = False, progress=None) -> dict:
     """Resolve the IP(s) behind each live host and flag unexpected open ports."""
     deduped_hosts = sorted(set(hosts))
     assets: list[dict] = []
@@ -1277,6 +1301,7 @@ def _port_scan_tests(hosts: list[str], *, use_external_tools: bool = False) -> d
         }
         assets.append(record)
         thread_status.append({'thread_id': thread_name, 'host': host, 'status': record['status'], 'open_ports': record['ports'], 'timestamp': time.time()})
+        _emit_progress(progress, {'assets': list(assets), 'discovered': [row['domain'] for row in assets if row.get('findings')], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
         return record
 
     if not deduped_hosts:
@@ -1349,7 +1374,7 @@ def _api_candidate_hosts() -> list[str]:
     return candidates
 
 
-def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: bool = False) -> dict:
+def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: bool = False, progress=None) -> dict:
     job_name = (job.get('name') or '').strip()
     job_type = (job.get('type', 'passive') or 'passive').lower()
     if job_type in {'github', 'repo', 'monitor'}:
@@ -1399,7 +1424,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
                 deduped_targets.append(host)
 
         deduped_targets, _truncated = _cap_hosts(deduped_targets)
-        probe_result = _probe_live_web_assets(deduped_targets, use_external_tools=use_external_tools)
+        probe_result = _probe_live_web_assets(deduped_targets, use_external_tools=use_external_tools, progress=progress)
         live_assets = probe_result.get('assets', probe_result.get('discovered', [])) if isinstance(probe_result, dict) else probe_result
         deduped = {}
         for asset in live_assets:
@@ -1462,7 +1487,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             live_hosts = [row.get('domain') for row in live_hosts if isinstance(row, dict) and row.get('domain')]
         deduped_hosts = sorted({host for host in live_hosts if isinstance(host, str) and host.strip()})
         deduped_hosts, _truncated = _cap_hosts(deduped_hosts)
-        enum_result = _enumerate_live_services(deduped_hosts, use_external_tools=use_external_tools)
+        enum_result = _enumerate_live_services(deduped_hosts, use_external_tools=use_external_tools, progress=progress)
         assets = enum_result.get('assets', [])
         response = {
             'job': job_name,
@@ -1506,7 +1531,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             payload = {}
         service_assets = [a for a in (payload.get('assets', []) or []) if isinstance(a, dict) and a.get('domain')]
         evaluated_hosts = sorted({a['domain'] for a in service_assets})
-        vhost_result = _run_vhost_discovery(service_assets)
+        vhost_result = _run_vhost_discovery(service_assets, progress=progress)
         assets = vhost_result.get('assets', [])
         response = {
             'job': job_name,
@@ -1570,7 +1595,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
                 deduped_hosts.append(host)
 
         deduped_hosts, _truncated = _cap_hosts(deduped_hosts)
-        enum_result = _directory_enumeration(deduped_hosts, use_external_tools=use_external_tools)
+        enum_result = _directory_enumeration(deduped_hosts, use_external_tools=use_external_tools, progress=progress)
         assets = enum_result.get('assets', [])
         response = {
             'job': job_name,
@@ -1602,7 +1627,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
         hosts = _combined_live_hosts()
         deduped_hosts = [h for h in hosts if is_in_scope(h, allowed_scope)]
         deduped_hosts, _truncated = _cap_hosts(deduped_hosts)
-        test_result = _application_security_tests(deduped_hosts, use_external_tools=use_external_tools)
+        test_result = _application_security_tests(deduped_hosts, use_external_tools=use_external_tools, progress=progress)
         assets = test_result.get('assets', [])
         response = {
             'job': job_name, 'program': job.get('program', DEFAULT_PROGRAM), 'type': 'active',
@@ -1628,7 +1653,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             }
         api_hosts = [h for h in _api_candidate_hosts() if is_in_scope(h, allowed_scope)]
         api_hosts, _truncated = _cap_hosts(api_hosts)
-        test_result = _api_endpoint_tests(api_hosts, use_external_tools=use_external_tools)
+        test_result = _api_endpoint_tests(api_hosts, use_external_tools=use_external_tools, progress=progress)
         assets = test_result.get('assets', [])
         response = {
             'job': job_name, 'program': job.get('program', DEFAULT_PROGRAM), 'type': 'active',
@@ -1655,7 +1680,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
         hosts = _combined_live_hosts()
         deduped_hosts = [h for h in hosts if is_in_scope(h, allowed_scope)]
         deduped_hosts, _truncated = _cap_hosts(deduped_hosts)
-        test_result = _port_scan_tests(deduped_hosts, use_external_tools=use_external_tools)
+        test_result = _port_scan_tests(deduped_hosts, use_external_tools=use_external_tools, progress=progress)
         assets = test_result.get('assets', [])
         response = {
             'job': job_name, 'program': job.get('program', DEFAULT_PROGRAM), 'type': 'active',
@@ -1807,12 +1832,48 @@ def main() -> None:
         RUNNING_DIR.mkdir(parents=True, exist_ok=True)
         lock_path = RUNNING_DIR / f'{job_path.stem}.lock'
         lock_path.write_text(str(os.getpid()), encoding='utf-8')
+        out_path = RESULTS_DIR / f"{job_path.stem}.json"
+        progress_lock = threading.Lock()
+        running_payload = {
+            'job': job.get('name'),
+            'program': job.get('program', DEFAULT_PROGRAM),
+            'type': job.get('type', 'passive'),
+            'targets': job.get('targets', []),
+            'queued': job.get('targets', []),
+            'skipped': [],
+            'status': 'running',
+            'job_state': 'running',
+            'discovered': [],
+            'assets': [],
+            'source_count': 0,
+            'depends_on': job_workflow_dependencies(job.get('name')),
+            'probe_log': [],
+            'thread_status': [],
+            'probe_threads': 0,
+        }
+        _atomic_write_json(out_path, running_payload)
+
+        def checkpoint(snapshot: dict) -> None:
+            assets = snapshot.get('assets', []) or []
+            payload = dict(running_payload)
+            payload.update({
+                'targets': job.get('targets', []),
+                'queued': job.get('targets', []),
+                'discovered': snapshot.get('discovered', []),
+                'assets': assets,
+                'source_count': sum(len(asset.get('findings', [])) for asset in assets if isinstance(asset, dict)),
+                'probe_log': _cap_log(snapshot.get('probe_log', []) or []),
+                'thread_status': _cap_log(snapshot.get('thread_status', []) or []),
+                'probe_threads': snapshot.get('threads', 0),
+            })
+            with progress_lock:
+                _atomic_write_json(out_path, payload)
+
         try:
             allowed_scope = read_scope_file(job.get('program', DEFAULT_PROGRAM))
-            result = run_passive_job(job, allowed_scope, use_external_tools=args.external_probes)
+            result = run_passive_job(job, allowed_scope, use_external_tools=args.external_probes, progress=checkpoint)
             if not RESULTS_DIR.exists():
                 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-            out_path = RESULTS_DIR / f"{job_path.stem}.json"
             previous = None
             if out_path.exists():
                 try:
@@ -1822,7 +1883,7 @@ def main() -> None:
             # Active steps derive targets/results from the current run only; merging would
             # carry stale targets forward. Passive discovery still accumulates across runs.
             merged_result = _result_for_write(job.get('name'), previous, result)
-            out_path.write_text(json.dumps(merged_result, indent=2), encoding='utf-8')
+            _atomic_write_json(out_path, merged_result)
             all_results.append(merged_result)
         finally:
             if lock_path.exists():

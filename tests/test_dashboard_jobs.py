@@ -803,6 +803,33 @@ class DashboardJobMetadataTest(unittest.TestCase):
             self.assertTrue(all(item.get('source') for item in asset['evidence']))
             self.assertTrue(asset.get('source'))
 
+    def test_service_enumeration_emits_incremental_progress(self):
+        from worker import _enumerate_live_services
+
+        class FakeResponse:
+            status = 200
+            headers = {'Server': 'nginx'}
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def getcode(self):
+                return self.status
+
+        checkpoints = []
+
+        def fake_urlopen(req, timeout=8):
+            if req.full_url == 'https://alpha.example.com':
+                return FakeResponse()
+            raise OSError('no response')
+
+        with patch('worker.urllib_request.urlopen', side_effect=fake_urlopen):
+            _enumerate_live_services(['alpha.example.com'], progress=checkpoints.append)
+
+        self.assertTrue(checkpoints)
+        self.assertIn('alpha.example.com', checkpoints[-1]['discovered'])
+        self.assertEqual(checkpoints[-1]['assets'][0]['ports'], [443])
+
     def test_dashboard_can_queue_rerun_for_job(self):
         with patch('dashboard_app.subprocess.Popen', return_value=type('Proc', (), {'pid': 1234})()) as mock_popen, \
              patch.dict('os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token'}):
