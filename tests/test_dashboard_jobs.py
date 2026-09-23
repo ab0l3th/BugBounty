@@ -828,6 +828,7 @@ class DashboardJobMetadataTest(unittest.TestCase):
 
         self.assertTrue(checkpoints)
         self.assertIn('alpha.example.com', checkpoints[-1]['discovered'])
+        self.assertEqual(checkpoints[-1]['targets'], ['alpha.example.com'])
         self.assertEqual(checkpoints[-1]['assets'][0]['ports'], [443])
 
     def test_dashboard_can_queue_rerun_for_job(self):

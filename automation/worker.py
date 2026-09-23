@@ -393,7 +393,7 @@ def _probe_live_web_assets(hosts: list[str], *, use_external_tools: bool = False
                             'url': url,
                             'timestamp': time.time(),
                         })
-                        _emit_progress(progress, {'assets': list(discovered), 'discovered': [row['domain'] for row in discovered], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
+                        _emit_progress(progress, {'targets': list(deduped_hosts), 'assets': list(discovered), 'discovered': [row['domain'] for row in discovered], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
                         if use_external_tools:
                             for tool_name in ('curl', 'nmap', 'whatweb'):
                                 if _command_exists(tool_name):
@@ -591,7 +591,7 @@ def _enumerate_live_services(hosts: list[str], *, use_external_tools: bool = Fal
             'ports': open_ports,
             'timestamp': time.time(),
         })
-        _emit_progress(progress, {'assets': list(results), 'discovered': [row['domain'] for row in results], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
+        _emit_progress(progress, {'targets': list(deduped_hosts), 'assets': list(results), 'discovered': [row['domain'] for row in results], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
         return service_record
 
     if not deduped_hosts:
@@ -741,7 +741,7 @@ def _run_vhost_discovery(service_assets: list[dict], *, progress=None) -> dict:
         }
         assets.append(record)
         thread_status.append({'thread_id': thread_name, 'host': host, 'status': record['status'], 'reason': candidate['reason'], 'timestamp': time.time()})
-        _emit_progress(progress, {'assets': list(assets), 'discovered': [row['domain'] for row in assets], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
+        _emit_progress(progress, {'targets': [item['domain'] for item in candidates], 'assets': list(assets), 'discovered': [row['domain'] for row in assets], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
         return record
 
     if not candidates:
@@ -826,7 +826,7 @@ def _directory_enumeration(hosts: list[str], *, wordlist: list[str] | None = Non
         }
         assets.append(record)
         thread_status.append({'thread_id': thread_name, 'host': host, 'status': record['status'], 'found': len(found), 'timestamp': time.time()})
-        _emit_progress(progress, {'assets': list(assets), 'discovered': [row['domain'] for row in assets if row.get('paths')], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
+        _emit_progress(progress, {'targets': list(deduped_hosts), 'assets': list(assets), 'discovered': [row['domain'] for row in assets if row.get('paths')], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
         return record
 
     if not deduped_hosts:
@@ -1029,14 +1029,14 @@ def _application_security_tests(hosts: list[str], *, use_external_tools: bool = 
             record = {'domain': host, 'status': 'no_response', 'kind': 'app-test', 'ports': [], 'findings': [], 'source': 'app-test', 'sources': ['app-test'], 'source_count': 0, 'evidence': [], 'error': str(exc)}
             assets.append(record)
             thread_status.append({'thread_id': thread_name, 'host': host, 'status': 'no_response', 'timestamp': time.time()})
-            _emit_progress(progress, {'assets': list(assets), 'discovered': [row['domain'] for row in assets if row.get('findings')], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
+            _emit_progress(progress, {'targets': list(deduped_hosts), 'assets': list(assets), 'discovered': [row['domain'] for row in assets if row.get('findings')], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
             return record
 
         if _is_login_redirect(url, hdrs.get('x-final-url', url), body):
             record = {'domain': host, 'status': 'no_findings', 'kind': 'app-test', 'ports': [], 'findings': [], 'source': 'app-test', 'sources': ['app-test'], 'source_count': 0, 'evidence': []}
             assets.append(record)
             thread_status.append({'thread_id': thread_name, 'host': host, 'status': 'login_redirect', 'timestamp': time.time()})
-            _emit_progress(progress, {'assets': list(assets), 'discovered': [], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
+            _emit_progress(progress, {'targets': list(deduped_hosts), 'assets': list(assets), 'discovered': [], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
             return record
 
         missing = [h for h in _SECURITY_HEADERS if h not in hdrs]
@@ -1081,7 +1081,7 @@ def _application_security_tests(hosts: list[str], *, use_external_tools: bool = 
             record['report_url'] = report_url
         assets.append(record)
         thread_status.append({'thread_id': thread_name, 'host': host, 'status': record['status'], 'findings': len(findings), 'timestamp': time.time()})
-        _emit_progress(progress, {'assets': list(assets), 'discovered': [row['domain'] for row in assets if row.get('findings')], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
+        _emit_progress(progress, {'targets': list(deduped_hosts), 'assets': list(assets), 'discovered': [row['domain'] for row in assets if row.get('findings')], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
         return record
 
     if not deduped_hosts:
@@ -1204,7 +1204,7 @@ def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False, p
         }
         assets.append(record)
         thread_status.append({'thread_id': thread_name, 'host': host, 'status': record['status'], 'findings': len(findings), 'timestamp': time.time()})
-        _emit_progress(progress, {'assets': list(assets), 'discovered': [row['domain'] for row in assets if row.get('findings')], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
+        _emit_progress(progress, {'targets': list(deduped_hosts), 'assets': list(assets), 'discovered': [row['domain'] for row in assets if row.get('findings')], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
         return record
 
     if not deduped_hosts:
@@ -1856,9 +1856,10 @@ def main() -> None:
         def checkpoint(snapshot: dict) -> None:
             assets = snapshot.get('assets', []) or []
             payload = dict(running_payload)
+            targets = snapshot.get('targets', running_payload['targets']) or running_payload['targets']
             payload.update({
-                'targets': job.get('targets', []),
-                'queued': job.get('targets', []),
+                'targets': targets,
+                'queued': targets,
                 'discovered': snapshot.get('discovered', []),
                 'assets': assets,
                 'source_count': sum(len(asset.get('findings', [])) for asset in assets if isinstance(asset, dict)),
