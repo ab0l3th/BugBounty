@@ -930,6 +930,7 @@ def index():
 
                     {% set probe_log = (job.raw.probe_log if job.raw else []) %}
                     {% set thread_status = (job.raw.thread_status if job.raw else []) %}
+                    {% set login_redirects = probe_log|selectattr('status', 'equalto', 'login_redirect')|list %}
                     {% if probe_log or thread_status %}
                       <details class="collapsible-list" data-state-key="threads-{{ job.name }}">
                         <summary>Thread progress ({{ thread_status|length }})</summary>
@@ -940,6 +941,16 @@ def index():
                           {% if thread_status|length > thread_render_cap %}
                             <li>… {{ thread_status|length - thread_render_cap }} more not shown</li>
                           {% endif %}
+                        </ul>
+                      </details>
+                    {% endif %}
+                    {% if login_redirects %}
+                      <details class="collapsible-list" data-state-key="login-redirects-{{ job.name }}">
+                        <summary>Login redirects ({{ login_redirects|length }})</summary>
+                        <ul>
+                          {% for item in login_redirects %}
+                            <li><code>{{ item.host }}</code> — {{ item.classification or 'unknown_login' }}{% if item.final_host %} → <code>{{ item.final_host }}{{ item.final_path or '/' }}</code>{% endif %}{% if item.title %} — {{ item.title }}{% endif %}</li>
+                          {% endfor %}
                         </ul>
                       </details>
                     {% endif %}
