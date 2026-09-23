@@ -1778,7 +1778,7 @@ def main() -> None:
             lock_path = RUNNING_DIR / f'{job_path.stem}.lock'
             if lock_path.exists():
                 lock_path.unlink()
-            print(json.dumps({'job': job.get('name'), 'status': 'skipped_active', 'reason': 'requires --allow-active'}, indent=2))
+            print(json.dumps({'job': job.get('name'), 'status': 'skipped_active', 'reason': 'requires --allow-active'}, indent=2), file=sys.stderr)
             continue
         dependencies = job_workflow_dependencies(job.get('name'))
         if dependencies:
@@ -1797,10 +1797,10 @@ def main() -> None:
                 if state not in (COMPLETED_STATUSES | {'completed'}):
                     pending.append(dependency)
             if pending:
-                print(json.dumps({'job': job.get('name'), 'status': 'waiting_on_dependencies', 'dependencies': pending}, indent=2))
+                print(json.dumps({'job': job.get('name'), 'status': 'waiting_on_dependencies', 'dependencies': pending}, indent=2), file=sys.stderr)
                 continue
         if not args.force and _lock_is_active(job_path.stem):
-            print(json.dumps({'job': job.get('name'), 'status': 'busy', 'reason': 'another run holds the lock'}, indent=2))
+            print(json.dumps({'job': job.get('name'), 'status': 'busy', 'reason': 'another run holds the lock'}, indent=2), file=sys.stderr)
             continue
         if not args.force and not should_run_job(job_path):
             continue
