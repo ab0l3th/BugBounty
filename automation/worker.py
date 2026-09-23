@@ -304,6 +304,27 @@ def _run_external_probe_tool(host: str, url: str, tool_name: str) -> dict:
         return {'tool': tool_name, 'ok': False, 'error': str(exc)}
 
 
+def _response_final_url(resp, fallback: str) -> str:
+    geturl = getattr(resp, 'geturl', None)
+    if callable(geturl):
+        try:
+            return str(geturl())
+        except Exception:
+            pass
+    return fallback
+
+
+def _response_text(resp, limit: int) -> str:
+    reader = getattr(resp, 'read', None)
+    if not callable(reader):
+        return ''
+    try:
+        body = reader(limit)
+    except Exception:
+        return ''
+    return body.decode('utf-8', 'replace') if isinstance(body, (bytes, bytearray)) else str(body)
+
+
 def _probe_live_web_assets(hosts: list[str], *, use_external_tools: bool = False) -> dict:
     deduped_hosts = sorted(set(hosts))
     discovered: list[dict] = []
@@ -329,7 +350,9 @@ def _probe_live_web_assets(hosts: list[str], *, use_external_tools: bool = False
                 req = urllib_request.Request(url, headers=headers, method='GET')
                 with urllib_request.urlopen(req, timeout=8) as resp:
                     code = getattr(resp, 'status', resp.getcode())
-                    if code and code < 400:
+                    final_url = _response_final_url(resp, url)
+                    body_text = _response_text(resp, 2048)
+                    if code and code < 400 and not _is_login_redirect(url, final_url, body_text):
                         info['status'] = 'live'
                         info['status_code'] = code
                         discovered.append({
@@ -491,6 +514,11 @@ def _enumerate_live_services(hosts: list[str], *, use_external_tools: bool = Fal
                     source = str(server).strip() or f'{parts.scheme}/{code}'
                     attempt['status'] = 'open'
                     attempt['status_code'] = code
+                    body_text = _response_text(resp, 2048)
+                    final_url = _response_final_url(resp, url)
+                    if _is_login_redirect(url, final_url, body_text):
+                        attempt['status'] = 'login_redirect'
+                        continue
                     attempt['server'] = str(server)
                     attempt['port'] = port
                     attempt['source'] = source
@@ -645,6 +673,10 @@ def _probe_vhost(ip: str, host_header: str, scheme: str = 'https') -> dict:
             body = resp.read(4096)
             headers = getattr(resp, 'headers', {})
             server = headers.get('Server', '') if hasattr(headers, 'get') else ''
+            final_url = _response_final_url(resp, url)
+            body_text = body.decode('utf-8', 'replace') if isinstance(body, (bytes, bytearray)) else str(body)
+            if _is_login_redirect(url, final_url, body_text):
+                return {'host_header': host_header, 'ip': ip, 'source': f'{host_header} (login redirect)', 'url': url, 'ok': False, 'status': 'login_redirect'}
             return {
                 'host_header': host_header,
                 'ip': ip,
@@ -747,14 +779,18 @@ def _directory_enumeration(hosts: list[str], *, wordlist: list[str] | None = Non
                 req = urllib_request.Request(url, headers=headers, method='GET')
                 with urllib_request.urlopen(req, timeout=8) as resp:
                     code = getattr(resp, 'status', resp.getcode())
-                    body = resp.read(2048)
+                    body = resp.read(2048) if callable(getattr(resp, 'read', None)) else b''
                     length = len(body) if body else 0
+                    final_url = _response_final_url(resp, url)
             except urllib_error.HTTPError as exc:
                 code = exc.code
                 length = 0
+                body = b''
+                final_url = url
             except (urllib_error.URLError, ValueError, OSError):
                 continue
-            if code in _INTERESTING_STATUS:
+            body_text = body.decode('utf-8', 'replace') if isinstance(body, (bytes, bytearray)) else str(body)
+            if code in _INTERESTING_STATUS and not _is_login_redirect(url, final_url, body_text):
                 entry = {'path': path, 'status_code': code, 'length': length, 'url': url}
                 found.append(entry)
                 probe_log.append({'thread_id': thread_name, 'host': host, 'path': path, 'status_code': code, 'status': 'found', 'timestamp': time.time()})
@@ -975,6 +1011,12 @@ def _application_security_tests(hosts: list[str], *, use_external_tools: bool = 
             thread_status.append({'thread_id': thread_name, 'host': host, 'status': 'no_response', 'timestamp': time.time()})
             return record
 
+        if _is_login_redirect(url, hdrs.get('x-final-url', url), body):
+            record = {'domain': host, 'status': 'no_findings', 'kind': 'app-test', 'ports': [], 'findings': [], 'source': 'app-test', 'sources': ['app-test'], 'source_count': 0, 'evidence': []}
+            assets.append(record)
+            thread_status.append({'thread_id': thread_name, 'host': host, 'status': 'login_redirect', 'timestamp': time.time()})
+            return record
+
         missing = [h for h in _SECURITY_HEADERS if h not in hdrs]
         if missing:
             findings.append({'type': 'missing_security_headers', 'detail': missing, 'severity': 'low'})
@@ -1053,7 +1095,11 @@ def _looks_like_data(content_type: str, body: str) -> bool:
 
 
 _LOGIN_URL_MARKERS = ('login', 'signin', 'sign-in', 'sso', 'oauth', 'auth/realms', 'account/login', 'session/new', 'adfs', 'saml', 'idp')
-_LOGIN_BODY_MARKERS = ('type="password"', "type='password'", 'name="password"', 'id="password"')
+_LOGIN_BODY_MARKERS = (
+    'type="password"', "type='password'", 'name="password"', 'id="password"',
+    '<title>login', '<title>sign in', 'login required', 'please sign in',
+    'authentication required', 'name="username"', "name='username'",
+)
 
 
 def _is_login_redirect(requested_url: str, final_url: str, body: str) -> bool:

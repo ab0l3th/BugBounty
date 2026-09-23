@@ -548,6 +548,52 @@ class DashboardJobMetadataTest(unittest.TestCase):
             self.assertEqual(debug, [])
             self.assertEqual(asset['status'], 'no_findings')
 
+    def test_directory_enumeration_ignores_login_redirect(self):
+        from worker import _directory_enumeration
+
+        class FakeResp:
+            status = 200
+            headers = {'Content-Type': 'text/html'}
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def getcode(self):
+                return self.status
+            def geturl(self):
+                return 'https://app.example.com/login'
+            def read(self, n=None):
+                return b'<title>Login</title><form><input type="password"></form>'
+
+        with patch('worker.urllib_request.urlopen', return_value=FakeResp()):
+            result = _directory_enumeration(['app.example.com'], wordlist=['/admin'])
+
+        self.assertEqual(result['assets'][0]['paths'], [])
+        self.assertEqual(result['assets'][0]['status'], 'no_paths')
+
+    def test_application_security_ignores_login_page(self):
+        from worker import _application_security_tests
+
+        class FakeResp:
+            status = 200
+            headers = {'Content-Type': 'text/html'}
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def getcode(self):
+                return self.status
+            def geturl(self):
+                return 'https://app.example.com/signin'
+            def read(self, n=None):
+                return b'<title>Sign In</title><input name="username"><input type="password">'
+
+        with patch('worker.urllib_request.urlopen', return_value=FakeResp()):
+            result = _application_security_tests(['app.example.com'])
+
+        self.assertEqual(result['assets'][0]['findings'], [])
+        self.assertEqual(result['assets'][0]['status'], 'no_findings')
+
     def test_highest_severity_returns_top_rank(self):
         from dashboard_app import highest_severity
         self.assertEqual(highest_severity([{'severity': 'low'}, {'severity': 'high'}, {'severity': 'medium'}]), 'High')
