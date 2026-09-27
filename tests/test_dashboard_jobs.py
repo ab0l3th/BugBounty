@@ -895,6 +895,7 @@ class DashboardJobMetadataTest(unittest.TestCase):
                 page = client.get('/review')
                 self.assertEqual(page.status_code, 200)
                 self.assertIn(b'host.example.com', page.data)
+                self.assertIn(b'href="https://host.example.com/"', page.data)
                 self.assertNotIn(b'private evidence', page.data)
                 endpoint = f'/review/{finding_id}'
                 decision = {'status': 'needs_account', 'scope': 'needs_verification'}
@@ -907,6 +908,34 @@ class DashboardJobMetadataTest(unittest.TestCase):
                 self.assertEqual(client.post(endpoint, json={'status': 'false_positive', 'scope': 'in_scope'}, headers=headers).status_code, 200)
                 self.assertIn(b'value="false_positive" selected', client.get('/review').data)
                 self.assertIn(b'value="in_scope" selected', client.get('/review').data)
+
+    def test_review_links_known_paths_and_rejects_unsafe_hosts(self):
+        from dashboard_app import review_candidates
+
+        jobs = [{'name': 'api-endpoint-testing', 'assets': [
+            {'domain': 'api.example.com', 'report_url': '/reports/api-endpoint-testing/api.example.com',
+             'findings': [{'type': 'debug_endpoint', 'path': '/actuator/health', 'severity': 'high'}]},
+            {'domain': 'api.example.com@malicious.test',
+             'findings': [{'type': 'debug_endpoint', 'path': '//malicious.test', 'severity': 'high'}]},
+        ]}]
+        candidates = review_candidates(jobs)
+        self.assertEqual(candidates[0]['target_url'], 'https://api.example.com/actuator/health')
+        self.assertEqual(candidates[0]['report_url'], '/reports/api-endpoint-testing/api.example.com')
+        self.assertIsNone(candidates[1]['target_url'])
+        web_port = review_candidates([{'name': 'port-scan-live-hosts', 'assets': [{
+            'domain': 'app.example.com', 'findings': [
+                {'type': 'open_port', 'service': 'http-alt', 'port': 8080},
+                {'type': 'open_port', 'service': 'redis', 'port': 6379},
+            ],
+        }]}])
+        self.assertEqual(web_port[0]['target_url'], 'http://app.example.com:8080/')
+        self.assertEqual(web_port[1]['target_url'], 'https://app.example.com/')
+        with patch('dashboard_app.list_jobs', return_value=jobs):
+            with app.test_client() as client:
+                page = client.get('/review')
+                self.assertIn(b'href="https://api.example.com/actuator/health"', page.data)
+                self.assertIn(b'href="/reports/api-endpoint-testing/api.example.com"', page.data)
+                self.assertNotIn(b'href="https://api.example.com@malicious.test', page.data)
 
     def test_rerun_launches_only_the_requested_job(self):
         with patch('dashboard_app.subprocess.Popen', return_value=type('Proc', (), {'pid': 4321})()) as mock_popen, \

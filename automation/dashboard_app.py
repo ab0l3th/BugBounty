@@ -14,6 +14,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List
+from urllib.parse import quote
 
 from flask import Flask, jsonify, render_template_string, request
 
@@ -200,10 +201,28 @@ def review_candidates(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     continue
                 seen.add(identity)
                 finding_type = finding['type']
+                host = asset['domain']
+                target_url = None
+                report_url = None
+                if isinstance(host, str) and re.fullmatch(r'[a-zA-Z0-9](?:[a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?', host) and '..' not in host:
+                  path = finding.get('path')
+                  if isinstance(path, str) and path.startswith('/') and not path.startswith('//'):
+                    target_url = f'https://{host}{quote(path, safe="/%-._~")}'
+                  elif finding_type == 'open_port' and finding.get('service') == 'https-alt' and finding.get('port') == 8443:
+                    target_url = f'https://{host}:8443/'
+                  elif finding_type == 'open_port' and finding.get('service') in {'http-alt', 'http-dev'} and finding.get('port') in {8000, 8080, 8888}:
+                    target_url = f"http://{host}:{finding['port']}/"
+                  else:
+                    target_url = f'https://{host}/'
+                  expected_report = f"/reports/{job['name']}/{host}"
+                  if asset.get('report_url') == expected_report:
+                    report_url = expected_report
                 candidates.append({
                     'id': hashlib.sha256(identity.encode('utf-8')).hexdigest(),
                     'job': job['name'],
                     'host': asset['domain'],
+                    'target_url': target_url,
+                    'report_url': report_url,
                     'evidence': evidence,
                     'confidence': 'medium' if finding_type in {'error_disclosure', 'graphql_introspection'} else 'low',
                     'scope': 'needs verification',
@@ -247,8 +266,8 @@ def review_queue():
   </style></head><body><main><p><a href="/">← Dashboard</a></p><h1>Finding review</h1>
   <p class="meta">Scanner signals need manual verification. Confidence is a triage estimate, not a confirmed vulnerability rating. Scope must be checked against program rules.</p>
   <table><thead><tr><th>Asset / job</th><th>Observed evidence</th><th>Confidence</th><th>Scope</th><th>Review</th></tr></thead><tbody>
-  {% for item in candidates %}<tr><td><code>{{ item.host }}</code><br><small>{{ item.job }}</small></td>
-  <td><strong>{{ item.evidence.type }}</strong><br>{% for key, value in item.evidence.items() if key != 'type' %}<small>{{ key }}: {{ value }}</small><br>{% endfor %}</td>
+  {% for item in candidates %}<tr><td>{% if item.target_url %}<a href="{{ item.target_url }}" target="_blank" rel="noopener noreferrer"><code>{{ item.host }}</code></a>{% else %}<code>{{ item.host }}</code>{% endif %}<br><small>{{ item.job }}</small></td>
+  <td><strong>{{ item.evidence.type }}</strong><br>{% for key, value in item.evidence.items() if key != 'type' %}<small>{{ key }}: {{ value }}</small><br>{% endfor %}{% if item.target_url and item.evidence.path %}<a href="{{ item.target_url }}" target="_blank" rel="noopener noreferrer">Open path</a><br>{% elif item.target_url and item.evidence.type == 'open_port' %}<a href="{{ item.target_url }}" target="_blank" rel="noopener noreferrer">Open host</a><br>{% endif %}{% if item.report_url %}<a href="{{ item.report_url }}" target="_blank" rel="noopener noreferrer">View write-up</a>{% endif %}</td>
   <td>{{ item.confidence }}</td><td><select class="scope" aria-label="Scope for {{ item.host }}">
   {% for value, label in [('needs_verification', 'Needs verification'), ('in_scope', 'In scope'), ('out_of_scope', 'Out of scope')] %}
   <option value="{{ value }}" {% if item.scope == value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></td>
