@@ -1332,6 +1332,12 @@ def index():
         const guidelinesFile = document.getElementById('guidelines-file');
         const guidelinesText = document.getElementById('guidelines-text');
         const uploadStatus = document.getElementById('upload-status');
+        let uploadInProgress = false;
+        let uploadComplete = false;
+        function uploadDraftPending() {
+          return !uploadComplete && (uploadInProgress || scopeFile.files.length > 0 ||
+            guidelinesFile.files.length > 0 || !!programName.value.trim() || !!guidelinesText.value.trim());
+        }
         ['dragenter', 'dragover'].forEach(eventName => scopeDrop.addEventListener(eventName, event => {
           event.preventDefault();
           scopeDrop.classList.add('dragging');
@@ -1353,6 +1359,7 @@ def index():
           }
           const button = uploadForm.querySelector('button');
           button.disabled = true;
+          uploadInProgress = true;
           uploadStatus.textContent = 'Uploading...';
           try {
             const response = await fetch('/programs/upload', { method: 'POST',
@@ -1364,11 +1371,13 @@ def index():
               return;
             }
             uploadStatus.textContent = result.message || (result.program + ' awaiting rules review');
+            uploadComplete = true;
             saveViewState();
             window.location.reload();
           } catch (error) {
             uploadStatus.textContent = 'Upload failed';
           } finally {
+            uploadInProgress = false;
             button.disabled = false;
           }
         });
@@ -1423,6 +1432,10 @@ def index():
                 message.textContent = result.message || 'Decision not saved';
                 return;
               }
+              if (uploadDraftPending()) {
+                uploadStatus.textContent = 'Refresh paused while an upload is staged';
+                return;
+              }
               saveViewState();
               window.location.reload();
             } catch (error) {
@@ -1460,6 +1473,10 @@ def index():
             if (!resp.ok) {
               const detail = await resp.json().catch(() => ({}));
               alert('Re-run failed: ' + (detail.message || resp.status));
+              return;
+            }
+            if (uploadDraftPending()) {
+              uploadStatus.textContent = 'Refresh paused while an upload is staged';
               return;
             }
             window.location.reload();
@@ -1528,6 +1545,11 @@ def index():
 
         restoreViewState();
         window.addEventListener('beforeunload', saveViewState);
+        window.addEventListener('beforeunload', event => {
+          if (!uploadDraftPending()) return;
+          event.preventDefault();
+          event.returnValue = '';
+        });
 
         let refreshTimer = null;
         function applyRefreshInterval() {
@@ -1539,6 +1561,7 @@ def index():
           }
           if (value > 0) {
             refreshTimer = setInterval(() => {
+              if (uploadDraftPending()) return;
               saveViewState();
               window.location.reload();
             }, value * 1000);
@@ -1550,6 +1573,10 @@ def index():
         }
         if (refreshButton) {
           refreshButton.addEventListener('click', () => {
+            if (uploadDraftPending()) {
+              uploadStatus.textContent = 'Refresh paused while an upload is staged';
+              return;
+            }
             saveViewState();
             setLastRefreshed();
             window.location.reload();
