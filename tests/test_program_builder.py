@@ -100,6 +100,7 @@ class ProgramBuilderTest(unittest.TestCase):
             self.assertEqual(jobs[3]['queued'], [])
             self.assertEqual(page.status_code, 200)
             self.assertIn(b'id="program-upload"', page.data)
+            self.assertIn(b'id="program-name"', page.data)
             self.assertIn(b'id="guidelines-file"', page.data)
             self.assertIn(b'Review required', page.data)
             self.assertIn(b'class="rules-acknowledged"', page.data)
@@ -133,12 +134,13 @@ class ProgramBuilderTest(unittest.TestCase):
                 self.assertEqual(unauthorized.status_code, 401)
                 self.assertFalse((Path(directory) / 'programs').exists())
                 headers = {'X-BugBounty-Token': 'test-token'}
-                malformed = client.post('/programs/upload', data={'scope_file': (io.BytesIO(b'bad data'), 'demo.csv')}, headers=headers)
+                malformed = client.post('/programs/upload', data={'program_name': 'Demo', 'scope_file': (io.BytesIO(b'bad data'), 'demo.csv')}, headers=headers)
                 self.assertEqual(malformed.status_code, 400)
-                no_rules = client.post('/programs/upload', data={'scope_file': (io.BytesIO(csv_data), 'hackerone-demo-scope.csv')}, headers=headers)
+                no_rules = client.post('/programs/upload', data={'program_name': 'Demo', 'scope_file': (io.BytesIO(csv_data), 'hackerone-demo-scope.csv')}, headers=headers)
                 self.assertEqual(no_rules.status_code, 400)
                 self.assertFalse((Path(directory) / 'programs/demo').exists())
                 accepted = client.post('/programs/upload', data={
+                    'program_name': 'Demo',
                     'scope_file': (io.BytesIO(csv_data), 'hackerone-demo-scope.csv'),
                     'guidelines_text': 'Authorized read-only checks. No credential testing.',
                 }, headers=headers)
@@ -149,11 +151,44 @@ class ProgramBuilderTest(unittest.TestCase):
                 self.assertIn('No credential testing.', (Path(directory) / 'programs/demo/rules.md').read_text(encoding='utf-8'))
                 self.assertEqual(len(list_jobs()), 9)
                 duplicate = client.post('/programs/upload', data={
+                    'program_name': 'Demo',
                     'scope_file': (io.BytesIO(csv_data), 'hackerone-demo-scope.csv'),
                     'guidelines_text': 'Authorized read-only checks. No credential testing.',
                 }, headers=headers)
                 self.assertEqual(duplicate.status_code, 409)
                 launch.assert_called_once()
+
+    def test_upload_requires_name_and_separates_same_named_scope_files(self):
+        with TemporaryDirectory() as directory, \
+             patch('dashboard_app.ROOT', Path(directory)), \
+             patch('dashboard_app.JOBS_DIR', Path(directory) / 'jobs'), \
+             patch('dashboard_app.RESULTS_DIR', Path(directory) / 'results'), \
+             patch('dashboard_app.subprocess.Popen') as launch, \
+             patch.dict('dashboard_app.os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token'}):
+            csv_data = b'identifier,asset_type,in_scope\n*.example.com,WILDCARD,true\n'
+            headers = {'X-BugBounty-Token': 'test-token'}
+
+            def submit(client, name):
+                return client.post('/programs/upload', data={
+                    'program_name': name,
+                    'scope_file': (io.BytesIO(csv_data), 'scope.csv'),
+                    'guidelines_text': 'Read-only validation.',
+                }, headers=headers)
+
+            with app.test_client() as client:
+                self.assertEqual(submit(client, '').status_code, 400)
+                self.assertEqual(submit(client, '../../other').status_code, 400)
+                self.assertFalse((Path(directory) / 'programs').exists())
+                first = submit(client, 'NBA Public')
+                second = submit(client, 'WNBA Public')
+                self.assertEqual(first.status_code, 202)
+                self.assertEqual(second.status_code, 202)
+                self.assertEqual(first.get_json()['program'], 'nba-public')
+                self.assertEqual(second.get_json()['program'], 'wnba-public')
+                self.assertTrue((Path(directory) / 'programs/nba-public/scope.md').exists())
+                self.assertTrue((Path(directory) / 'programs/wnba-public/scope.md').exists())
+                self.assertFalse(set(first.get_json()['jobs']) & set(second.get_json()['jobs']))
+                self.assertEqual(launch.call_count, 2)
 
     def test_rules_review_and_approval_requires_current_guidelines(self):
         with TemporaryDirectory() as directory, \
@@ -194,6 +229,7 @@ class ProgramBuilderTest(unittest.TestCase):
              patch.dict('dashboard_app.os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token', 'BUGBOUNTY_ALLOW_ACTIVE': '1'}):
             with app.test_client() as client:
                 response = client.post('/programs/upload', data={
+                    'program_name': 'Demo',
                     'scope_file': (io.BytesIO(b'identifier,asset_type,in_scope\n*.example.com,WILDCARD,true\n'), 'demo-scope.csv'),
                     'guidelines_file': (io.BytesIO(b'No active testing until approved.'), 'terms.md'),
                 }, headers={'X-BugBounty-Token': 'test-token'})

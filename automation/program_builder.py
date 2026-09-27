@@ -15,6 +15,16 @@ from stages import STAGES, job_name_for
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def slug_from_program_name(name: str) -> str:
+    label = name.strip()
+    if not label or len(label) > 80 or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9 ._-]*', label):
+        raise ValueError('Enter a program name using letters, numbers, spaces, dots, dashes, or underscores')
+    slug = re.sub(r'[^a-z0-9]+', '-', label.lower()).strip('-')
+    if not slug or len(slug) > 64:
+        raise ValueError('Program name is too long')
+    return slug
+
+
 def program_slug(filename: str, rows: list[dict] | None = None) -> str:
     names = [str(row.get('program_name') or row.get('program') or '').strip() for row in rows or []]
     label = next((name for name in names if name), '') or Path(filename).stem

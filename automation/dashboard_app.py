@@ -22,7 +22,7 @@ AUTOMATION_DIR = Path(__file__).resolve().parent
 if str(AUTOMATION_DIR) not in sys.path:
   sys.path.insert(0, str(AUTOMATION_DIR))
 
-from program_builder import active_approved, create_program, parse_scope, read_guidelines, set_active_approval
+from program_builder import active_approved, create_program, parse_scope, read_guidelines, set_active_approval, slug_from_program_name
 from stages import ACTIVE_STAGES, STAGE_BY_ID, STAGES, job_name_for, stage_for_job_name
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -868,7 +868,7 @@ def about_overview():
 
         <div class="card">
           <h2>Adding a program</h2>
-          <p>Upload a HackerOne or Bugcrowd CSV, or a Markdown scope file, from New program on the dashboard. The filename or document title supplies the program name. Only explicitly in-scope domain entries become targets; unsupported assets must be reviewed manually.</p>
+          <p>Enter a unique program name and upload a HackerOne or Bugcrowd CSV, or a Markdown scope file, from New program on the dashboard. That name supplies the separate program folder and job names. Only explicitly in-scope domain entries become targets; unsupported assets must be reviewed manually.</p>
           <p>Each program gets its own scope, guidelines, and nine jobs. Passive stages queue immediately; generated active stages remain blocked until an operator reviews the guidelines and confirms the pipeline's checks are permitted. The server's active-testing opt-in is also required. Prose rules are not automatically translated into scanner limits or exclusions.</p>
         </div>
 
@@ -994,6 +994,7 @@ def index():
         .upload-area form { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
         .upload-area h2 { margin: 0 0 12px; font-size: 18px; }
         .upload-area input { max-width: 100%; }
+        .upload-area input[type=text] { background: #0f172a; color: #e5e7eb; border: 1px solid #475569; padding: 8px; }
         .upload-area textarea { width: min(100%, 600px); min-height: 90px; background: #0f172a; color: #e5e7eb; border: 1px solid #475569; }
         .upload-area button { background: #0ea5e9; color: #082f49; border: 0; padding: 8px 12px; font-weight: bold; cursor: pointer; }
         .upload-area button:disabled { opacity: .6; cursor: wait; }
@@ -1082,6 +1083,8 @@ def index():
         <section class="upload-area" id="scope-drop">
           <h2>New program</h2>
           <form id="program-upload">
+            <label for="program-name">Program name</label>
+            <input id="program-name" name="program_name" type="text" maxlength="80" required>
             <label for="scope-file">Scope file</label>
             <input id="scope-file" name="scope_file" type="file" accept=".csv,.md,text/csv,text/markdown" required>
             <label for="guidelines-file">Program guidelines</label>
@@ -1299,6 +1302,7 @@ def index():
         }
 
         const uploadForm = document.getElementById('program-upload');
+        const programName = document.getElementById('program-name');
         const scopeDrop = document.getElementById('scope-drop');
         const scopeFile = document.getElementById('scope-file');
         const guidelinesFile = document.getElementById('guidelines-file');
@@ -1318,7 +1322,7 @@ def index():
         uploadForm.addEventListener('submit', async event => {
           event.preventDefault();
           const token = getToken(false);
-          if (!token || !scopeFile.files.length) return;
+          if (!token || !programName.value.trim() || !scopeFile.files.length) return;
           if (!guidelinesFile.files.length && !guidelinesText.value.trim()) {
             uploadStatus.textContent = 'Program guidelines are required';
             return;
@@ -1551,6 +1555,10 @@ def rerun_job_endpoint(job_name: str):
 def upload_program():
     if not _authorized_for_state_change():
         return jsonify({'status': 'error', 'message': 'unauthorized'}), 401
+    try:
+        slug = slug_from_program_name(request.form.get('program_name', ''))
+    except ValueError as exc:
+        return jsonify({'status': 'error', 'message': str(exc)}), 400
     uploaded = request.files.get('scope_file')
     if not uploaded or not uploaded.filename:
         return jsonify({'status': 'error', 'message': 'A scope file is required'}), 400
@@ -1573,7 +1581,7 @@ def upload_program():
     if not guidelines.strip() or len(guidelines.encode('utf-8')) > 256 * 1024:
         return jsonify({'status': 'error', 'message': 'Program guidelines are required (max 256 KB)'}), 400
     try:
-        slug, targets = parse_scope(uploaded.filename, contents.decode('utf-8-sig'))
+        _, targets = parse_scope(uploaded.filename, contents.decode('utf-8-sig'))
         jobs = create_program(slug, targets, root=ROOT, guidelines=guidelines)
     except (UnicodeDecodeError, ValueError) as exc:
         return jsonify({'status': 'error', 'message': str(exc)}), 400
