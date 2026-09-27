@@ -9,6 +9,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -273,6 +274,10 @@ def should_run_job(job_path: Path, *, force: bool = False) -> bool:
         return True
     status = payload.get('status')
     job_state = payload.get('job_state')
+    if job_path.stem == 'confirm-live-web-assets' and status in COMPLETED_STATUSES:
+        progress_path = RESULTS_DIR / '.scan-progress' / f'{job_path.stem}.json'
+        if not progress_path.exists() and len(payload.get('targets', [])) >= MAX_HOSTS_PER_RUN:
+            return True
     # Only skip genuinely completed jobs; queued/waiting jobs should be picked up so the
     # pipeline can auto-advance once dependencies finish. Active in-flight runs are guarded
     # separately by a live lock check.
@@ -1437,7 +1442,7 @@ def _api_candidate_hosts() -> list[str]:
     return candidates
 
 
-def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: bool = False, progress=None) -> dict:
+def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: bool = False, progress=None, scan_progress: dict | None = None) -> dict:
     job_name = (job.get('name') or '').strip()
     job_type = (job.get('type', 'passive') or 'passive').lower()
     if job_type in {'github', 'repo', 'monitor'}:
@@ -1486,10 +1491,27 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             if is_in_scope(host, allowed_scope):
                 deduped_targets.append(host)
 
-        deduped_targets, _truncated = _cap_hosts(deduped_targets)
-        probe_result = _probe_live_web_assets(deduped_targets, use_external_tools=use_external_tools, progress=progress)
+        previous_progress = scan_progress or {}
+        candidate_set = set(deduped_targets)
+        processed = list(dict.fromkeys(host for host in previous_progress.get('processed_hosts', []) if host in candidate_set))
+        processed_set = set(processed)
+        remaining = [host for host in deduped_targets if host not in processed_set]
+        batch, _truncated = _cap_hosts(remaining)
+        previous_assets = {asset['domain']: asset for asset in previous_progress.get('assets', [])
+                           if isinstance(asset, dict) and asset.get('domain') in candidate_set}
+
+        def report_progress(snapshot: dict) -> None:
+            if progress is None:
+                return
+            partial_assets = dict(previous_assets)
+            partial_assets.update({asset['domain']: asset for asset in snapshot.get('assets', []) if isinstance(asset, dict) and asset.get('domain')})
+            progress({**snapshot, 'targets': batch, 'assets': list(partial_assets.values()),
+                      'discovered': sorted(partial_assets), 'total_candidates': len(deduped_targets),
+                      'processed_count': len(processed), 'remaining_count': len(remaining)})
+
+        probe_result = _probe_live_web_assets(batch, use_external_tools=use_external_tools, progress=report_progress)
         live_assets = probe_result.get('assets', probe_result.get('discovered', [])) if isinstance(probe_result, dict) else probe_result
-        deduped = {}
+        deduped = dict(previous_assets)
         for asset in live_assets:
             domain = asset['domain']
             existing = deduped.setdefault(domain, {
@@ -1500,21 +1522,28 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
                 'source_count': 1,
                 'evidence': [],
             })
-            existing['evidence'] += asset['evidence']
+            existing['evidence'] = asset['evidence']
             existing['sources'] = list(dict.fromkeys(existing['sources'] + asset['sources']))
             existing['source_count'] = len(existing['sources'])
         ordered_assets = [deduped[host] for host in sorted(deduped)]
+        processed.extend(batch)
+        incomplete = len(processed) < len(deduped_targets)
         response = {
             'job': job_name,
             'program': job.get('program', DEFAULT_PROGRAM),
             'type': 'active',
-            'targets': deduped_targets,
-            'queued': deduped_targets,
-            'skipped': [host for host in sorted(set(merged_candidates)) if host and host not in deduped_targets],
-            'status': 'ok' if ordered_assets else 'no_new_assets',
+            'targets': batch,
+            'queued': batch,
+            'skipped': [host for host in sorted(set(merged_candidates)) if host and host not in candidate_set],
+            'status': 'queued' if incomplete else ('ok' if ordered_assets else 'no_new_assets'),
+            'job_state': 'queued' if incomplete else 'completed',
             'discovered': sorted(deduped),
             'assets': ordered_assets,
             'source_count': sum(len(asset.get('sources', [])) for asset in ordered_assets),
+            'total_candidates': len(deduped_targets),
+            'processed_count': len(processed),
+            'remaining_count': len(deduped_targets) - len(processed),
+            'processed_hosts': processed,
             'depends_on': ['aa-passive-discovery', 'american-airlines-passive-dns'],
         }
         if isinstance(probe_result, dict):
@@ -1896,6 +1925,21 @@ def main() -> None:
         lock_path = RUNNING_DIR / f'{job_path.stem}.lock'
         lock_path.write_text(str(os.getpid()), encoding='utf-8')
         out_path = RESULTS_DIR / f"{job_path.stem}.json"
+        progress_path = RESULTS_DIR / '.scan-progress' / f'{job_path.stem}.json'
+        scan_progress: dict = {}
+        if job.get('name') == 'confirm-live-web-assets':
+            try:
+                scan_progress = json.loads(progress_path.read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                try:
+                    old_result = json.loads(out_path.read_text(encoding='utf-8'))
+                except (OSError, ValueError):
+                    old_result = {}
+                if old_result.get('status') in COMPLETED_STATUSES:
+                    scan_progress = {'processed_hosts': old_result.get('processed_hosts', old_result.get('targets', [])),
+                                     'assets': old_result.get('assets', [])}
+            if args.force and scan_progress.get('completed'):
+                scan_progress = {}
         progress_lock = threading.Lock()
         running_payload = {
             'job': job.get('name'),
@@ -1914,6 +1958,13 @@ def main() -> None:
             'thread_status': [],
             'probe_threads': 0,
         }
+        if job.get('name') == 'confirm-live-web-assets':
+            running_payload.update({
+                'assets': scan_progress.get('assets', []),
+                'discovered': sorted(asset['domain'] for asset in scan_progress.get('assets', []) if isinstance(asset, dict) and asset.get('domain')),
+                'processed_count': len(scan_progress.get('processed_hosts', [])),
+                'processed_hosts': scan_progress.get('processed_hosts', []),
+            })
         _atomic_write_json(out_path, running_payload)
 
         def checkpoint(snapshot: dict) -> None:
@@ -1930,12 +1981,14 @@ def main() -> None:
                 'thread_status': _cap_log(snapshot.get('thread_status', []) or []),
                 'probe_threads': snapshot.get('threads', 0),
             })
+            if job.get('name') == 'confirm-live-web-assets':
+                payload.update({key: snapshot[key] for key in ('total_candidates', 'processed_count', 'remaining_count') if key in snapshot})
             with progress_lock:
                 _atomic_write_json(out_path, payload)
 
         try:
             allowed_scope = read_scope_file(job.get('program', DEFAULT_PROGRAM))
-            result = run_passive_job(job, allowed_scope, use_external_tools=args.external_probes, progress=checkpoint)
+            result = run_passive_job(job, allowed_scope, use_external_tools=args.external_probes, progress=checkpoint, scan_progress=scan_progress)
             if not RESULTS_DIR.exists():
                 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
             previous = None
@@ -1948,6 +2001,12 @@ def main() -> None:
             # carry stale targets forward. Passive discovery still accumulates across runs.
             merged_result = _result_for_write(job.get('name'), previous, result)
             _atomic_write_json(out_path, merged_result)
+            if job.get('name') == 'confirm-live-web-assets' and 'processed_hosts' in merged_result:
+                _atomic_write_json(progress_path, {
+                    'processed_hosts': merged_result['processed_hosts'],
+                    'assets': merged_result['assets'],
+                    'completed': merged_result.get('job_state') == 'completed',
+                })
             all_results.append(merged_result)
         finally:
             if lock_path.exists():

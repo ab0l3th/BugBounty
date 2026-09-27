@@ -1043,7 +1043,7 @@ def index():
                     <div class="job-header">
                       <div class="job-title-wrap">
                         <h3 class="job-name">{{ job_title_label(job.name) }}</h3>
-                        <div class="job-summary"><strong>Targets:</strong> {{ job.targets|length }} &nbsp; <strong>Discovered:</strong> {{ job.discovered|length }} &nbsp; <strong>Status:</strong> {{ job.job_state }}</div>
+                        <div class="job-summary"><strong>Targets:</strong> {{ job.targets|length }} &nbsp; <strong>Discovered:</strong> {{ job.discovered|length }}{% if job.raw.total_candidates is defined %} &nbsp; <strong>Checked:</strong> {{ job.raw.processed_count or 0 }} / {{ job.raw.total_candidates }}{% endif %} &nbsp; <strong>Status:</strong> {{ job.job_state }}</div>
                       </div>
                       <div class="status {{ 'ok' if job.job_state == 'completed' else 'warn' if job.job_state == 'running' else 'bad' }}">{{ job.job_state }}</div>
                     </div>
@@ -1057,6 +1057,7 @@ def index():
                     <p><strong>Pipeline status:</strong> {{ job.status }}</p>
                     <p><strong>Source count:</strong> {{ job.source_count }}</p>
                     <p><strong>Targets:</strong> {{ job.targets|length }}</p>
+                    {% if job.raw.total_candidates is defined %}<p><strong>Coverage:</strong> {{ job.raw.processed_count or 0 }} / {{ job.raw.total_candidates }} hosts checked, {{ job.raw.remaining_count or 0 }} remaining</p>{% endif %}
                     <p><strong>Discovered:</strong> {{ job.discovered|length }}</p>
 
                     {% set probe_log = (job.raw.probe_log if job.raw else []) %}

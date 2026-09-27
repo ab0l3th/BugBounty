@@ -712,6 +712,139 @@ class DashboardJobMetadataTest(unittest.TestCase):
         (root / 'aa-passive-discovery.json').unlink(missing_ok=True)
         (root / 'american-airlines-passive-dns.json').unlink(missing_ok=True)
 
+    def test_confirm_live_web_assets_advances_batches_and_keeps_discoveries(self):
+        import json
+        from tempfile import TemporaryDirectory
+        from worker import run_passive_job
+
+        with TemporaryDirectory() as directory, patch('worker.RESULTS_DIR', Path(directory)), \
+             patch('worker.MAX_HOSTS_PER_RUN', 2):
+            root = Path(directory)
+            (root / 'aa-passive-discovery.json').write_text(json.dumps({
+                'discovered': [f'h{number}.example.com' for number in range(5)], 'targets': [],
+            }), encoding='utf-8')
+            (root / 'american-airlines-passive-dns.json').write_text(json.dumps({'discovered': [], 'targets': []}), encoding='utf-8')
+            batches = []
+
+            def fake_probe(hosts, **kwargs):
+                batches.append(list(hosts))
+                assets = [{'domain': host, 'status': 'live', 'sources': ['http-probe'],
+                           'evidence': [{'source': 'http-probe', 'url': f'https://{host}'}]}
+                          for host in hosts if host == 'h0.example.com']
+                return {'assets': assets, 'discovered': [asset['domain'] for asset in assets]}
+
+            progress = {}
+            with patch('worker._probe_live_web_assets', side_effect=fake_probe):
+                for expected_processed in (2, 4, 5):
+                    result = run_passive_job({'name': 'confirm-live-web-assets', 'program': 'american-airlines'},
+                                             ['*.example.com'], scan_progress=progress)
+                    self.assertEqual(len(result['processed_hosts']), expected_processed)
+                    self.assertEqual(result['discovered'], ['h0.example.com'])
+                    self.assertEqual(result['status'] == 'ok', expected_processed == 5)
+                    progress = {'processed_hosts': result['processed_hosts'], 'assets': result['assets']}
+            self.assertEqual(batches, [
+                ['h0.example.com', 'h1.example.com'],
+                ['h2.example.com', 'h3.example.com'],
+                ['h4.example.com'],
+            ])
+
+    def test_confirm_live_progress_survives_queued_result_overwrite(self):
+        import io
+        import json
+        from contextlib import redirect_stdout
+        from tempfile import TemporaryDirectory
+        import worker
+
+        with TemporaryDirectory() as directory, \
+             patch.object(worker, 'RESULTS_DIR', Path(directory)), \
+             patch.object(worker, 'RUNNING_DIR', Path(directory) / '.running'), \
+             patch.object(worker, 'MAX_HOSTS_PER_RUN', 2), \
+             patch.object(worker, 'discover_jobs', return_value=[Path('confirm-live-web-assets.yaml')]), \
+             patch.object(worker, 'load_job', return_value={'name': 'confirm-live-web-assets', 'program': 'american-airlines', 'type': 'active'}), \
+             patch.object(worker, 'read_scope_file', return_value=['*.example.com']), \
+             patch('sys.argv', ['worker.py', '--allow-active']), \
+             patch.object(worker, '_probe_live_web_assets') as probe:
+            root = Path(directory)
+            (root / 'aa-passive-discovery.json').write_text(json.dumps({'status': 'ok', 'discovered': [f'h{number}.example.com' for number in range(5)]}), encoding='utf-8')
+            (root / 'american-airlines-passive-dns.json').write_text(json.dumps({'status': 'ok', 'discovered': []}), encoding='utf-8')
+            probe.side_effect = lambda hosts, **kwargs: {'assets': [
+                {'domain': host, 'sources': ['http-probe'], 'evidence': []} for host in hosts
+            ]}
+            out_path = root / 'confirm-live-web-assets.json'
+            for expected in (2, 4, 5):
+                if expected == 4:
+                    sys.argv.append('--force')
+                with redirect_stdout(io.StringIO()):
+                    worker.main()
+                if expected == 4:
+                    sys.argv.remove('--force')
+                payload = json.loads(out_path.read_text(encoding='utf-8'))
+                self.assertEqual(payload['processed_count'], expected)
+                self.assertEqual(payload['job_state'], 'completed' if expected == 5 else 'queued')
+                self.assertEqual(len(payload['assets']), expected)
+                if expected == 2:
+                    out_path.write_text(json.dumps({'status': 'queued', 'job_state': 'queued'}), encoding='utf-8')
+            self.assertEqual([call.args[0] for call in probe.call_args_list], [
+                ['h0.example.com', 'h1.example.com'],
+                ['h2.example.com', 'h3.example.com'],
+                ['h4.example.com'],
+            ])
+
+    def test_legacy_capped_confirm_result_is_eligible_for_continuation(self):
+        import json
+        from tempfile import TemporaryDirectory
+        from worker import should_run_job
+
+        with TemporaryDirectory() as directory, patch('worker.RESULTS_DIR', Path(directory)), \
+             patch('worker.MAX_HOSTS_PER_RUN', 2):
+            result_path = Path(directory) / 'confirm-live-web-assets.json'
+            result_path.write_text(json.dumps({'status': 'ok', 'targets': ['a.example.com', 'b.example.com']}), encoding='utf-8')
+            self.assertTrue(should_run_job(Path('confirm-live-web-assets.yaml')))
+
+    def test_legacy_confirm_result_resumes_at_next_batch(self):
+        import io
+        import json
+        from contextlib import redirect_stdout
+        from tempfile import TemporaryDirectory
+        import worker
+
+        with TemporaryDirectory() as directory, \
+             patch.object(worker, 'RESULTS_DIR', Path(directory)), \
+             patch.object(worker, 'RUNNING_DIR', Path(directory) / '.running'), \
+             patch.object(worker, 'MAX_HOSTS_PER_RUN', 2), \
+             patch.object(worker, 'discover_jobs', return_value=[Path('confirm-live-web-assets.yaml')]), \
+             patch.object(worker, 'load_job', return_value={'name': 'confirm-live-web-assets', 'program': 'american-airlines', 'type': 'active'}), \
+             patch.object(worker, 'read_scope_file', return_value=['*.example.com']), \
+             patch('sys.argv', ['worker.py', '--allow-active']), \
+             patch.object(worker, '_probe_live_web_assets', return_value={'assets': []}) as probe:
+            root = Path(directory)
+            (root / 'aa-passive-discovery.json').write_text(json.dumps({
+                'status': 'ok', 'discovered': [f'h{number}.example.com' for number in range(5)],
+            }), encoding='utf-8')
+            (root / 'american-airlines-passive-dns.json').write_text(json.dumps({'status': 'ok', 'discovered': []}), encoding='utf-8')
+            (root / 'confirm-live-web-assets.json').write_text(json.dumps({
+                'status': 'ok', 'targets': ['h0.example.com', 'h1.example.com'],
+                'assets': [{'domain': 'h0.example.com', 'sources': ['http-probe'], 'evidence': []}],
+            }), encoding='utf-8')
+            with redirect_stdout(io.StringIO()):
+                worker.main()
+            self.assertEqual(probe.call_args.args[0], ['h2.example.com', 'h3.example.com'])
+            payload = json.loads((root / 'confirm-live-web-assets.json').read_text(encoding='utf-8'))
+            self.assertEqual(payload['processed_count'], 4)
+            self.assertEqual(payload['discovered'], ['h0.example.com'])
+            self.assertEqual(payload['job_state'], 'queued')
+
+    def test_dashboard_shows_total_confirm_coverage(self):
+        job = {'name': 'confirm-live-web-assets', 'program': 'american-airlines',
+               'job_state': 'queued', 'status': 'queued', 'type': 'active',
+               'targets': ['a.example.com', 'b.example.com'], 'queued': [], 'skipped': [],
+               'discovered': [], 'assets': [], 'source_count': 0,
+               'raw': {'total_candidates': 5, 'processed_count': 2, 'remaining_count': 3}}
+        with patch('dashboard_app.list_jobs', return_value=[job]):
+            body = app.test_client().get('/').get_data(as_text=True)
+        self.assertIn('Checked:</strong> 2 / 5', body)
+        self.assertIn('2 / 5 hosts checked, 3 remaining', body)
+
     def test_dashboard_reports_dependency_wait_as_waiting_state(self):
         result_path = ROOT / 'results' / 'confirm-live-web-assets.json'
         result_path.parent.mkdir(parents=True, exist_ok=True)
