@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import functools
 import hashlib
 import hmac
@@ -20,6 +21,8 @@ ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = ROOT / 'results'
 RUNNING_DIR = RESULTS_DIR / '.running'
 JOBS_DIR = ROOT / 'jobs'
+REVIEW_FILE = RESULTS_DIR / '.finding-reviews.json'
+REVIEW_LOCK = RESULTS_DIR / '.finding-reviews.lock'
 
 app = Flask(__name__)
 
@@ -179,6 +182,114 @@ def highest_severity(findings: List[Dict[str, Any]] | None) -> str | None:
             best_rank = rank
             best = sev
     return best.capitalize() if best else None
+
+
+def review_candidates(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    candidates = []
+    seen: set[str] = set()
+    for job in jobs:
+        for asset in job.get('assets', []) or []:
+            if not isinstance(asset, dict) or not asset.get('domain'):
+                continue
+            for finding in asset.get('findings', []) or []:
+                if not isinstance(finding, dict) or not finding.get('type'):
+                    continue
+                evidence = {key: finding[key] for key in ('type', 'path', 'ip', 'port', 'service', 'severity') if key in finding}
+                identity = json.dumps([job['name'], asset['domain'], evidence], sort_keys=True)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                finding_type = finding['type']
+                candidates.append({
+                    'id': hashlib.sha256(identity.encode('utf-8')).hexdigest(),
+                    'job': job['name'],
+                    'host': asset['domain'],
+                    'evidence': evidence,
+                    'confidence': 'medium' if finding_type in {'error_disclosure', 'graphql_introspection'} else 'low',
+                    'scope': 'needs verification',
+                })
+    return candidates
+
+
+def read_reviews() -> Dict[str, Any]:
+    try:
+        payload = json.loads(REVIEW_FILE.read_text(encoding='utf-8'))
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_reviews(reviews: Dict[str, Any]) -> None:
+    REVIEW_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = REVIEW_FILE.with_name(f'.{REVIEW_FILE.name}.{os.getpid()}.tmp')
+    temporary.write_text(json.dumps(reviews, indent=2), encoding='utf-8')
+    temporary.replace(REVIEW_FILE)
+
+
+@app.route('/review')
+def review_queue():
+    reviews = read_reviews()
+    candidates = review_candidates(list_jobs())
+    for candidate in candidates:
+        decision = reviews.get(candidate['id'], {})
+        candidate['decision'] = decision.get('status', 'needs_review')
+        candidate['scope'] = decision.get('scope', 'needs_verification')
+    candidates.sort(key=lambda item: (item['decision'] != 'needs_review', item['job'], item['host']))
+    return render_template_string('''<!doctype html>
+  <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Finding Review</title><style>
+  body { background:#111827; color:#e5e7eb; font-family:Arial,sans-serif; margin:0; padding:24px; }
+  main { max-width:1200px; margin:auto; } a { color:#7dd3fc; }
+  table { width:100%; border-collapse:collapse; } th,td { text-align:left; vertical-align:top; border-bottom:1px solid #334155; padding:10px; }
+  select,button { background:#1f2937; color:#e5e7eb; border:1px solid #475569; padding:7px; }
+  code { overflow-wrap:anywhere; } .meta { color:#94a3b8; } .row { display:flex; flex-wrap:wrap; gap:6px; }
+  @media(max-width:700px) { table,tbody,tr,td { display:block; } thead { display:none; } tr { padding:10px 0; } td { border:0; padding:4px; } }
+  </style></head><body><main><p><a href="/">← Dashboard</a></p><h1>Finding review</h1>
+  <p class="meta">Scanner signals need manual verification. Confidence is a triage estimate, not a confirmed vulnerability rating. Scope must be checked against program rules.</p>
+  <table><thead><tr><th>Asset / job</th><th>Observed evidence</th><th>Confidence</th><th>Scope</th><th>Review</th></tr></thead><tbody>
+  {% for item in candidates %}<tr><td><code>{{ item.host }}</code><br><small>{{ item.job }}</small></td>
+  <td><strong>{{ item.evidence.type }}</strong><br>{% for key, value in item.evidence.items() if key != 'type' %}<small>{{ key }}: {{ value }}</small><br>{% endfor %}</td>
+  <td>{{ item.confidence }}</td><td><select class="scope" aria-label="Scope for {{ item.host }}">
+  {% for value, label in [('needs_verification', 'Needs verification'), ('in_scope', 'In scope'), ('out_of_scope', 'Out of scope')] %}
+  <option value="{{ value }}" {% if item.scope == value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></td>
+  <td><div class="row"><select class="decision" aria-label="Review status for {{ item.host }}">
+  {% for value, label in [('needs_review', 'Needs review'), ('needs_account', 'Needs account'), ('confirmed', 'Confirmed'), ('false_positive', 'False positive')] %}
+  <option value="{{ value }}" {% if item.decision == value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select>
+  <button type="button" data-id="{{ item.id }}">Save</button></div></td></tr>
+  {% else %}<tr><td colspan="5">No scanner findings to review.</td></tr>{% endfor %}
+  </tbody></table></main><script>
+  document.querySelectorAll('button[data-id]').forEach(button => button.addEventListener('click', async () => {
+    const row = button.closest('tr');
+    const token = localStorage.getItem('bugbounty-dashboard-token') || window.prompt('Dashboard token:');
+    if (!token) return;
+    localStorage.setItem('bugbounty-dashboard-token', token);
+    button.disabled = true;
+    try {
+    const response = await fetch('/review/' + button.dataset.id, {method:'POST', headers:{'Content-Type':'application/json', 'X-BugBounty-Token':token},
+      body:JSON.stringify({status:row.querySelector('.decision').value, scope:row.querySelector('.scope').value})});
+    if (!response.ok) { alert('Review was not saved (' + response.status + ')'); return; }
+    button.textContent = 'Saved';
+    } catch (error) { alert('Review was not saved'); } finally { button.disabled = false; }
+  }));
+  </script></body></html>''', candidates=candidates)
+
+
+@app.route('/review/<finding_id>', methods=['POST'])
+def update_review(finding_id: str):
+    if not _authorized_for_state_change():
+        return jsonify({'status': 'error', 'message': 'unauthorized'}), 401
+    data = request.get_json(silent=True) or {}
+    if data.get('status') not in {'needs_review', 'needs_account', 'confirmed', 'false_positive'} or data.get('scope') not in {'needs_verification', 'in_scope', 'out_of_scope'}:
+        return jsonify({'status': 'error', 'message': 'invalid decision'}), 400
+    if finding_id not in {item['id'] for item in review_candidates(list_jobs())}:
+        return jsonify({'status': 'error', 'message': 'finding not found'}), 404
+    REVIEW_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with REVIEW_LOCK.open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        reviews = read_reviews()
+        reviews[finding_id] = {'status': data['status'], 'scope': data['scope'], 'reviewed_at': int(time.time())}
+        write_reviews(reviews)
+    return jsonify(reviews[finding_id])
 
 
 def program_label(value: str) -> str:
@@ -851,6 +962,7 @@ def index():
           <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
             <h1 style="margin:0;">BugBounty Dashboard</h1>
             <a href="/about" style="color:#7dd3fc; text-decoration:none; background:#1f2937; border:1px solid #334155; border-radius:8px; padding:7px 10px; font-size:14px;">About</a>
+            <a href="/review" style="color:#7dd3fc; text-decoration:none; background:#1f2937; border:1px solid #334155; border-radius:8px; padding:7px 10px; font-size:14px;">Finding review</a>
           </div>
           <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; background:#1f2937; border:1px solid #334155; border-radius:10px; padding:8px 12px;">
             <label for="refresh-interval" style="font-size:14px; color:#cbd5e1;">Auto refresh</label>
@@ -964,7 +1076,7 @@ def index():
                           <th align="left">Service</th>
                           <th align="left">Ports</th>
                           <th align="left">Status</th>
-                          <th align="left">Highest Rated Vuln</th>
+                          <th align="left">Scanner severity</th>
                         </tr>
                       </thead>
                       <tbody>

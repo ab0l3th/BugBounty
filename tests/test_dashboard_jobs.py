@@ -876,6 +876,38 @@ class DashboardJobMetadataTest(unittest.TestCase):
                 self.assertEqual(response.status_code, 401)
                 mock_popen.assert_not_called()
 
+    def test_finding_review_survives_rescan_and_requires_auth(self):
+        from tempfile import TemporaryDirectory
+        from dashboard_app import review_candidates
+
+        jobs = [{'name': 'port-scan-live-hosts', 'assets': [{
+            'domain': 'host.example.com',
+            'findings': [{'type': 'open_port', 'ip': '203.0.113.4', 'port': 6379,
+                          'service': 'redis', 'severity': 'critical', 'detail': 'private evidence'}],
+        }]}]
+        finding_id = review_candidates(jobs)[0]['id']
+        with TemporaryDirectory() as directory, \
+             patch('dashboard_app.REVIEW_FILE', Path(directory) / 'reviews.json'), \
+             patch('dashboard_app.REVIEW_LOCK', Path(directory) / 'reviews.lock'), \
+             patch('dashboard_app.list_jobs', return_value=jobs), \
+             patch.dict('os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token'}):
+            with app.test_client() as client:
+                page = client.get('/review')
+                self.assertEqual(page.status_code, 200)
+                self.assertIn(b'host.example.com', page.data)
+                self.assertNotIn(b'private evidence', page.data)
+                endpoint = f'/review/{finding_id}'
+                decision = {'status': 'needs_account', 'scope': 'needs_verification'}
+                self.assertEqual(client.post(endpoint, json=decision).status_code, 401)
+                headers = {'X-BugBounty-Token': 'test-token'}
+                self.assertEqual(client.post(endpoint, json={'status': 'confirmed', 'scope': 'invalid'}, headers=headers).status_code, 400)
+                self.assertEqual(client.post('/review/' + '0' * 64, json=decision, headers=headers).status_code, 404)
+                self.assertEqual(client.post(endpoint, json=decision, headers=headers).status_code, 200)
+                self.assertIn(b'value="needs_account" selected', client.get('/review').data)
+                self.assertEqual(client.post(endpoint, json={'status': 'false_positive', 'scope': 'in_scope'}, headers=headers).status_code, 200)
+                self.assertIn(b'value="false_positive" selected', client.get('/review').data)
+                self.assertIn(b'value="in_scope" selected', client.get('/review').data)
+
     def test_rerun_launches_only_the_requested_job(self):
         with patch('dashboard_app.subprocess.Popen', return_value=type('Proc', (), {'pid': 4321})()) as mock_popen, \
              patch.dict('os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token'}):
