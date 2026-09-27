@@ -17,6 +17,11 @@ from typing import Any, Dict, List
 from urllib.parse import quote
 
 from flask import Flask, jsonify, render_template_string, request
+
+AUTOMATION_DIR = Path(__file__).resolve().parent
+if str(AUTOMATION_DIR) not in sys.path:
+  sys.path.insert(0, str(AUTOMATION_DIR))
+
 from program_builder import create_program, parse_scope
 from stages import ACTIVE_STAGES, STAGE_BY_ID, STAGES, job_name_for, stage_for_job_name
 

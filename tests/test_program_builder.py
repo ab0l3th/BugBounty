@@ -6,6 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 import json
+import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / 'automation') not in sys.path:
@@ -19,6 +20,10 @@ from dashboard_app import app, group_jobs_by_program, job_workflow_metadata, lis
 
 
 class ProgramBuilderTest(unittest.TestCase):
+    def test_dashboard_imports_as_gunicorn_package(self):
+        subprocess.run([sys.executable, '-c', 'from automation.dashboard_app import app'],
+                       cwd=ROOT, check=True, capture_output=True)
+
     def test_hackerone_csv_filters_out_of_scope_and_unsupported_assets(self):
         slug, targets = parse_scope('hackerone-demo-scope.csv',
             'identifier,asset_type,eligible_for_bounty\n'
