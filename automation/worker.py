@@ -19,6 +19,8 @@ from urllib import request as urllib_request
 from urllib.parse import urlsplit
 
 from scope_validator import is_in_scope, parse_scope_pattern
+from stages import ACTIVE_STAGES, LEGACY_NAME_TO_STAGE, STAGE_BY_ID, job_name_for, stage_for_job_name
+from program_builder import parse_scope
 
 ROOT = Path(__file__).resolve().parent.parent
 JOBS_DIR = ROOT / 'jobs'
@@ -101,27 +103,43 @@ def _drain_futures(futures, log: list | None = None) -> None:
 
 
 def job_workflow_dependencies(job_name: str) -> list[str]:
-    return list(WORKFLOW_SEQUENCE.get(job_name, {}).get('depends_on', []))
+    if job_name in WORKFLOW_SEQUENCE:
+        return list(WORKFLOW_SEQUENCE[job_name]['depends_on'])
+    stage = stage_for_job_name(job_name)
+    if stage and job_name.endswith('-' + stage):
+        program = job_name[:-(len(stage) + 1)]
+        return [job_name_for(program, dependency) for dependency in STAGE_BY_ID[stage]['depends_on']]
+    return []
+
+
+def result_name_for(program: str, stage: str) -> str:
+    if program == DEFAULT_PROGRAM:
+        for name, stage_id in LEGACY_NAME_TO_STAGE.items():
+            if stage_id == stage:
+                return name
+    return job_name_for(program, stage)
+
+
+def result_path_for(program: str, stage: str) -> Path:
+    return RESULTS_DIR / f'{result_name_for(program, stage)}.json'
 
 
 def read_scope_file(program_name: str = DEFAULT_PROGRAM) -> list[str]:
     scope_file = ROOT / 'programs' / program_name / 'scope.md'
-    patterns: list[str] = []
-    if scope_file.exists():
-        for line in scope_file.read_text(encoding='utf-8').splitlines():
-            value = line.strip()
-            if value.startswith('- '):
-                pattern = parse_scope_pattern(value[2:].strip())
-                if pattern:
-                    patterns.append(pattern)
-    return patterns
+    if not scope_file.exists():
+        return []
+    try:
+        return parse_scope(f'{program_name}.md', scope_file.read_text(encoding='utf-8'))[1]
+    except ValueError:
+        return []
 
 
 def discover_jobs() -> list[Path]:
     if not JOBS_DIR.exists():
         return []
     job_paths = list(JOBS_DIR.glob('*.yaml')) + list(JOBS_DIR.glob('*.yml'))
-    return sorted(job_paths, key=lambda path: (WORKFLOW_SEQUENCE.get(path.stem, {'step': 99})['step'], path.name))
+    job_paths += list((JOBS_DIR / 'generated').glob('*.yaml'))
+    return sorted(job_paths, key=lambda path: (STAGE_BY_ID.get(stage_for_job_name(path.stem) or '', {}).get('step', 99), path.name))
 
 
 def load_job(path: Path) -> dict:
@@ -134,6 +152,8 @@ def load_job(path: Path) -> dict:
             data['name'] = clean.split(':', 1)[1].strip()
         elif clean.startswith('program:'):
             data['program'] = clean.split(':', 1)[1].strip()
+        elif clean.startswith('stage:'):
+            data['stage'] = clean.split(':', 1)[1].strip()
         elif clean.startswith('type:'):
             data['type'] = clean.split(':', 1)[1].strip()
         elif clean.startswith('order:'):
@@ -155,6 +175,7 @@ def load_job(path: Path) -> dict:
             data['targets'].append(clean[2:].strip().strip("'\""))
     if not data.get('depends_on'):
         data['depends_on'] = job_workflow_dependencies(data['name'])
+    data['stage'] = data.get('stage') or stage_for_job_name(data['name'])
     return data
 
 
@@ -214,7 +235,7 @@ def merge_result_payloads(previous: dict | None, current: dict) -> dict:
 
 def _result_for_write(job_name: str | None, previous: dict | None, current: dict) -> dict:
     """Active steps replace prior results; passive discovery accumulates across runs."""
-    if job_name in ACTIVE_JOBS:
+    if stage_for_job_name(job_name or '') in ACTIVE_STAGES:
         return current
     return merge_result_payloads(previous, current)
 
@@ -274,7 +295,7 @@ def should_run_job(job_path: Path, *, force: bool = False) -> bool:
         return True
     status = payload.get('status')
     job_state = payload.get('job_state')
-    if job_path.stem == 'confirm-live-web-assets' and status in COMPLETED_STATUSES:
+    if stage_for_job_name(job_path.stem) == 'confirm-live-web-assets' and status in COMPLETED_STATUSES:
         progress_path = RESULTS_DIR / '.scan-progress' / f'{job_path.stem}.json'
         if not progress_path.exists() and len(payload.get('targets', [])) >= MAX_HOSTS_PER_RUN:
             return True
@@ -1022,7 +1043,7 @@ def _write_finding_report(job_name: str, host: str, findings: list[dict]) -> str
     return f'/reports/{job_name}/{host}'
 
 
-def _application_security_tests(hosts: list[str], *, use_external_tools: bool = False, progress=None) -> dict:
+def _application_security_tests(hosts: list[str], *, use_external_tools: bool = False, progress=None, report_job_name: str = 'application-security-testing') -> dict:
     deduped_hosts = sorted(set(hosts))
     assets: list[dict] = []
     probe_log: list[dict] = []
@@ -1092,7 +1113,7 @@ def _application_security_tests(hosts: list[str], *, use_external_tools: bool = 
             'source_count': len(findings),
             'evidence': [{'source': 'app-test', 'url': url, 'detail': f.get('type')} for f in findings],
         }
-        report_url = _write_finding_report('application-security-testing', host, findings)
+        report_url = _write_finding_report(report_job_name, host, findings)
         if report_url:
             record['report_url'] = report_url
         assets.append(record)
@@ -1404,11 +1425,11 @@ def _hosts_from_result(payload: dict) -> list[str]:
     return [h for h in hosts if isinstance(h, str) and h.strip()]
 
 
-def _combined_live_hosts() -> list[str]:
+def _combined_live_hosts(program: str = DEFAULT_PROGRAM) -> list[str]:
     merged: list[str] = []
     seen: set[str] = set()
-    for name in ('service-enumeration-live-hosts', 'vhost-discovery-shared-infra'):
-        for host in _hosts_from_result(_load_result(name)):
+    for stage in ('service-enumeration', 'vhost-discovery'):
+        for host in _hosts_from_result(_load_result(result_name_for(program, stage))):
             if host not in seen:
                 seen.add(host)
                 merged.append(host)
@@ -1418,19 +1439,19 @@ def _combined_live_hosts() -> list[str]:
 _API_PATH_HINTS = ('/api', '/swagger', '/graphql', '/openapi', '/v2/api-docs', '/v3/api-docs', '/actuator')
 
 
-def _api_candidate_hosts() -> list[str]:
+def _api_candidate_hosts(program: str = DEFAULT_PROGRAM) -> list[str]:
     """API hosts: step 4 api-gateway classifications plus step 6 hosts exposing API-ish paths."""
     candidates: list[str] = []
     seen: set[str] = set()
 
-    for asset in _load_result('service-enumeration-live-hosts').get('assets', []) or []:
+    for asset in _load_result(result_name_for(program, 'service-enumeration')).get('assets', []) or []:
         if isinstance(asset, dict) and asset.get('kind') == 'api-gateway' and asset.get('domain'):
             host = asset['domain']
             if host not in seen:
                 seen.add(host)
                 candidates.append(host)
 
-    for asset in _load_result('directory-enumeration-live-hosts').get('assets', []) or []:
+    for asset in _load_result(result_name_for(program, 'directory-enumeration')).get('assets', []) or []:
         if not isinstance(asset, dict) or not asset.get('domain'):
             continue
         paths = [p.get('path', '') for p in (asset.get('paths', []) or []) if isinstance(p, dict)]
@@ -1444,16 +1465,18 @@ def _api_candidate_hosts() -> list[str]:
 
 def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: bool = False, progress=None, scan_progress: dict | None = None) -> dict:
     job_name = (job.get('name') or '').strip()
+    program = job.get('program', DEFAULT_PROGRAM)
+    stage = job.get('stage') or stage_for_job_name(job_name)
     job_type = (job.get('type', 'passive') or 'passive').lower()
     if job_type in {'github', 'repo', 'monitor'}:
         from github_monitor import github_activity
         repo = (job.get('targets') or [job.get('name', 'ab0l3th/BugBounty')])[0]
         return github_activity(repo)
 
-    if job_name == 'confirm-live-web-assets':
+    if stage == 'confirm-live-web-assets':
         required_paths = [
-            RESULTS_DIR / 'aa-passive-discovery.json',
-            RESULTS_DIR / 'american-airlines-passive-dns.json',
+            result_path_for(program, 'passive-web-discovery'),
+            result_path_for(program, 'passive-dns-discovery'),
         ]
         if any(not path.exists() for path in required_paths):
             return {
@@ -1468,7 +1491,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
                 'discovered': [],
                 'assets': [],
                 'source_count': 0,
-                'dependencies': ['aa-passive-discovery', 'american-airlines-passive-dns'],
+                'dependencies': job_workflow_dependencies(job_name),
             }
 
         merged_candidates: list[str] = []
@@ -1544,7 +1567,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             'processed_count': len(processed),
             'remaining_count': len(deduped_targets) - len(processed),
             'processed_hosts': processed,
-            'depends_on': ['aa-passive-discovery', 'american-airlines-passive-dns'],
+            'depends_on': job_workflow_dependencies(job_name),
         }
         if isinstance(probe_result, dict):
             response['probe_log'] = probe_result.get('probe_log', [])
@@ -1552,8 +1575,8 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             response['probe_threads'] = probe_result.get('threads', 0)
         return response
 
-    if job_name == 'service-enumeration-live-hosts':
-        live_assets_path = RESULTS_DIR / 'confirm-live-web-assets.json'
+    if stage == 'service-enumeration':
+        live_assets_path = result_path_for(program, 'confirm-live-web-assets')
         if not live_assets_path.exists():
             return {
                 'job': job_name,
@@ -1567,7 +1590,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
                 'discovered': [],
                 'assets': [],
                 'source_count': 0,
-                'dependencies': ['confirm-live-web-assets'],
+                'dependencies': job_workflow_dependencies(job_name),
             }
 
         try:
@@ -1592,15 +1615,15 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             'discovered': [row.get('domain') for row in assets],
             'assets': assets,
             'source_count': sum(len(asset.get('ports', [])) for asset in assets),
-            'depends_on': ['confirm-live-web-assets'],
+            'depends_on': job_workflow_dependencies(job_name),
         }
         response['probe_log'] = enum_result.get('probe_log', [])
         response['thread_status'] = enum_result.get('thread_status', [])
         response['probe_threads'] = enum_result.get('threads', 0)
         return response
 
-    if job_name == 'vhost-discovery-shared-infra':
-        service_path = RESULTS_DIR / 'service-enumeration-live-hosts.json'
+    if stage == 'vhost-discovery':
+        service_path = result_path_for(program, 'service-enumeration')
         if not service_path.exists():
             return {
                 'job': job_name,
@@ -1614,7 +1637,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
                 'discovered': [],
                 'assets': [],
                 'source_count': 0,
-                'dependencies': ['service-enumeration-live-hosts'],
+                'dependencies': job_workflow_dependencies(job_name),
             }
 
         try:
@@ -1636,20 +1659,20 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             'discovered': vhost_result.get('discovered', []),
             'assets': assets,
             'source_count': vhost_result.get('candidates', 0),
-            'depends_on': ['service-enumeration-live-hosts'],
+            'depends_on': job_workflow_dependencies(job_name),
         }
         response['probe_log'] = vhost_result.get('probe_log', [])
         response['thread_status'] = vhost_result.get('thread_status', [])
         response['probe_threads'] = vhost_result.get('threads', 0)
         return response
 
-    if job_name == 'directory-enumeration-live-hosts':
-        step4_path = RESULTS_DIR / 'service-enumeration-live-hosts.json'
-        step5_path = RESULTS_DIR / 'vhost-discovery-shared-infra.json'
+    if stage == 'directory-enumeration':
+        step4_path = result_path_for(program, 'service-enumeration')
+        step5_path = result_path_for(program, 'vhost-discovery')
         if not step4_path.exists() or not step5_path.exists():
             missing = [name for name, p in (
-                ('service-enumeration-live-hosts', step4_path),
-                ('vhost-discovery-shared-infra', step5_path),
+                (result_name_for(program, 'service-enumeration'), step4_path),
+                (result_name_for(program, 'vhost-discovery'), step5_path),
             ) if not p.exists()]
             return {
                 'job': job_name,
@@ -1700,26 +1723,26 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             'discovered': enum_result.get('discovered', []),
             'assets': assets,
             'source_count': sum(len(a.get('paths', [])) for a in assets),
-            'depends_on': ['service-enumeration-live-hosts', 'vhost-discovery-shared-infra'],
+            'depends_on': job_workflow_dependencies(job_name),
         }
         response['probe_log'] = enum_result.get('probe_log', [])
         response['thread_status'] = enum_result.get('thread_status', [])
         response['probe_threads'] = enum_result.get('threads', 0)
         return response
 
-    if job_name == 'application-security-testing':
-        dep_path = RESULTS_DIR / 'directory-enumeration-live-hosts.json'
+    if stage == 'application-testing':
+        dep_path = result_path_for(program, 'directory-enumeration')
         if not dep_path.exists():
             return {
                 'job': job_name, 'program': job.get('program', DEFAULT_PROGRAM), 'type': 'active',
                 'targets': [], 'queued': [], 'skipped': [], 'status': 'waiting_on_dependencies',
                 'job_state': 'waiting_on_dependencies', 'discovered': [], 'assets': [], 'source_count': 0,
-                'dependencies': ['directory-enumeration-live-hosts'],
+                'dependencies': job_workflow_dependencies(job_name),
             }
-        hosts = _combined_live_hosts()
+        hosts = _combined_live_hosts(program)
         deduped_hosts = [h for h in hosts if is_in_scope(h, allowed_scope)]
         deduped_hosts, _truncated = _cap_hosts(deduped_hosts)
-        test_result = _application_security_tests(deduped_hosts, use_external_tools=use_external_tools, progress=progress)
+        test_result = _application_security_tests(deduped_hosts, use_external_tools=use_external_tools, progress=progress, report_job_name=job_name)
         assets = test_result.get('assets', [])
         response = {
             'job': job_name, 'program': job.get('program', DEFAULT_PROGRAM), 'type': 'active',
@@ -1727,23 +1750,23 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             'status': 'ok' if test_result.get('discovered') else 'no_findings',
             'discovered': test_result.get('discovered', []), 'assets': assets,
             'source_count': sum(len(a.get('findings', [])) for a in assets),
-            'depends_on': ['directory-enumeration-live-hosts'],
+            'depends_on': job_workflow_dependencies(job_name),
         }
         response['probe_log'] = test_result.get('probe_log', [])
         response['thread_status'] = test_result.get('thread_status', [])
         response['probe_threads'] = test_result.get('threads', 0)
         return response
 
-    if job_name == 'api-endpoint-testing':
-        dep_path = RESULTS_DIR / 'directory-enumeration-live-hosts.json'
+    if stage == 'api-testing':
+        dep_path = result_path_for(program, 'directory-enumeration')
         if not dep_path.exists():
             return {
                 'job': job_name, 'program': job.get('program', DEFAULT_PROGRAM), 'type': 'active',
                 'targets': [], 'queued': [], 'skipped': [], 'status': 'waiting_on_dependencies',
                 'job_state': 'waiting_on_dependencies', 'discovered': [], 'assets': [], 'source_count': 0,
-                'dependencies': ['directory-enumeration-live-hosts'],
+                'dependencies': job_workflow_dependencies(job_name),
             }
-        api_hosts = [h for h in _api_candidate_hosts() if is_in_scope(h, allowed_scope)]
+        api_hosts = [h for h in _api_candidate_hosts(program) if is_in_scope(h, allowed_scope)]
         api_hosts, _truncated = _cap_hosts(api_hosts)
         test_result = _api_endpoint_tests(api_hosts, use_external_tools=use_external_tools, progress=progress)
         assets = test_result.get('assets', [])
@@ -1753,23 +1776,23 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             'status': 'ok' if test_result.get('discovered') else 'no_findings',
             'discovered': test_result.get('discovered', []), 'assets': assets,
             'source_count': sum(len(a.get('findings', [])) for a in assets),
-            'depends_on': ['directory-enumeration-live-hosts'],
+            'depends_on': job_workflow_dependencies(job_name),
         }
         response['probe_log'] = test_result.get('probe_log', [])
         response['thread_status'] = test_result.get('thread_status', [])
         response['probe_threads'] = test_result.get('threads', 0)
         return response
 
-    if job_name == 'port-scan-live-hosts':
-        dep_path = RESULTS_DIR / 'service-enumeration-live-hosts.json'
+    if stage == 'port-scan':
+        dep_path = result_path_for(program, 'service-enumeration')
         if not dep_path.exists():
             return {
                 'job': job_name, 'program': job.get('program', DEFAULT_PROGRAM), 'type': 'active',
                 'targets': [], 'queued': [], 'skipped': [], 'status': 'waiting_on_dependencies',
                 'job_state': 'waiting_on_dependencies', 'discovered': [], 'assets': [], 'source_count': 0,
-                'dependencies': ['service-enumeration-live-hosts'],
+                'dependencies': job_workflow_dependencies(job_name),
             }
-        hosts = _combined_live_hosts()
+        hosts = _combined_live_hosts(program)
         deduped_hosts = [h for h in hosts if is_in_scope(h, allowed_scope)]
         deduped_hosts, _truncated = _cap_hosts(deduped_hosts)
         test_result = _port_scan_tests(deduped_hosts, use_external_tools=use_external_tools, progress=progress)
@@ -1780,7 +1803,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             'status': 'ok' if test_result.get('discovered') else 'no_findings',
             'discovered': test_result.get('discovered', []), 'assets': assets,
             'source_count': sum(len(a.get('findings', [])) for a in assets),
-            'depends_on': ['service-enumeration-live-hosts'],
+            'depends_on': job_workflow_dependencies(job_name),
         }
         response['probe_log'] = test_result.get('probe_log', [])
         response['thread_status'] = test_result.get('thread_status', [])
@@ -1813,8 +1836,15 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
     from passive_discovery import build_job_output
     from passive_dns_enrichment import passive_dns_enrichment
 
-    legacy = build_job_output()
-    passive = passive_dns_enrichment(job.get('program', DEFAULT_PROGRAM))
+    if program != DEFAULT_PROGRAM and stage == 'passive-web-discovery':
+        legacy = build_job_output(allowed_scope, job_name)
+        passive = {'assets': [], 'targets': []}
+    elif program != DEFAULT_PROGRAM and stage == 'passive-dns-discovery':
+        legacy = {'assets': [], 'targets': []}
+        passive = passive_dns_enrichment(program)
+    else:
+        legacy = build_job_output()
+        passive = passive_dns_enrichment(program)
 
     merged_assets: dict[str, dict] = {}
     for asset in legacy.get('assets', []):
@@ -1891,10 +1921,8 @@ def main() -> None:
     all_results = []
     for job_path in jobs:
         job = load_job(job_path)
-        if job.get('name') in ACTIVE_JOBS and not allow_active:
-            lock_path = RUNNING_DIR / f'{job_path.stem}.lock'
-            if lock_path.exists():
-                lock_path.unlink()
+        job['stage'] = job.get('stage') or stage_for_job_name(job.get('name', ''))
+        if job.get('stage') in ACTIVE_STAGES and not allow_active:
             print(json.dumps({'job': job.get('name'), 'status': 'skipped_active', 'reason': 'requires --allow-active'}, indent=2), file=sys.stderr)
             continue
         dependencies = job_workflow_dependencies(job.get('name'))
@@ -1927,7 +1955,7 @@ def main() -> None:
         out_path = RESULTS_DIR / f"{job_path.stem}.json"
         progress_path = RESULTS_DIR / '.scan-progress' / f'{job_path.stem}.json'
         scan_progress: dict = {}
-        if job.get('name') == 'confirm-live-web-assets':
+        if job.get('stage') == 'confirm-live-web-assets':
             try:
                 scan_progress = json.loads(progress_path.read_text(encoding='utf-8'))
             except (OSError, ValueError):
@@ -1958,7 +1986,7 @@ def main() -> None:
             'thread_status': [],
             'probe_threads': 0,
         }
-        if job.get('name') == 'confirm-live-web-assets':
+        if job.get('stage') == 'confirm-live-web-assets':
             running_payload.update({
                 'assets': scan_progress.get('assets', []),
                 'discovered': sorted(asset['domain'] for asset in scan_progress.get('assets', []) if isinstance(asset, dict) and asset.get('domain')),
@@ -1981,7 +2009,7 @@ def main() -> None:
                 'thread_status': _cap_log(snapshot.get('thread_status', []) or []),
                 'probe_threads': snapshot.get('threads', 0),
             })
-            if job.get('name') == 'confirm-live-web-assets':
+            if job.get('stage') == 'confirm-live-web-assets':
                 payload.update({key: snapshot[key] for key in ('total_candidates', 'processed_count', 'remaining_count') if key in snapshot})
             with progress_lock:
                 _atomic_write_json(out_path, payload)
@@ -2001,7 +2029,7 @@ def main() -> None:
             # carry stale targets forward. Passive discovery still accumulates across runs.
             merged_result = _result_for_write(job.get('name'), previous, result)
             _atomic_write_json(out_path, merged_result)
-            if job.get('name') == 'confirm-live-web-assets' and 'processed_hosts' in merged_result:
+            if job.get('stage') == 'confirm-live-web-assets' and 'processed_hosts' in merged_result:
                 _atomic_write_json(progress_path, {
                     'processed_hosts': merged_result['processed_hosts'],
                     'assets': merged_result['assets'],

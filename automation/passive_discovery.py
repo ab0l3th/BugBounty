@@ -16,21 +16,18 @@ if str(AUTOMATION_DIR) not in sys.path:
     sys.path.insert(0, str(AUTOMATION_DIR))
 
 from scope_validator import is_in_scope, parse_scope_pattern
+from program_builder import parse_scope
 
 SCOPE_FILE = ROOT / 'programs' / 'american-airlines' / 'scope.md'
 
 
 def load_allowed_domains() -> List[str]:
-    rows: List[str] = []
     if not SCOPE_FILE.exists():
-        return rows
-    for line in SCOPE_FILE.read_text(encoding='utf-8').splitlines():
-        value = line.strip()
-        if value.startswith('- '):
-            pattern = parse_scope_pattern(value[2:].strip())
-            if pattern:
-                rows.append(pattern)
-    return rows
+        return []
+    try:
+        return parse_scope('american-airlines.md', SCOPE_FILE.read_text(encoding='utf-8'))[1]
+    except ValueError:
+        return []
 
 
 def fetch_url(url: str, timeout: int = 15, retries: int = 3) -> str:
@@ -100,8 +97,8 @@ def discover_passive_assets(domain: str) -> List[str]:
     return sorted(observed)
 
 
-def build_job_output() -> dict:
-    allowed = load_allowed_domains()
+def build_job_output(allowed_patterns: list[str] | None = None, job_name: str = 'aa-passive-discovery') -> dict:
+    allowed = allowed_patterns if allowed_patterns is not None else load_allowed_domains()
     evidence_by_host: dict[str, list[dict]] = {}
     source_by_host: dict[str, set[str]] = {}
     all_found: Set[str] = set()
@@ -137,7 +134,7 @@ def build_job_output() -> dict:
         })
 
     return {
-        'job': 'aa-passive-discovery',
+        'job': job_name,
         'type': 'passive',
         'targets': allowed,
         'discovered': sorted(filtered),

@@ -68,6 +68,13 @@ STAGES: List[Dict[str, object]] = [
         'type': 'active',
         'depends_on': ['directory-enumeration'],
     },
+    {
+        'stage': 'port-scan',
+        'step': 9,
+        'label': 'Port Scan',
+        'type': 'active',
+        'depends_on': ['vhost-discovery', 'directory-enumeration', 'application-testing'],
+    },
 ]
 
 STAGE_BY_ID: Dict[str, Dict[str, object]] = {stage['stage']: stage for stage in STAGES}
@@ -85,6 +92,7 @@ LEGACY_NAME_TO_STAGE: Dict[str, str] = {
     'directory-enumeration-live-hosts': 'directory-enumeration',
     'application-security-testing': 'application-testing',
     'api-endpoint-testing': 'api-testing',
+    'port-scan-live-hosts': 'port-scan',
 }
 
 

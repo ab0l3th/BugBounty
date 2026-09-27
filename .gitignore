@@ -23,3 +23,5 @@ results/.state/
 results/.running/
 results/private/
 programs/**/scopes_*.csv
+/programs/*/
+/jobs/generated/

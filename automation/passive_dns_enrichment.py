@@ -19,14 +19,11 @@ def load_allowed_patterns(program_name: str) -> List[str]:
     scope_path = PROGRAMS_DIR / program_name / 'scope.md'
     if not scope_path.exists():
         return []
-    result: List[str] = []
-    for line in scope_path.read_text(encoding='utf-8').splitlines():
-        item = line.strip()
-        if item.startswith('- '):
-            value = parse_scope_pattern(item[2:].strip())
-            if value:
-                result.append(value)
-    return result
+    from program_builder import parse_scope
+    try:
+        return parse_scope(f'{program_name}.md', scope_path.read_text(encoding='utf-8'))[1]
+    except ValueError:
+        return []
 
 
 def fetch_url(url: str, timeout: int = 8, retries: int = 2) -> str:

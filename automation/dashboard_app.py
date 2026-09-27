@@ -17,6 +17,8 @@ from typing import Any, Dict, List
 from urllib.parse import quote
 
 from flask import Flask, jsonify, render_template_string, request
+from program_builder import create_program, parse_scope
+from stages import ACTIVE_STAGES, STAGE_BY_ID, STAGES, job_name_for, stage_for_job_name
 
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = ROOT / 'results'
@@ -91,6 +93,12 @@ def job_workflow_metadata(name: str) -> Dict[str, Any]:
     clean_name = (name or '').strip()
     if clean_name in WORKFLOW_SEQUENCE:
         return dict(WORKFLOW_SEQUENCE[clean_name])
+    canonical_stage = stage_for_job_name(clean_name)
+    if canonical_stage and clean_name.endswith('-' + canonical_stage):
+      program = clean_name[:-(len(canonical_stage) + 1)]
+      stage_metadata = STAGE_BY_ID[canonical_stage]
+      return {'step': stage_metadata['step'], 'label': stage_metadata['label'],
+          'depends_on': [job_name_for(program, dependency) for dependency in stage_metadata['depends_on']]}
     return {'step': 99, 'label': job_title_label(clean_name), 'depends_on': []}
 
 
@@ -464,7 +472,7 @@ def group_jobs_by_program(jobs: List[Dict[str, Any]]) -> Dict[str, List[Dict[str
         program = job.get('program', 'unknown')
         name = (job.get('name') or '')
         # Suppress GitHub monitoring jobs from the dashboard view.
-        if 'github' in program.lower() or 'github' in name.lower():
+        if name == 'github-monitor' or job.get('type') in {'github', 'monitor'}:
             continue
         grouped.setdefault(program, []).append(job)
     return dict(sorted(grouped.items(), key=lambda item: program_label(item[0])))
@@ -518,6 +526,8 @@ def read_job_definition(path: Path) -> Dict[str, Any]:
             data['name'] = clean.split(':', 1)[1].strip()
         elif clean.startswith('program:'):
             data['program'] = clean.split(':', 1)[1].strip()
+        elif clean.startswith('stage:'):
+          data['stage'] = clean.split(':', 1)[1].strip()
         elif clean.startswith('type:'):
             data['type'] = clean.split(':', 1)[1].strip()
         elif clean.startswith('order:'):
@@ -544,19 +554,52 @@ def read_job_definition(path: Path) -> Dict[str, Any]:
     return data
 
 
+def program_stage_targets(program: str, stage_id: str) -> List[str]:
+    if stage_id in {'passive-web-discovery', 'passive-dns-discovery'}:
+        return []
+    sources = {
+        'confirm-live-web-assets': ('passive-web-discovery', 'passive-dns-discovery'),
+        'service-enumeration': ('confirm-live-web-assets',),
+        'vhost-discovery': ('service-enumeration',),
+        'directory-enumeration': ('service-enumeration', 'vhost-discovery'),
+        'application-testing': ('service-enumeration', 'vhost-discovery'),
+        'api-testing': ('service-enumeration', 'directory-enumeration'),
+        'port-scan': ('service-enumeration', 'vhost-discovery'),
+    }.get(stage_id, ())
+    hosts: List[str] = []
+    for source in sources:
+        payload = read_result_file(RESULTS_DIR / f'{job_name_for(program, source)}.json')
+        if source == 'service-enumeration' and stage_id == 'api-testing':
+            hosts.extend(asset['domain'] for asset in payload.get('assets', []) or []
+                         if isinstance(asset, dict) and asset.get('kind') == 'api-gateway' and asset.get('domain'))
+        elif source == 'directory-enumeration' and stage_id == 'api-testing':
+            for asset in payload.get('assets', []) or []:
+                if isinstance(asset, dict) and asset.get('domain') and any(
+                    str(path.get('path', '')).startswith(_API_PATH_HINTS)
+                    for path in asset.get('paths', []) or [] if isinstance(path, dict)
+                ):
+                    hosts.append(asset['domain'])
+        else:
+            hosts.extend(payload.get('discovered', []) or [])
+    return list(dict.fromkeys(hosts))
+
+
 def list_jobs() -> List[Dict[str, Any]]:
     jobs: List[Dict[str, Any]] = []
     seen: set[str] = set()
 
     if JOBS_DIR.exists():
-        for path in sorted(JOBS_DIR.glob('*.yaml')) + sorted(JOBS_DIR.glob('*.yml')):
+        for path in sorted(JOBS_DIR.glob('*.yaml')) + sorted(JOBS_DIR.glob('*.yml')) + sorted((JOBS_DIR / 'generated').glob('*.yaml')):
             job_name = path.stem
             seen.add(job_name)
             definition = read_job_definition(path)
             payload = read_result_file(RESULTS_DIR / f'{job_name}.json')
             job_state = _job_state_for(job_name, payload if payload else None)
             metadata = job_workflow_metadata(definition.get('name', job_name))
-            if job_name == 'confirm-live-web-assets':
+            if definition.get('program') != 'american-airlines' and definition.get('stage') in STAGE_BY_ID:
+              queued_targets = (definition.get('targets', []) if definition['stage'] in {'passive-web-discovery', 'passive-dns-discovery'}
+                        else program_stage_targets(definition['program'], definition['stage']))
+            elif job_name == 'confirm-live-web-assets':
                 queued_targets = merged_live_asset_targets()
             elif job_name == 'service-enumeration-live-hosts':
                 queued_targets = live_web_asset_targets_from_step3()
@@ -614,7 +657,7 @@ def list_jobs() -> List[Dict[str, Any]]:
                 })
 
     if not RESULTS_DIR.exists():
-        return sorted(jobs, key=lambda item: item['name'])
+      return sorted(jobs, key=lambda item: (item.get('workflow_step', 99), item['name']))
 
     for path in sorted(RESULTS_DIR.glob('*.json')):
         if path.name.startswith('.') or path.stem in seen:
@@ -683,7 +726,11 @@ def rerun_job(job_name: str) -> Dict[str, Any]:
     program = match.get('program', 'unknown')
     result_path = RESULTS_DIR / f'{job_name}.json'
     result_path.parent.mkdir(parents=True, exist_ok=True)
-    if job_name == 'confirm-live-web-assets':
+    stage_id = stage_for_job_name(job_name)
+    if program != 'american-airlines' and stage_id in STAGE_BY_ID:
+      queued_targets = (match.get('targets', []) if stage_id in {'passive-web-discovery', 'passive-dns-discovery'}
+                else program_stage_targets(program, stage_id))
+    elif job_name == 'confirm-live-web-assets':
         queued_targets = merged_live_asset_targets()
     elif job_name == 'service-enumeration-live-hosts':
         queued_targets = live_web_asset_targets_from_step3()
@@ -719,7 +766,7 @@ def rerun_job(job_name: str) -> Dict[str, Any]:
     lock_path.write_text(str(int(time.time())), encoding='utf-8')
 
     command = [sys.executable, str(ROOT / 'automation' / 'worker.py'), '--force', '--job', job_name]
-    if job_name in ACTIVE_JOBS:
+    if stage_id in ACTIVE_STAGES:
         command.append('--allow-active')
     if program and program != 'unknown':
         command.extend(['--program', str(program)])
@@ -808,8 +855,14 @@ def about_overview():
 
         <div class="card">
           <h1>BugBounty Workflow Overview</h1>
-          <p>This dashboard is a structured recon pipeline designed to move from passive discovery to live validation and then into targeted application and API testing. The workflow is intentionally evidence-based: each step narrows the scope using the output of the previous stage instead of scanning everything blindly.</p>
+          <p>This dashboard runs a separate nine-stage recon pipeline for each program, moving from passive discovery to live validation and targeted application, API, and port testing. Each stage narrows its program's scope using earlier results.</p>
           <p>The goal is to find realistic, high-signal assets and manually validate them before writing a report or investing time in deep exploitation.</p>
+        </div>
+
+        <div class="card">
+          <h2>Adding a program</h2>
+          <p>Upload a HackerOne or Bugcrowd CSV, or a Markdown scope file, from New program on the dashboard. The filename or document title supplies the program name. Only explicitly in-scope domain entries become targets; unsupported assets must be reviewed manually.</p>
+          <p>Each program gets its own scope and nine jobs. The passive stages queue immediately. Active stages require the server's active-testing opt-in, and every stage waits for its own program's dependencies.</p>
         </div>
 
         <div class="card">
@@ -854,6 +907,11 @@ def about_overview():
               <div class="num">Step 8</div>
               <h3>API Endpoint Testing</h3>
               <p>Inspect live APIs for auth issues, debug endpoints, GraphQL, OpenAPI docs, and other high-value paths that can leak data or reveal vulnerabilities. This is where API-specific routes are validated.</p>
+            </div>
+            <div class="step">
+              <div class="num">Step 9</div>
+              <h3>Port Scan</h3>
+              <p>Check bounded ports on IPs behind confirmed in-scope web hosts after application testing. Open ports are triage signals, not confirmed vulnerabilities.</p>
             </div>
           </div>
         </div>
@@ -908,7 +966,7 @@ def index():
     jobs = list_jobs()
     summary = summarize_jobs(jobs)
     grouped_jobs = group_jobs_by_program(jobs)
-    workflow_order = [job_workflow_metadata(job_name) for job_name in ['aa-passive-discovery', 'american-airlines-passive-dns', 'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra', 'directory-enumeration-live-hosts', 'application-security-testing', 'api-endpoint-testing', 'port-scan-live-hosts']]
+    workflow_order = STAGES
     return render_template_string('''
     <!doctype html>
     <html lang="en">
@@ -921,6 +979,14 @@ def index():
         h1 { margin-bottom: 24px; }
         .wrap { max-width: 1200px; margin: 0 auto; }
         .card { background: #1f2937; border-radius: 12px; padding: 20px; margin-bottom: 20px; box-shadow: 0 8px 20px rgba(0,0,0,0.2); }
+        .upload-area { border: 1px dashed #64748b; background: #1f2937; padding: 16px 20px; margin-bottom: 20px; }
+        .upload-area.dragging { border-color: #38bdf8; background: #253645; }
+        .upload-area form { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+        .upload-area h2 { margin: 0 0 12px; font-size: 18px; }
+        .upload-area input { max-width: 100%; }
+        .upload-area button { background: #0ea5e9; color: #082f49; border: 0; padding: 8px 12px; font-weight: bold; cursor: pointer; }
+        .upload-area button:disabled { opacity: .6; cursor: wait; }
+        #upload-status { color: #cbd5e1; font-size: 14px; }
         .summary-row { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 16px; margin-bottom: 20px; }
         .pill { background: #0f172a; border: 1px solid #334155; border-radius: 10px; padding: 16px; text-align: center; }
         .pill strong { display: block; font-size: 28px; margin-top: 8px; }
@@ -997,6 +1063,15 @@ def index():
             <span id="last-refreshed" style="font-size:12px; color:#cbd5e1;">Last refreshed: --:--:--</span>
           </div>
         </div>
+        <section class="upload-area" id="scope-drop">
+          <h2>New program</h2>
+          <form id="program-upload">
+            <label for="scope-file">Scope file</label>
+            <input id="scope-file" name="scope_file" type="file" accept=".csv,.md,text/csv,text/markdown" required>
+            <button type="submit">Upload scope</button>
+            <span id="upload-status" role="status" aria-live="polite"></span>
+          </form>
+        </section>
         <div class="card" style="margin-bottom:20px;">
           <h2 style="margin-top:0; margin-bottom:12px;">Workflow order</h2>
           <div style="display:flex; flex-wrap:wrap; gap:10px;">
@@ -1192,6 +1267,47 @@ def index():
           return token;
         }
 
+        const uploadForm = document.getElementById('program-upload');
+        const scopeDrop = document.getElementById('scope-drop');
+        const scopeFile = document.getElementById('scope-file');
+        const uploadStatus = document.getElementById('upload-status');
+        ['dragenter', 'dragover'].forEach(eventName => scopeDrop.addEventListener(eventName, event => {
+          event.preventDefault();
+          scopeDrop.classList.add('dragging');
+        }));
+        ['dragleave', 'drop'].forEach(eventName => scopeDrop.addEventListener(eventName, event => {
+          event.preventDefault();
+          scopeDrop.classList.remove('dragging');
+          if (eventName === 'drop' && event.dataTransfer.files.length) {
+            scopeFile.files = event.dataTransfer.files;
+          }
+        }));
+        uploadForm.addEventListener('submit', async event => {
+          event.preventDefault();
+          const token = getToken(false);
+          if (!token || !scopeFile.files.length) return;
+          const button = uploadForm.querySelector('button');
+          button.disabled = true;
+          uploadStatus.textContent = 'Uploading...';
+          try {
+            const response = await fetch('/programs/upload', { method: 'POST',
+              headers: {'X-BugBounty-Token': token}, body: new FormData(uploadForm) });
+            const result = await response.json();
+            if (!response.ok) {
+              if (response.status === 401) localStorage.removeItem(TOKEN_KEY);
+              uploadStatus.textContent = result.message || 'Upload failed';
+              return;
+            }
+            uploadStatus.textContent = result.program + ' queued';
+            saveViewState();
+            window.location.reload();
+          } catch (error) {
+            uploadStatus.textContent = 'Upload failed';
+          } finally {
+            button.disabled = false;
+          }
+        });
+
         async function rerunJob(jobName, button) {
           const token = getToken(false);
           if (!token) {
@@ -1327,6 +1443,32 @@ def rerun_job_endpoint(job_name: str):
     except KeyError:
         return jsonify({'status': 'error', 'message': f'Unknown job: {job_name}'}), 404
     return jsonify(result), 202
+
+
+@app.route('/programs/upload', methods=['POST'])
+def upload_program():
+    if not _authorized_for_state_change():
+        return jsonify({'status': 'error', 'message': 'unauthorized'}), 401
+    uploaded = request.files.get('scope_file')
+    if not uploaded or not uploaded.filename:
+        return jsonify({'status': 'error', 'message': 'A scope file is required'}), 400
+    contents = uploaded.stream.read(2 * 1024 * 1024 + 1)
+    if len(contents) > 2 * 1024 * 1024:
+        return jsonify({'status': 'error', 'message': 'Scope file exceeds 2 MB'}), 413
+    try:
+        slug, targets = parse_scope(uploaded.filename, contents.decode('utf-8-sig'))
+        jobs = create_program(slug, targets, root=ROOT)
+    except (UnicodeDecodeError, ValueError) as exc:
+        return jsonify({'status': 'error', 'message': str(exc)}), 400
+    except FileExistsError:
+        return jsonify({'status': 'error', 'message': 'Program already exists'}), 409
+
+    command = [sys.executable, str(ROOT / 'automation' / 'worker.py'), '--program', slug]
+    if os.environ.get('BUGBOUNTY_ALLOW_ACTIVE', '').strip().lower() in {'1', 'true', 'yes', 'on'}:
+        command.append('--allow-active')
+    subprocess.Popen(command, cwd=str(ROOT), stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    return jsonify({'status': 'queued', 'program': slug, 'targets': len(targets), 'jobs': jobs}), 202
 
 
 @app.route('/api/jobs')
