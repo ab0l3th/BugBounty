@@ -22,7 +22,7 @@ AUTOMATION_DIR = Path(__file__).resolve().parent
 if str(AUTOMATION_DIR) not in sys.path:
   sys.path.insert(0, str(AUTOMATION_DIR))
 
-from program_builder import create_program, parse_scope
+from program_builder import active_approved, create_program, parse_scope, read_guidelines, set_active_approval
 from stages import ACTIVE_STAGES, STAGE_BY_ID, STAGES, job_name_for, stage_for_job_name
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -729,6 +729,8 @@ def rerun_job(job_name: str) -> Dict[str, Any]:
         raise KeyError(f'Unknown job: {job_name}')
 
     program = match.get('program', 'unknown')
+    if program != 'american-airlines' and stage_for_job_name(job_name) in ACTIVE_STAGES and not active_approved(program, root=ROOT):
+      raise PermissionError('Program guidelines have not been approved')
     result_path = RESULTS_DIR / f'{job_name}.json'
     result_path.parent.mkdir(parents=True, exist_ok=True)
     stage_id = stage_for_job_name(job_name)
@@ -867,7 +869,7 @@ def about_overview():
         <div class="card">
           <h2>Adding a program</h2>
           <p>Upload a HackerOne or Bugcrowd CSV, or a Markdown scope file, from New program on the dashboard. The filename or document title supplies the program name. Only explicitly in-scope domain entries become targets; unsupported assets must be reviewed manually.</p>
-          <p>Each program gets its own scope and nine jobs. The passive stages queue immediately. Active stages require the server's active-testing opt-in, and every stage waits for its own program's dependencies.</p>
+          <p>Each program gets its own scope, guidelines, and nine jobs. Passive stages queue immediately; generated active stages remain blocked until an operator reviews the guidelines and confirms the pipeline's checks are permitted. The server's active-testing opt-in is also required. Prose rules are not automatically translated into scanner limits or exclusions.</p>
         </div>
 
         <div class="card">
@@ -972,6 +974,9 @@ def index():
     summary = summarize_jobs(jobs)
     grouped_jobs = group_jobs_by_program(jobs)
     workflow_order = STAGES
+    generated_programs = {job['program'] for job in jobs if
+                (JOBS_DIR / 'generated' / f"{job['program']}-passive-web-discovery.yaml").exists()}
+    approved_programs = {program for program in generated_programs if active_approved(program, root=ROOT)}
     return render_template_string('''
     <!doctype html>
     <html lang="en">
@@ -989,6 +994,7 @@ def index():
         .upload-area form { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
         .upload-area h2 { margin: 0 0 12px; font-size: 18px; }
         .upload-area input { max-width: 100%; }
+        .upload-area textarea { width: min(100%, 600px); min-height: 90px; background: #0f172a; color: #e5e7eb; border: 1px solid #475569; }
         .upload-area button { background: #0ea5e9; color: #082f49; border: 0; padding: 8px 12px; font-weight: bold; cursor: pointer; }
         .upload-area button:disabled { opacity: .6; cursor: wait; }
         #upload-status { color: #cbd5e1; font-size: 14px; }
@@ -1004,6 +1010,11 @@ def index():
         .program-summary-card { background: #0f172a; border: 1px solid #334155; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
         .program-summary-card h3 { margin: 0 0 6px; font-size: 18px; }
         .program-summary-card .meta { color: #cbd5e1; font-size: 14px; }
+        .program-rules { border-top: 1px solid #334155; border-bottom: 1px solid #334155; margin: 0 0 16px; padding: 8px 0; }
+        .program-rules summary { padding: 8px 0; }
+        .program-rules pre { background: #0f172a; padding: 12px; max-height: 300px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+        .program-rules button { background: #1f2937; color: #e5e7eb; border: 1px solid #475569; padding: 7px 10px; cursor: pointer; }
+        .program-rules button:disabled { opacity: .55; cursor: not-allowed; }
         .job { margin-bottom: 18px; padding: 0; background: #0f172a; border-left: 4px solid #38bdf8; border-radius: 8px; overflow: hidden; }
         summary { list-style: none; cursor: pointer; padding: 16px; display: block; }
         summary::-webkit-details-marker { display: none; }
@@ -1073,6 +1084,10 @@ def index():
           <form id="program-upload">
             <label for="scope-file">Scope file</label>
             <input id="scope-file" name="scope_file" type="file" accept=".csv,.md,text/csv,text/markdown" required>
+            <label for="guidelines-file">Program guidelines</label>
+            <input id="guidelines-file" name="guidelines_file" type="file" accept=".md,.txt,text/plain,text/markdown">
+            <label for="guidelines-text">Or paste guidelines</label>
+            <textarea id="guidelines-text" name="guidelines_text"></textarea>
             <button type="submit">Upload scope</button>
             <span id="upload-status" role="status" aria-live="polite"></span>
           </form>
@@ -1111,6 +1126,17 @@ def index():
             {% set program_summary = summarize_program_jobs(program_jobs) %}
             <details class="program-group" data-state-key="program-{{ program_name }}" open>
               <summary class="program-header">{{ program_label(program_name) }} <span class="program-count">({{ program_summary.jobs }} jobs)</span></summary>
+              {% if program_name in generated_programs %}
+                <details class="program-rules" data-state-key="rules-{{ program_name }}" data-program="{{ program_name }}">
+                  <summary>Program guidelines: <span class="approval-status">{{ 'Active approved' if program_name in approved_programs else 'Review required' }}</span></summary>
+                  <button type="button" class="view-guidelines">View guidelines</button>
+                  <pre hidden></pre>
+                  <label><input type="checkbox" class="rules-acknowledged"> I confirm this program permits the active checks in this pipeline</label>
+                  <button type="button" class="approve-active" disabled>Approve active</button>
+                  <button type="button" class="revoke-active" disabled>Revoke approval</button>
+                  <span class="rules-message" role="status" aria-live="polite"></span>
+                </details>
+              {% endif %}
               {% if program_summary.passive_dns_jobs %}
                 <div class="program-summary-card">
                   <h3>Passive DNS</h3>
@@ -1130,7 +1156,7 @@ def index():
                   </summary>
                   <div class="job-content">
                     <div class="rerun-form">
-                      <button class="rerun-button" type="button" onclick="rerunJob('{{ job.name }}', this)">Re-run job</button>
+                      <button class="rerun-button" type="button" onclick="rerunJob('{{ job.name }}', this)" {% if job.program in generated_programs and job.type == 'active' and job.program not in approved_programs %}disabled title="Review guidelines before active testing"{% endif %}>Re-run job</button>
                     </div>
                     <p><strong>Program:</strong> {{ program_label(job.program) }}</p>
                     <p><strong>Type:</strong> {{ job.type }}</p>
@@ -1275,6 +1301,8 @@ def index():
         const uploadForm = document.getElementById('program-upload');
         const scopeDrop = document.getElementById('scope-drop');
         const scopeFile = document.getElementById('scope-file');
+        const guidelinesFile = document.getElementById('guidelines-file');
+        const guidelinesText = document.getElementById('guidelines-text');
         const uploadStatus = document.getElementById('upload-status');
         ['dragenter', 'dragover'].forEach(eventName => scopeDrop.addEventListener(eventName, event => {
           event.preventDefault();
@@ -1291,6 +1319,10 @@ def index():
           event.preventDefault();
           const token = getToken(false);
           if (!token || !scopeFile.files.length) return;
+          if (!guidelinesFile.files.length && !guidelinesText.value.trim()) {
+            uploadStatus.textContent = 'Program guidelines are required';
+            return;
+          }
           const button = uploadForm.querySelector('button');
           button.disabled = true;
           uploadStatus.textContent = 'Uploading...';
@@ -1303,7 +1335,7 @@ def index():
               uploadStatus.textContent = result.message || 'Upload failed';
               return;
             }
-            uploadStatus.textContent = result.program + ' queued';
+            uploadStatus.textContent = result.program + ' awaiting rules review';
             saveViewState();
             window.location.reload();
           } catch (error) {
@@ -1311,6 +1343,69 @@ def index():
           } finally {
             button.disabled = false;
           }
+        });
+
+        document.querySelectorAll('.program-rules').forEach(panel => {
+          const slug = panel.dataset.program;
+          const message = panel.querySelector('.rules-message');
+          const documentView = panel.querySelector('pre');
+          const acknowledgment = panel.querySelector('.rules-acknowledged');
+          const approve = panel.querySelector('.approve-active');
+          const revoke = panel.querySelector('.revoke-active');
+          const view = panel.querySelector('.view-guidelines');
+          view.addEventListener('click', async () => {
+            const token = getToken(false);
+            if (!token) return;
+            try {
+              const response = await fetch('/programs/' + encodeURIComponent(slug) + '/guidelines',
+                {headers: {'X-BugBounty-Token': token}});
+              const result = await response.json();
+              if (!response.ok) {
+                if (response.status === 401) localStorage.removeItem(TOKEN_KEY);
+                message.textContent = result.message || 'Guidelines unavailable';
+                return;
+              }
+              documentView.textContent = result.text;
+              documentView.hidden = false;
+              panel.dataset.digest = result.guidelines_sha256;
+              acknowledgment.checked = false;
+              approve.disabled = true;
+              revoke.disabled = !result.approved;
+              message.textContent = '';
+            } catch (error) {
+              message.textContent = 'Guidelines unavailable';
+            }
+          });
+          acknowledgment.addEventListener('change', () => {
+            approve.disabled = !panel.dataset.digest || !acknowledgment.checked;
+          });
+          async function setApproval(approved) {
+            const token = getToken(false);
+            if (!token || !panel.dataset.digest) return;
+            approve.disabled = true;
+            revoke.disabled = true;
+            try {
+              const response = await fetch('/programs/' + encodeURIComponent(slug) + '/active-approval', {
+                method: 'POST', headers: {'Content-Type': 'application/json', 'X-BugBounty-Token': token},
+                body: JSON.stringify({approved, acknowledged: true, guidelines_sha256: panel.dataset.digest}),
+              });
+              const result = await response.json();
+              if (!response.ok) {
+                if (response.status === 401) localStorage.removeItem(TOKEN_KEY);
+                message.textContent = result.message || 'Decision not saved';
+                return;
+              }
+              saveViewState();
+              window.location.reload();
+            } catch (error) {
+              message.textContent = 'Decision not saved';
+            } finally {
+              approve.disabled = !acknowledgment.checked;
+              revoke.disabled = false;
+            }
+          }
+          approve.addEventListener('click', () => setApproval(true));
+          revoke.addEventListener('click', () => setApproval(false));
         });
 
         async function rerunJob(jobName, button) {
@@ -1436,7 +1531,7 @@ def index():
       </script>
     </body>
     </html>
-    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs, workflow_order=workflow_order, highest_severity=highest_severity, asset_render_cap=ASSET_RENDER_CAP, evidence_render_cap=EVIDENCE_RENDER_CAP, thread_render_cap=THREAD_RENDER_CAP)
+    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, generated_programs=generated_programs, approved_programs=approved_programs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs, workflow_order=workflow_order, highest_severity=highest_severity, asset_render_cap=ASSET_RENDER_CAP, evidence_render_cap=EVIDENCE_RENDER_CAP, thread_render_cap=THREAD_RENDER_CAP)
 
 
 @app.route('/jobs/<job_name>/rerun', methods=['POST'])
@@ -1447,6 +1542,8 @@ def rerun_job_endpoint(job_name: str):
         result = rerun_job(job_name)
     except KeyError:
         return jsonify({'status': 'error', 'message': f'Unknown job: {job_name}'}), 404
+    except PermissionError:
+      return jsonify({'status': 'error', 'message': 'Review program guidelines before active testing'}), 409
     return jsonify(result), 202
 
 
@@ -1460,20 +1557,69 @@ def upload_program():
     contents = uploaded.stream.read(2 * 1024 * 1024 + 1)
     if len(contents) > 2 * 1024 * 1024:
         return jsonify({'status': 'error', 'message': 'Scope file exceeds 2 MB'}), 413
+    rules_file = request.files.get('guidelines_file')
+    if rules_file and rules_file.filename:
+        if Path(rules_file.filename).suffix.lower() not in {'.md', '.txt'}:
+            return jsonify({'status': 'error', 'message': 'Guidelines must be Markdown or plain text'}), 400
+        raw_rules = rules_file.stream.read(256 * 1024 + 1)
+        if len(raw_rules) > 256 * 1024:
+            return jsonify({'status': 'error', 'message': 'Guidelines exceed 256 KB'}), 413
+        try:
+            guidelines = raw_rules.decode('utf-8-sig')
+        except UnicodeDecodeError:
+            return jsonify({'status': 'error', 'message': 'Guidelines must use UTF-8'}), 400
+    else:
+        guidelines = request.form.get('guidelines_text', '')
+    if not guidelines.strip() or len(guidelines.encode('utf-8')) > 256 * 1024:
+        return jsonify({'status': 'error', 'message': 'Program guidelines are required (max 256 KB)'}), 400
     try:
         slug, targets = parse_scope(uploaded.filename, contents.decode('utf-8-sig'))
-        jobs = create_program(slug, targets, root=ROOT)
+        jobs = create_program(slug, targets, root=ROOT, guidelines=guidelines)
     except (UnicodeDecodeError, ValueError) as exc:
         return jsonify({'status': 'error', 'message': str(exc)}), 400
     except FileExistsError:
         return jsonify({'status': 'error', 'message': 'Program already exists'}), 409
 
     command = [sys.executable, str(ROOT / 'automation' / 'worker.py'), '--program', slug]
-    if os.environ.get('BUGBOUNTY_ALLOW_ACTIVE', '').strip().lower() in {'1', 'true', 'yes', 'on'}:
-        command.append('--allow-active')
     subprocess.Popen(command, cwd=str(ROOT), stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    return jsonify({'status': 'queued', 'program': slug, 'targets': len(targets), 'jobs': jobs}), 202
+    return jsonify({'status': 'pending_review', 'program': slug, 'targets': len(targets), 'jobs': jobs}), 202
+
+
+@app.route('/programs/<slug>/guidelines')
+def program_guidelines(slug: str):
+    if not _authorized_for_state_change():
+        return jsonify({'status': 'error', 'message': 'unauthorized'}), 401
+    if not (JOBS_DIR / 'generated' / f'{slug}-passive-web-discovery.yaml').exists():
+        return jsonify({'status': 'error', 'message': 'Program not found'}), 404
+    try:
+        text, digest = read_guidelines(slug, root=ROOT)
+    except (OSError, ValueError):
+        return jsonify({'status': 'error', 'message': 'Guidelines unavailable'}), 404
+    return jsonify({'program': slug, 'text': text, 'guidelines_sha256': digest,
+                    'approved': active_approved(slug, root=ROOT)})
+
+
+@app.route('/programs/<slug>/active-approval', methods=['POST'])
+def approve_program_active(slug: str):
+    if not _authorized_for_state_change():
+        return jsonify({'status': 'error', 'message': 'unauthorized'}), 401
+    if not (JOBS_DIR / 'generated' / f'{slug}-passive-web-discovery.yaml').exists():
+        return jsonify({'status': 'error', 'message': 'Program not found'}), 404
+    data = request.get_json(silent=True) or {}
+    if data.get('acknowledged') is not True or type(data.get('approved')) is not bool:
+        return jsonify({'status': 'error', 'message': 'Rules review and explicit decision required'}), 400
+    try:
+        set_active_approval(slug, data['approved'], data.get('guidelines_sha256', ''), root=ROOT)
+    except (OSError, ValueError) as exc:
+        return jsonify({'status': 'error', 'message': str(exc)}), 409
+    started = False
+    if data['approved'] and os.environ.get('BUGBOUNTY_ALLOW_ACTIVE', '').strip().lower() in {'1', 'true', 'yes', 'on'}:
+        subprocess.Popen([sys.executable, str(ROOT / 'automation' / 'worker.py'), '--program', slug, '--allow-active'],
+                         cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        started = True
+    return jsonify({'status': 'approved' if data['approved'] else 'revoked', 'active_run_started': started})
 
 
 @app.route('/api/jobs')

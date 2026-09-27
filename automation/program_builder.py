@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import re
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -101,11 +103,42 @@ def parse_scope(filename: str, content: str) -> tuple[str, list[str]]:
     return program_slug(source_name, rows), targets
 
 
-def create_program(slug: str, targets: list[str], *, root: Path = ROOT) -> list[str]:
+def read_guidelines(slug: str, *, root: Path = ROOT) -> tuple[str, str]:
+    if not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', slug):
+        raise ValueError('Invalid program name')
+    text = (root / 'programs' / slug / 'rules.md').read_text(encoding='utf-8')
+    if not text.strip():
+        raise ValueError('Program guidelines are empty')
+    return text, hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def active_approved(slug: str, *, root: Path = ROOT) -> bool:
+    try:
+        _, digest = read_guidelines(slug, root=root)
+        decision = json.loads((root / 'programs' / slug / '.active-approval.json').read_text(encoding='utf-8'))
+        return decision.get('approved') is True and decision.get('guidelines_sha256') == digest
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def set_active_approval(slug: str, approved: bool, digest: str, *, root: Path = ROOT) -> None:
+    _, current_digest = read_guidelines(slug, root=root)
+    if digest != current_digest:
+        raise ValueError('Guidelines changed; review the current document before approving')
+    path = root / 'programs' / slug / '.active-approval.json'
+    temporary = path.with_name('.active-approval.json.tmp')
+    temporary.write_text(json.dumps({'approved': approved, 'guidelines_sha256': digest,
+                                     'reviewed_at': int(time.time())}), encoding='utf-8')
+    temporary.replace(path)
+
+
+def create_program(slug: str, targets: list[str], *, root: Path = ROOT, guidelines: str | None = None) -> list[str]:
     if not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', slug):
         raise ValueError('Invalid program name')
     if not targets or any(parse_scope_pattern(target) != target for target in targets):
         raise ValueError('Program targets must be valid domain patterns')
+    if guidelines is not None and (not guidelines.strip() or len(guidelines.encode('utf-8')) > 256 * 1024):
+        raise ValueError('Program guidelines must contain text under 256 KB')
     program_dir = root / 'programs' / slug
     jobs_dir = root / 'jobs' / 'generated'
     job_names = [job_name_for(slug, stage['stage']) for stage in STAGES]
@@ -115,6 +148,8 @@ def create_program(slug: str, targets: list[str], *, root: Path = ROOT) -> list[
     jobs_dir.mkdir(parents=True, exist_ok=True)
     (program_dir / 'scope.md').write_text(
         f'# {slug} scope\n\n## In-scope targets\n' + ''.join(f'- {target}\n' for target in targets), encoding='utf-8')
+    if guidelines is not None:
+        (program_dir / 'rules.md').write_text(guidelines.strip() + '\n', encoding='utf-8')
     for stage, name in zip(STAGES, job_names):
         dependencies = [job_name_for(slug, dependency) for dependency in stage['depends_on']]
         job_yaml = '\n'.join([

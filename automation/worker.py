@@ -20,7 +20,7 @@ from urllib.parse import urlsplit
 
 from scope_validator import is_in_scope, parse_scope_pattern
 from stages import ACTIVE_STAGES, LEGACY_NAME_TO_STAGE, STAGE_BY_ID, job_name_for, stage_for_job_name
-from program_builder import parse_scope
+from program_builder import active_approved, parse_scope
 
 ROOT = Path(__file__).resolve().parent.parent
 JOBS_DIR = ROOT / 'jobs'
@@ -1924,6 +1924,9 @@ def main() -> None:
         job['stage'] = job.get('stage') or stage_for_job_name(job.get('name', ''))
         if job.get('stage') in ACTIVE_STAGES and not allow_active:
             print(json.dumps({'job': job.get('name'), 'status': 'skipped_active', 'reason': 'requires --allow-active'}, indent=2), file=sys.stderr)
+            continue
+        if job.get('stage') in ACTIVE_STAGES and job.get('program') != DEFAULT_PROGRAM and not active_approved(job['program'], root=ROOT):
+            print(json.dumps({'job': job.get('name'), 'status': 'pending_guidelines_review'}, indent=2), file=sys.stderr)
             continue
         dependencies = job_workflow_dependencies(job.get('name'))
         if dependencies:
