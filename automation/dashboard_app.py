@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
+import functools
 import hashlib
 import hmac
 import json
@@ -12,6 +14,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List
+from urllib.parse import quote
 
 from flask import Flask, jsonify, render_template_string, request
 
@@ -19,11 +22,13 @@ ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = ROOT / 'results'
 RUNNING_DIR = RESULTS_DIR / '.running'
 JOBS_DIR = ROOT / 'jobs'
+REVIEW_FILE = RESULTS_DIR / '.finding-reviews.json'
+REVIEW_LOCK = RESULTS_DIR / '.finding-reviews.lock'
 
 app = Flask(__name__)
 
 # Jobs that make live connections to targets and must be launched in active mode.
-ACTIVE_JOBS = {'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra', 'directory-enumeration-live-hosts', 'application-security-testing', 'api-endpoint-testing'}
+ACTIVE_JOBS = {'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra', 'directory-enumeration-live-hosts', 'application-security-testing', 'api-endpoint-testing', 'port-scan-live-hosts'}
 
 WORKFLOW_SEQUENCE = {
     'aa-passive-discovery': {
@@ -66,7 +71,20 @@ WORKFLOW_SEQUENCE = {
         'label': 'API Testing',
         'depends_on': ['directory-enumeration-live-hosts'],
     },
+    'port-scan-live-hosts': {
+        'step': 9,
+        'label': 'Port Scan',
+      'depends_on': ['vhost-discovery-shared-infra', 'directory-enumeration-live-hosts', 'application-security-testing'],
+    },
 }
+
+
+# Caps on how many rows are rendered per job on the dashboard home page. The full
+# data stays in the result JSON; these only bound the HTML payload so the page
+# stays small enough to auto-refresh without timing out.
+ASSET_RENDER_CAP = 150
+EVIDENCE_RENDER_CAP = 15
+THREAD_RENDER_CAP = 100
 
 
 def job_workflow_metadata(name: str) -> Dict[str, Any]:
@@ -149,6 +167,148 @@ def summarize_jobs(jobs: List[Dict[str, Any]]) -> Dict[str, int]:
         if state in summary:
             summary[state] += 1
     return summary
+
+
+_SEVERITY_ORDER = {'critical': 5, 'high': 4, 'medium': 3, 'low': 2, 'info': 1}
+
+
+def highest_severity(findings: List[Dict[str, Any]] | None) -> str | None:
+    """Return the highest-ranked severity label among an asset's findings, or None."""
+    best_rank = 0
+    best = None
+    for finding in findings or []:
+        sev = str((finding or {}).get('severity', '')).lower()
+        rank = _SEVERITY_ORDER.get(sev, 0)
+        if rank > best_rank:
+            best_rank = rank
+            best = sev
+    return best.capitalize() if best else None
+
+
+def review_candidates(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    candidates = []
+    seen: set[str] = set()
+    for job in jobs:
+        for asset in job.get('assets', []) or []:
+            if not isinstance(asset, dict) or not asset.get('domain'):
+                continue
+            for finding in asset.get('findings', []) or []:
+                if not isinstance(finding, dict) or not finding.get('type'):
+                    continue
+                evidence = {key: finding[key] for key in ('type', 'path', 'ip', 'port', 'service', 'severity') if key in finding}
+                identity = json.dumps([job['name'], asset['domain'], evidence], sort_keys=True)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                finding_type = finding['type']
+                host = asset['domain']
+                target_url = None
+                report_url = None
+                if isinstance(host, str) and re.fullmatch(r'[a-zA-Z0-9](?:[a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?', host) and '..' not in host:
+                  path = finding.get('path')
+                  if isinstance(path, str) and path.startswith('/') and not path.startswith('//'):
+                    target_url = f'https://{host}{quote(path, safe="/%-._~")}'
+                  elif finding_type == 'open_port' and finding.get('service') == 'https-alt' and finding.get('port') == 8443:
+                    target_url = f'https://{host}:8443/'
+                  elif finding_type == 'open_port' and finding.get('service') in {'http-alt', 'http-dev'} and finding.get('port') in {8000, 8080, 8888}:
+                    target_url = f"http://{host}:{finding['port']}/"
+                  else:
+                    target_url = f'https://{host}/'
+                  expected_report = f"/reports/{job['name']}/{host}"
+                  if asset.get('report_url') == expected_report:
+                    report_url = expected_report
+                candidates.append({
+                    'id': hashlib.sha256(identity.encode('utf-8')).hexdigest(),
+                    'job': job['name'],
+                    'host': asset['domain'],
+                    'target_url': target_url,
+                    'report_url': report_url,
+                    'evidence': evidence,
+                    'confidence': 'medium' if finding_type in {'error_disclosure', 'graphql_introspection'} else 'low',
+                    'scope': 'needs verification',
+                })
+    return candidates
+
+
+def read_reviews() -> Dict[str, Any]:
+    try:
+        payload = json.loads(REVIEW_FILE.read_text(encoding='utf-8'))
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_reviews(reviews: Dict[str, Any]) -> None:
+    REVIEW_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = REVIEW_FILE.with_name(f'.{REVIEW_FILE.name}.{os.getpid()}.tmp')
+    temporary.write_text(json.dumps(reviews, indent=2), encoding='utf-8')
+    temporary.replace(REVIEW_FILE)
+
+
+@app.route('/review')
+def review_queue():
+    reviews = read_reviews()
+    candidates = review_candidates(list_jobs())
+    for candidate in candidates:
+        decision = reviews.get(candidate['id'], {})
+        candidate['decision'] = decision.get('status', 'needs_review')
+        candidate['scope'] = decision.get('scope', 'needs_verification')
+    candidates.sort(key=lambda item: (item['decision'] != 'needs_review', item['job'], item['host']))
+    return render_template_string('''<!doctype html>
+  <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Finding Review</title><style>
+  body { background:#111827; color:#e5e7eb; font-family:Arial,sans-serif; margin:0; padding:24px; }
+  main { max-width:1200px; margin:auto; } a { color:#7dd3fc; }
+  table { width:100%; border-collapse:collapse; } th,td { text-align:left; vertical-align:top; border-bottom:1px solid #334155; padding:10px; }
+  select,button { background:#1f2937; color:#e5e7eb; border:1px solid #475569; padding:7px; }
+  code { overflow-wrap:anywhere; } .meta { color:#94a3b8; } .row { display:flex; flex-wrap:wrap; gap:6px; }
+  @media(max-width:700px) { table,tbody,tr,td { display:block; } thead { display:none; } tr { padding:10px 0; } td { border:0; padding:4px; } }
+  </style></head><body><main><p><a href="/">← Dashboard</a></p><h1>Finding review</h1>
+  <p class="meta">Scanner signals need manual verification. Confidence is a triage estimate, not a confirmed vulnerability rating. Scope must be checked against program rules.</p>
+  <table><thead><tr><th>Asset / job</th><th>Observed evidence</th><th>Confidence</th><th>Scope</th><th>Review</th></tr></thead><tbody>
+  {% for item in candidates %}<tr><td>{% if item.target_url %}<a href="{{ item.target_url }}" target="_blank" rel="noopener noreferrer"><code>{{ item.host }}</code></a>{% else %}<code>{{ item.host }}</code>{% endif %}<br><small>{{ item.job }}</small></td>
+  <td><strong>{{ item.evidence.type }}</strong><br>{% for key, value in item.evidence.items() if key != 'type' %}<small>{{ key }}: {{ value }}</small><br>{% endfor %}{% if item.target_url and item.evidence.path %}<a href="{{ item.target_url }}" target="_blank" rel="noopener noreferrer">Open path</a><br>{% elif item.target_url and item.evidence.type == 'open_port' %}<a href="{{ item.target_url }}" target="_blank" rel="noopener noreferrer">Open host</a><br>{% endif %}{% if item.report_url %}<a href="{{ item.report_url }}" target="_blank" rel="noopener noreferrer">View write-up</a>{% endif %}</td>
+  <td>{{ item.confidence }}</td><td><select class="scope" aria-label="Scope for {{ item.host }}">
+  {% for value, label in [('needs_verification', 'Needs verification'), ('in_scope', 'In scope'), ('out_of_scope', 'Out of scope')] %}
+  <option value="{{ value }}" {% if item.scope == value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></td>
+  <td><div class="row"><select class="decision" aria-label="Review status for {{ item.host }}">
+  {% for value, label in [('needs_review', 'Needs review'), ('needs_account', 'Needs account'), ('confirmed', 'Confirmed'), ('false_positive', 'False positive')] %}
+  <option value="{{ value }}" {% if item.decision == value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select>
+  <button type="button" data-id="{{ item.id }}">Save</button></div></td></tr>
+  {% else %}<tr><td colspan="5">No scanner findings to review.</td></tr>{% endfor %}
+  </tbody></table></main><script>
+  document.querySelectorAll('button[data-id]').forEach(button => button.addEventListener('click', async () => {
+    const row = button.closest('tr');
+    const token = localStorage.getItem('bugbounty-dashboard-token') || window.prompt('Dashboard token:');
+    if (!token) return;
+    localStorage.setItem('bugbounty-dashboard-token', token);
+    button.disabled = true;
+    try {
+    const response = await fetch('/review/' + button.dataset.id, {method:'POST', headers:{'Content-Type':'application/json', 'X-BugBounty-Token':token},
+      body:JSON.stringify({status:row.querySelector('.decision').value, scope:row.querySelector('.scope').value})});
+    if (!response.ok) { alert('Review was not saved (' + response.status + ')'); return; }
+    button.textContent = 'Saved';
+    } catch (error) { alert('Review was not saved'); } finally { button.disabled = false; }
+  }));
+  </script></body></html>''', candidates=candidates)
+
+
+@app.route('/review/<finding_id>', methods=['POST'])
+def update_review(finding_id: str):
+    if not _authorized_for_state_change():
+        return jsonify({'status': 'error', 'message': 'unauthorized'}), 401
+    data = request.get_json(silent=True) or {}
+    if data.get('status') not in {'needs_review', 'needs_account', 'confirmed', 'false_positive'} or data.get('scope') not in {'needs_verification', 'in_scope', 'out_of_scope'}:
+        return jsonify({'status': 'error', 'message': 'invalid decision'}), 400
+    if finding_id not in {item['id'] for item in review_candidates(list_jobs())}:
+        return jsonify({'status': 'error', 'message': 'finding not found'}), 404
+    REVIEW_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with REVIEW_LOCK.open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        reviews = read_reviews()
+        reviews[finding_id] = {'status': data['status'], 'scope': data['scope'], 'reviewed_at': int(time.time())}
+        write_reviews(reviews)
+    return jsonify(reviews[finding_id])
 
 
 def program_label(value: str) -> str:
@@ -326,11 +486,22 @@ def summarize_program_jobs(jobs: List[Dict[str, Any]]) -> Dict[str, int]:
     return summary
 
 
-def read_result_file(path: Path) -> Dict[str, Any]:
+@functools.lru_cache(maxsize=64)
+def _read_result_cached(path_str: str, mtime: float, size: int) -> Dict[str, Any]:
     try:
-        return json.loads(path.read_text(encoding='utf-8'))
+        return json.loads(Path(path_str).read_text(encoding='utf-8'))
     except Exception:
         return {}
+
+
+def read_result_file(path: Path) -> Dict[str, Any]:
+    # Cache by path+mtime+size so large result files are parsed once per page load,
+    # not once per helper that inspects them (was O(jobs) reparses of multi-MB files).
+    try:
+        stat = path.stat()
+    except OSError:
+        return {}
+    return _read_result_cached(str(path), stat.st_mtime, stat.st_size)
 
 
 def read_job_definition(path: Path) -> Dict[str, Any]:
@@ -397,6 +568,8 @@ def list_jobs() -> List[Dict[str, Any]]:
                 queued_targets = combined_live_roots_from_step4_and_step5()
             elif job_name == 'api-endpoint-testing':
                 queued_targets = api_candidate_hosts_from_step4_and_step6()
+            elif job_name == 'port-scan-live-hosts':
+                queued_targets = combined_live_roots_from_step4_and_step5()
             else:
                 queued_targets = definition.get('targets', [])
             if payload:
@@ -522,6 +695,8 @@ def rerun_job(job_name: str) -> Dict[str, Any]:
         queued_targets = combined_live_roots_from_step4_and_step5()
     elif job_name == 'api-endpoint-testing':
         queued_targets = api_candidate_hosts_from_step4_and_step6()
+    elif job_name == 'port-scan-live-hosts':
+        queued_targets = combined_live_roots_from_step4_and_step5()
     else:
         queued_targets = []
     result_path.write_text(json.dumps({
@@ -733,7 +908,7 @@ def index():
     jobs = list_jobs()
     summary = summarize_jobs(jobs)
     grouped_jobs = group_jobs_by_program(jobs)
-    workflow_order = [job_workflow_metadata(job_name) for job_name in ['aa-passive-discovery', 'american-airlines-passive-dns', 'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra', 'directory-enumeration-live-hosts', 'application-security-testing', 'api-endpoint-testing']]
+    workflow_order = [job_workflow_metadata(job_name) for job_name in ['aa-passive-discovery', 'american-airlines-passive-dns', 'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra', 'directory-enumeration-live-hosts', 'application-security-testing', 'api-endpoint-testing', 'port-scan-live-hosts']]
     return render_template_string('''
     <!doctype html>
     <html lang="en">
@@ -806,6 +981,7 @@ def index():
           <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
             <h1 style="margin:0;">BugBounty Dashboard</h1>
             <a href="/about" style="color:#7dd3fc; text-decoration:none; background:#1f2937; border:1px solid #334155; border-radius:8px; padding:7px 10px; font-size:14px;">About</a>
+            <a href="/review" style="color:#7dd3fc; text-decoration:none; background:#1f2937; border:1px solid #334155; border-radius:8px; padding:7px 10px; font-size:14px;">Finding review</a>
           </div>
           <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; background:#1f2937; border:1px solid #334155; border-radius:10px; padding:8px 12px;">
             <label for="refresh-interval" style="font-size:14px; color:#cbd5e1;">Auto refresh</label>
@@ -853,7 +1029,7 @@ def index():
         {% if jobs %}
           {% for program_name, program_jobs in grouped_jobs.items() %}
             {% set program_summary = summarize_program_jobs(program_jobs) %}
-            <details class="program-group" open>
+            <details class="program-group" data-state-key="program-{{ program_name }}" open>
               <summary class="program-header">{{ program_label(program_name) }} <span class="program-count">({{ program_summary.jobs }} jobs)</span></summary>
               {% if program_summary.passive_dns_jobs %}
                 <div class="program-summary-card">
@@ -862,12 +1038,12 @@ def index():
                 </div>
               {% endif %}
               {% for job in program_jobs %}
-                <details class="job">
+                <details class="job" data-state-key="job-{{ job.name }}">
                   <summary>
                     <div class="job-header">
                       <div class="job-title-wrap">
                         <h3 class="job-name">{{ job_title_label(job.name) }}</h3>
-                        <div class="job-summary"><strong>Targets:</strong> {{ job.targets|length }} &nbsp; <strong>Discovered:</strong> {{ job.discovered|length }} &nbsp; <strong>Status:</strong> {{ job.job_state }}</div>
+                        <div class="job-summary"><strong>Targets:</strong> {{ job.targets|length }} &nbsp; <strong>Discovered:</strong> {{ job.discovered|length }}{% if job.raw.total_candidates is defined %} &nbsp; <strong>Checked:</strong> {{ job.raw.processed_count or 0 }} / {{ job.raw.total_candidates }}{% endif %} &nbsp; <strong>Status:</strong> {{ job.job_state }}</div>
                       </div>
                       <div class="status {{ 'ok' if job.job_state == 'completed' else 'warn' if job.job_state == 'running' else 'bad' }}">{{ job.job_state }}</div>
                     </div>
@@ -881,16 +1057,31 @@ def index():
                     <p><strong>Pipeline status:</strong> {{ job.status }}</p>
                     <p><strong>Source count:</strong> {{ job.source_count }}</p>
                     <p><strong>Targets:</strong> {{ job.targets|length }}</p>
+                    {% if job.raw.total_candidates is defined %}<p><strong>Coverage:</strong> {{ job.raw.processed_count or 0 }} / {{ job.raw.total_candidates }} hosts checked, {{ job.raw.remaining_count or 0 }} remaining</p>{% endif %}
                     <p><strong>Discovered:</strong> {{ job.discovered|length }}</p>
 
                     {% set probe_log = (job.raw.probe_log if job.raw else []) %}
                     {% set thread_status = (job.raw.thread_status if job.raw else []) %}
+                    {% set login_redirects = probe_log|selectattr('status', 'equalto', 'login_redirect')|list %}
                     {% if probe_log or thread_status %}
-                      <details class="collapsible-list">
+                      <details class="collapsible-list" data-state-key="threads-{{ job.name }}">
                         <summary>Thread progress ({{ thread_status|length }})</summary>
                         <ul>
-                          {% for item in thread_status %}
+                          {% for item in thread_status[:thread_render_cap] %}
                             <li><code>{{ item.host }}</code> — {{ item.status }}{% if item.url %} / {{ item.url }}{% endif %}{% if item.thread_id %} [{{ item.thread_id }}]{% endif %}</li>
+                          {% endfor %}
+                          {% if thread_status|length > thread_render_cap %}
+                            <li>… {{ thread_status|length - thread_render_cap }} more not shown</li>
+                          {% endif %}
+                        </ul>
+                      </details>
+                    {% endif %}
+                    {% if login_redirects %}
+                      <details class="collapsible-list" data-state-key="login-redirects-{{ job.name }}">
+                        <summary>Login redirects ({{ login_redirects|length }})</summary>
+                        <ul>
+                          {% for item in login_redirects %}
+                            <li><code>{{ item.host }}</code> — {{ item.classification or 'unknown_login' }}{% if item.final_host %} → <code>{{ item.final_host }}{{ item.final_path or '/' }}</code>{% endif %}{% if item.title %} — {{ item.title }}{% endif %}</li>
                           {% endfor %}
                         </ul>
                       </details>
@@ -905,18 +1096,22 @@ def index():
                           <th align="left">Service</th>
                           <th align="left">Ports</th>
                           <th align="left">Status</th>
+                          <th align="left">Scanner severity</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {% for asset in job.assets %}
+                        {% for asset in job.assets[:asset_render_cap] %}
                           <tr>
                             <td><code>{{ asset.domain }}</code></td>
                             <td>
                               {% if asset.evidence %}
                                 <div class="evidence-list">
-                                  {% for item in asset.evidence %}
+                                  {% for item in asset.evidence[:evidence_render_cap] %}
                                     <span class="evidence-item"><a href="{{ item.url }}" target="_blank" rel="noopener">{{ item.source }}</a></span>
                                   {% endfor %}
+                                  {% if asset.evidence|length > evidence_render_cap %}
+                                    <span class="evidence-item">+{{ asset.evidence|length - evidence_render_cap }} more</span>
+                                  {% endif %}
                                 </div>
                               {% else %}
                                 {{ asset.source or asset.sources|join(', ') }}
@@ -928,14 +1123,23 @@ def index():
                             <td>{% if asset.kind %}<code>{{ asset.kind }}</code>{% else %}—{% endif %}</td>
                             <td>{% if asset.ports %}{{ asset.ports|join(', ') }}{% else %}—{% endif %}</td>
                             <td>{{ asset.status }}</td>
+                            <td>
+                              {% set sev = highest_severity(asset.findings) %}
+                              {% if sev %}
+                                <span class="status {{ 'bad' if sev in ['Critical', 'High'] else 'warn' if sev == 'Medium' else 'ok' }}">{{ sev }}</span>
+                              {% else %}—{% endif %}
+                            </td>
                           </tr>
                         {% else %}
-                          <tr><td colspan="5">No newly discovered assets.</td></tr>
+                          <tr><td colspan="6">No newly discovered assets.</td></tr>
                         {% endfor %}
                       </tbody>
                     </table>
+                    {% if job.assets|length > asset_render_cap %}
+                      <p style="margin-top:8px; color:#9ca3af;">Showing first {{ asset_render_cap }} of {{ job.assets|length }} assets. Full data in the result file.</p>
+                    {% endif %}
 
-                    <details class="collapsible-list">
+                    <details class="collapsible-list" data-state-key="targets-{{ job.name }}">
                       <summary>In-scope targets ({{ job.targets|length }})</summary>
                       <ul>
                         {% for item in job.targets %}
@@ -944,7 +1148,7 @@ def index():
                       </ul>
                     </details>
 
-                    <details class="collapsible-list">
+                    <details class="collapsible-list" data-state-key="queued-{{ job.name }}">
                       <summary>Queued ({{ job.queued|length }})</summary>
                       <ul>
                         {% for item in job.queued %}
@@ -953,7 +1157,7 @@ def index():
                       </ul>
                     </details>
                     {% if job.skipped %}
-                      <details class="collapsible-list">
+                      <details class="collapsible-list" data-state-key="skipped-{{ job.name }}">
                         <summary>Skipped ({{ job.skipped|length }})</summary>
                         <ul>
                           {% for item in job.skipped %}
@@ -1052,6 +1256,35 @@ def index():
           setLastRefreshed();
         }
 
+        const viewStateKey = 'bugbounty-dashboard-view-state';
+        function saveViewState() {
+          const open = {};
+          document.querySelectorAll('details[data-state-key]').forEach((element) => {
+            open[element.dataset.stateKey] = element.open;
+          });
+          sessionStorage.setItem(viewStateKey, JSON.stringify({ open, scrollY: window.scrollY }));
+        }
+
+        function restoreViewState() {
+          try {
+            const state = JSON.parse(sessionStorage.getItem(viewStateKey) || '{}');
+            const open = state.open || {};
+            document.querySelectorAll('details[data-state-key]').forEach((element) => {
+              if (Object.prototype.hasOwnProperty.call(open, element.dataset.stateKey)) {
+                element.open = Boolean(open[element.dataset.stateKey]);
+              }
+            });
+            if (Number.isFinite(state.scrollY)) {
+              requestAnimationFrame(() => window.scrollTo(0, state.scrollY));
+            }
+          } catch (err) {
+            sessionStorage.removeItem(viewStateKey);
+          }
+        }
+
+        restoreViewState();
+        window.addEventListener('beforeunload', saveViewState);
+
         let refreshTimer = null;
         function applyRefreshInterval() {
           const value = Number(refreshSelect ? refreshSelect.value : 60);
@@ -1062,6 +1295,7 @@ def index():
           }
           if (value > 0) {
             refreshTimer = setInterval(() => {
+              saveViewState();
               window.location.reload();
             }, value * 1000);
           }
@@ -1072,6 +1306,7 @@ def index():
         }
         if (refreshButton) {
           refreshButton.addEventListener('click', () => {
+            saveViewState();
             setLastRefreshed();
             window.location.reload();
           });
@@ -1080,7 +1315,7 @@ def index():
       </script>
     </body>
     </html>
-    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs, workflow_order=workflow_order)
+    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs, workflow_order=workflow_order, highest_severity=highest_severity, asset_render_cap=ASSET_RENDER_CAP, evidence_render_cap=EVIDENCE_RENDER_CAP, thread_render_cap=THREAD_RENDER_CAP)
 
 
 @app.route('/jobs/<job_name>/rerun', methods=['POST'])

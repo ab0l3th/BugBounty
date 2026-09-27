@@ -5,9 +5,11 @@ import argparse
 import http.client
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -33,10 +35,11 @@ WORKFLOW_SEQUENCE = {
     'directory-enumeration-live-hosts': {'step': 6, 'depends_on': ['service-enumeration-live-hosts', 'vhost-discovery-shared-infra']},
     'application-security-testing': {'step': 7, 'depends_on': ['directory-enumeration-live-hosts']},
     'api-endpoint-testing': {'step': 8, 'depends_on': ['directory-enumeration-live-hosts']},
+    'port-scan-live-hosts': {'step': 9, 'depends_on': ['vhost-discovery-shared-infra', 'directory-enumeration-live-hosts', 'application-security-testing']},
 }
 
 # Jobs that make live connections to targets and must not run in the default passive-only mode.
-ACTIVE_JOBS = {'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra', 'directory-enumeration-live-hosts', 'application-security-testing', 'api-endpoint-testing'}
+ACTIVE_JOBS = {'confirm-live-web-assets', 'service-enumeration-live-hosts', 'vhost-discovery-shared-infra', 'directory-enumeration-live-hosts', 'application-security-testing', 'api-endpoint-testing', 'port-scan-live-hosts'}
 
 # Statuses that count as a completed job for dependency gating and re-run skipping.
 COMPLETED_STATUSES = {'completed', 'ok', 'no_new_assets', 'no_in_scope_targets', 'no_shared_infra', 'no_paths', 'no_findings', 'no_activity'}
@@ -69,6 +72,22 @@ def _cap_hosts(hosts: list[str]) -> tuple[list[str], bool]:
 
 def _cap_log(entries: list) -> list:
     return entries[:MAX_LOG_ENTRIES] if MAX_LOG_ENTRIES and len(entries) > MAX_LOG_ENTRIES else entries
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f'.{path.name}.tmp')
+    temporary.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+    temporary.replace(path)
+
+
+def _emit_progress(progress, snapshot: dict) -> None:
+    if progress is None:
+        return
+    try:
+        progress(snapshot)
+    except Exception:
+        pass
 
 
 def _drain_futures(futures, log: list | None = None) -> None:
@@ -255,6 +274,10 @@ def should_run_job(job_path: Path, *, force: bool = False) -> bool:
         return True
     status = payload.get('status')
     job_state = payload.get('job_state')
+    if job_path.stem == 'confirm-live-web-assets' and status in COMPLETED_STATUSES:
+        progress_path = RESULTS_DIR / '.scan-progress' / f'{job_path.stem}.json'
+        if not progress_path.exists() and len(payload.get('targets', [])) >= MAX_HOSTS_PER_RUN:
+            return True
     # Only skip genuinely completed jobs; queued/waiting jobs should be picked up so the
     # pipeline can auto-advance once dependencies finish. Active in-flight runs are guarded
     # separately by a live lock check.
@@ -303,10 +326,32 @@ def _run_external_probe_tool(host: str, url: str, tool_name: str) -> dict:
         return {'tool': tool_name, 'ok': False, 'error': str(exc)}
 
 
-def _probe_live_web_assets(hosts: list[str], *, use_external_tools: bool = False) -> dict:
+def _response_final_url(resp, fallback: str) -> str:
+    geturl = getattr(resp, 'geturl', None)
+    if callable(geturl):
+        try:
+            return str(geturl())
+        except Exception:
+            pass
+    return fallback
+
+
+def _response_text(resp, limit: int) -> str:
+    reader = getattr(resp, 'read', None)
+    if not callable(reader):
+        return ''
+    try:
+        body = reader(limit)
+    except Exception:
+        return ''
+    return body.decode('utf-8', 'replace') if isinstance(body, (bytes, bytearray)) else str(body)
+
+
+def _probe_live_web_assets(hosts: list[str], *, use_external_tools: bool = False, progress=None) -> dict:
     deduped_hosts = sorted(set(hosts))
     discovered: list[dict] = []
     probe_log: list[dict] = []
+    login_seen: set[str] = set()
     thread_status: list[dict] = []
     headers = {'User-Agent': 'BugBountyPassiveRecon/1.0'}
     max_workers = _bounded_workers(len(deduped_hosts))
@@ -328,7 +373,9 @@ def _probe_live_web_assets(hosts: list[str], *, use_external_tools: bool = False
                 req = urllib_request.Request(url, headers=headers, method='GET')
                 with urllib_request.urlopen(req, timeout=8) as resp:
                     code = getattr(resp, 'status', resp.getcode())
-                    if code and code < 400:
+                    final_url = _response_final_url(resp, url)
+                    body_text = _response_text(resp, 2048)
+                    if code and code < 400 and not _is_login_redirect(url, final_url, body_text):
                         info['status'] = 'live'
                         info['status_code'] = code
                         discovered.append({
@@ -353,6 +400,7 @@ def _probe_live_web_assets(hosts: list[str], *, use_external_tools: bool = False
                             'url': url,
                             'timestamp': time.time(),
                         })
+                        _emit_progress(progress, {'targets': list(deduped_hosts), 'assets': list(discovered), 'discovered': [row['domain'] for row in discovered], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
                         if use_external_tools:
                             for tool_name in ('curl', 'nmap', 'whatweb'):
                                 if _command_exists(tool_name):
@@ -378,6 +426,8 @@ def _probe_live_web_assets(hosts: list[str], *, use_external_tools: bool = False
                                     })
                                     break
                         return {'host': host, 'status': 'live'}
+                    if code and code < 400:
+                        _record_login_redirect(probe_log, login_seen, thread_name=thread_name, host=host, requested_url=url, final_url=final_url, body=body_text)
                     info['status'] = 'http_error'
                     info['status_code'] = code
             except (urllib_error.HTTPError, urllib_error.URLError, ValueError, OSError) as exc:
@@ -460,10 +510,11 @@ def _classify_service(host: str, probe_rows: list[dict]) -> str:
     return 'static-site'
 
 
-def _enumerate_live_services(hosts: list[str], *, use_external_tools: bool = False) -> dict:
+def _enumerate_live_services(hosts: list[str], *, use_external_tools: bool = False, progress=None) -> dict:
     deduped_hosts = sorted(set(hosts))
     results: list[dict] = []
     probe_log: list[dict] = []
+    login_seen: set[str] = set()
     thread_status: list[dict] = []
     max_workers = _bounded_workers(len(deduped_hosts))
 
@@ -490,6 +541,12 @@ def _enumerate_live_services(hosts: list[str], *, use_external_tools: bool = Fal
                     source = str(server).strip() or f'{parts.scheme}/{code}'
                     attempt['status'] = 'open'
                     attempt['status_code'] = code
+                    body_text = _response_text(resp, 2048)
+                    final_url = _response_final_url(resp, url)
+                    if _is_login_redirect(url, final_url, body_text):
+                        _record_login_redirect(probe_log, login_seen, thread_name=thread_name, host=host, requested_url=url, final_url=final_url, body=body_text)
+                        attempt['status'] = 'login_redirect'
+                        continue
                     attempt['server'] = str(server)
                     attempt['port'] = port
                     attempt['source'] = source
@@ -545,6 +602,7 @@ def _enumerate_live_services(hosts: list[str], *, use_external_tools: bool = Fal
             'ports': open_ports,
             'timestamp': time.time(),
         })
+        _emit_progress(progress, {'targets': list(deduped_hosts), 'assets': list(results), 'discovered': [row['domain'] for row in results], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
         return service_record
 
     if not deduped_hosts:
@@ -644,19 +702,25 @@ def _probe_vhost(ip: str, host_header: str, scheme: str = 'https') -> dict:
             body = resp.read(4096)
             headers = getattr(resp, 'headers', {})
             server = headers.get('Server', '') if hasattr(headers, 'get') else ''
+            final_url = _response_final_url(resp, url)
+            body_text = body.decode('utf-8', 'replace') if isinstance(body, (bytes, bytearray)) else str(body)
+            if _is_login_redirect(url, final_url, body_text):
+                return {'host_header': host_header, 'ip': ip, 'source': f'{host_header} (login redirect)', 'url': url, 'ok': False, 'status': 'login_redirect', 'login': _login_page_fingerprint(url, final_url, body_text)}
             return {
                 'host_header': host_header,
                 'ip': ip,
                 'status_code': code,
                 'length': len(body),
                 'server': str(server),
+                'source': f'{host_header} → {code}',
+                'url': url,
                 'ok': True,
             }
     except (urllib_error.HTTPError, urllib_error.URLError, ValueError, OSError, http.client.HTTPException) as exc:
-        return {'host_header': host_header, 'ip': ip, 'ok': False, 'error': str(exc)}
+        return {'host_header': host_header, 'ip': ip, 'source': f'{host_header} (no response)', 'url': url, 'ok': False, 'error': str(exc)}
 
 
-def _run_vhost_discovery(service_assets: list[dict]) -> dict:
+def _run_vhost_discovery(service_assets: list[dict], *, progress=None) -> dict:
     candidates = _select_vhost_candidates(service_assets)
     probe_log: list[dict] = []
     thread_status: list[dict] = []
@@ -688,6 +752,7 @@ def _run_vhost_discovery(service_assets: list[dict]) -> dict:
         }
         assets.append(record)
         thread_status.append({'thread_id': thread_name, 'host': host, 'status': record['status'], 'reason': candidate['reason'], 'timestamp': time.time()})
+        _emit_progress(progress, {'targets': [item['domain'] for item in candidates], 'assets': list(assets), 'discovered': [row['domain'] for row in assets], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
         return record
 
     if not candidates:
@@ -725,11 +790,12 @@ DEFAULT_CONTENT_WORDLIST = [
 _INTERESTING_STATUS = {200, 201, 204, 301, 302, 307, 308, 401, 403, 405}
 
 
-def _directory_enumeration(hosts: list[str], *, wordlist: list[str] | None = None, use_external_tools: bool = False) -> dict:
+def _directory_enumeration(hosts: list[str], *, wordlist: list[str] | None = None, use_external_tools: bool = False, progress=None) -> dict:
     deduped_hosts = sorted(set(hosts))
     paths = list(dict.fromkeys(wordlist or DEFAULT_CONTENT_WORDLIST))
     assets: list[dict] = []
     probe_log: list[dict] = []
+    login_seen: set[str] = set()
     thread_status: list[dict] = []
     max_workers = _bounded_workers(len(deduped_hosts))
     headers = {'User-Agent': 'BugBountyPassiveRecon/1.0'}
@@ -744,17 +810,23 @@ def _directory_enumeration(hosts: list[str], *, wordlist: list[str] | None = Non
                 req = urllib_request.Request(url, headers=headers, method='GET')
                 with urllib_request.urlopen(req, timeout=8) as resp:
                     code = getattr(resp, 'status', resp.getcode())
-                    body = resp.read(2048)
+                    body = resp.read(2048) if callable(getattr(resp, 'read', None)) else b''
                     length = len(body) if body else 0
+                    final_url = _response_final_url(resp, url)
             except urllib_error.HTTPError as exc:
                 code = exc.code
                 length = 0
+                body = b''
+                final_url = url
             except (urllib_error.URLError, ValueError, OSError):
                 continue
-            if code in _INTERESTING_STATUS:
+            body_text = body.decode('utf-8', 'replace') if isinstance(body, (bytes, bytearray)) else str(body)
+            if code in _INTERESTING_STATUS and not _is_login_redirect(url, final_url, body_text):
                 entry = {'path': path, 'status_code': code, 'length': length, 'url': url}
                 found.append(entry)
                 probe_log.append({'thread_id': thread_name, 'host': host, 'path': path, 'status_code': code, 'status': 'found', 'timestamp': time.time()})
+            elif code in _INTERESTING_STATUS:
+                _record_login_redirect(probe_log, login_seen, thread_name=thread_name, host=host, requested_url=url, final_url=final_url, body=body_text, path=path)
         record = {
             'domain': host,
             'status': 'paths_found' if found else 'no_paths',
@@ -768,6 +840,7 @@ def _directory_enumeration(hosts: list[str], *, wordlist: list[str] | None = Non
         }
         assets.append(record)
         thread_status.append({'thread_id': thread_name, 'host': host, 'status': record['status'], 'found': len(found), 'timestamp': time.time()})
+        _emit_progress(progress, {'targets': list(deduped_hosts), 'assets': list(assets), 'discovered': [row['domain'] for row in assets if row.get('paths')], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
         return record
 
     if not deduped_hosts:
@@ -801,6 +874,13 @@ def _fetch_headers_body(url: str, *, extra_headers: dict | None = None, method: 
         rh = getattr(resp, 'headers', None)
         if rh is not None and hasattr(rh, 'items'):
             hdrs = {str(k).lower(): str(v) for k, v in rh.items()}
+        # Record the final URL so callers can detect redirects (e.g. to a login page).
+        geturl = getattr(resp, 'geturl', None)
+        if callable(geturl):
+            try:
+                hdrs['x-final-url'] = str(geturl())
+            except Exception:
+                pass
         text = raw.decode('utf-8', 'replace') if isinstance(raw, (bytes, bytearray)) else str(raw)
         return code, hdrs, text
 
@@ -942,10 +1022,11 @@ def _write_finding_report(job_name: str, host: str, findings: list[dict]) -> str
     return f'/reports/{job_name}/{host}'
 
 
-def _application_security_tests(hosts: list[str], *, use_external_tools: bool = False) -> dict:
+def _application_security_tests(hosts: list[str], *, use_external_tools: bool = False, progress=None) -> dict:
     deduped_hosts = sorted(set(hosts))
     assets: list[dict] = []
     probe_log: list[dict] = []
+    login_seen: set[str] = set()
     thread_status: list[dict] = []
     max_workers = _bounded_workers(len(deduped_hosts))
 
@@ -963,6 +1044,15 @@ def _application_security_tests(hosts: list[str], *, use_external_tools: bool = 
             record = {'domain': host, 'status': 'no_response', 'kind': 'app-test', 'ports': [], 'findings': [], 'source': 'app-test', 'sources': ['app-test'], 'source_count': 0, 'evidence': [], 'error': str(exc)}
             assets.append(record)
             thread_status.append({'thread_id': thread_name, 'host': host, 'status': 'no_response', 'timestamp': time.time()})
+            _emit_progress(progress, {'targets': list(deduped_hosts), 'assets': list(assets), 'discovered': [row['domain'] for row in assets if row.get('findings')], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
+            return record
+
+        if _is_login_redirect(url, hdrs.get('x-final-url', url), body):
+            _record_login_redirect(probe_log, login_seen, thread_name=thread_name, host=host, requested_url=url, final_url=hdrs.get('x-final-url', url), body=body)
+            record = {'domain': host, 'status': 'no_findings', 'kind': 'app-test', 'ports': [], 'findings': [], 'source': 'app-test', 'sources': ['app-test'], 'source_count': 0, 'evidence': []}
+            assets.append(record)
+            thread_status.append({'thread_id': thread_name, 'host': host, 'status': 'login_redirect', 'timestamp': time.time()})
+            _emit_progress(progress, {'targets': list(deduped_hosts), 'assets': list(assets), 'discovered': [], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
             return record
 
         missing = [h for h in _SECURITY_HEADERS if h not in hdrs]
@@ -1007,6 +1097,7 @@ def _application_security_tests(hosts: list[str], *, use_external_tools: bool = 
             record['report_url'] = report_url
         assets.append(record)
         thread_status.append({'thread_id': thread_name, 'host': host, 'status': record['status'], 'findings': len(findings), 'timestamp': time.time()})
+        _emit_progress(progress, {'targets': list(deduped_hosts), 'assets': list(assets), 'discovered': [row['domain'] for row in assets if row.get('findings')], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
         return record
 
     if not deduped_hosts:
@@ -1042,10 +1133,79 @@ def _looks_like_data(content_type: str, body: str) -> bool:
     return stripped.startswith('{') or stripped.startswith('[')
 
 
-def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False) -> dict:
+_LOGIN_URL_MARKERS = ('login', 'signin', 'sign-in', 'sso', 'oauth', 'auth/realms', 'account/login', 'session/new', 'adfs', 'saml', 'idp')
+_LOGIN_BODY_MARKERS = (
+    'type="password"', "type='password'", 'name="password"', 'id="password"',
+    '<title>login', '<title>sign in', 'login required', 'please sign in',
+    'authentication required', 'name="username"', "name='username'",
+)
+
+
+def _login_page_fingerprint(requested_url: str, final_url: str, body: str) -> dict | None:
+    if not _is_login_redirect(requested_url, final_url, body):
+        return None
+    requested = urlsplit(requested_url)
+    final = urlsplit(final_url or requested_url)
+    lowered_body = body.lower()
+    title_match = re.search(r'<title[^>]*>\s*([^<]{1,120})', body, re.IGNORECASE)
+    action_match = re.search(r'<form[^>]+action=["\']([^"\']{1,200})', body, re.IGNORECASE)
+    title = ' '.join((title_match.group(1) if title_match else '').split())
+    action = action_match.group(1) if action_match else ''
+    final_host = (final.hostname or '').lower()
+    requested_host = (requested.hostname or '').lower()
+    aa_markers = ('american airlines', 'aa.com', 'aadvantage', 'aadis', 'adfs', 'okta', 'sso')
+    corporate = final_host.endswith('.aa.com') or any(marker in lowered_body for marker in aa_markers)
+    same_host = final_host == requested_host
+    if corporate:
+        classification = 'corporate_sso'
+    elif same_host:
+        classification = 'application_login'
+    else:
+        classification = 'external_sso'
+    key = '|'.join((classification, final_host, final.path.lower(), title.lower(), action.lower()))
+    return {
+        'classification': classification,
+        'final_host': final_host,
+        'final_path': final.path or '/',
+        'title': title[:120],
+        'form_action': action[:200],
+        'password_form': 'type="password"' in lowered_body or "type='password'" in lowered_body,
+        'fingerprint': key,
+    }
+
+
+def _record_login_redirect(probe_log: list[dict], seen: set[str], *, thread_name: str, host: str, requested_url: str, final_url: str, body: str, path: str | None = None) -> dict | None:
+    fingerprint = _login_page_fingerprint(requested_url, final_url, body)
+    if not fingerprint:
+        return None
+    if fingerprint['fingerprint'] not in seen:
+        seen.add(fingerprint['fingerprint'])
+        probe_log.append({
+            'thread_id': thread_name,
+            'host': host,
+            'path': path,
+            'status': 'login_redirect',
+            'requested_url': requested_url,
+            **fingerprint,
+            'timestamp': time.time(),
+        })
+    return fingerprint
+
+
+def _is_login_redirect(requested_url: str, final_url: str, body: str) -> bool:
+    """True when a 200 response is really a login/auth page, often reached via redirect."""
+    final = (final_url or '').lower()
+    redirected = bool(final) and final.rstrip('/') != (requested_url or '').lower().rstrip('/')
+    url_login = any(marker in final for marker in _LOGIN_URL_MARKERS)
+    body_login = any(marker in body.lower() for marker in _LOGIN_BODY_MARKERS)
+    return (redirected and url_login) or body_login
+
+
+def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False, progress=None) -> dict:
     deduped_hosts = sorted(set(hosts))
     assets: list[dict] = []
     probe_log: list[dict] = []
+    login_seen: set[str] = set()
     thread_status: list[dict] = []
     max_workers = _bounded_workers(len(deduped_hosts))
 
@@ -1063,6 +1223,10 @@ def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False) -
                 continue
             if code == 200:
                 exposes = _looks_like_data(hdrs.get('content-type', ''), body)
+                # A redirect/landing on a login page is not a real debug exposure.
+                if not exposes and _is_login_redirect(url, hdrs.get('x-final-url', url), body):
+                    _record_login_redirect(probe_log, login_seen, thread_name=thread_name, host=host, requested_url=url, final_url=hdrs.get('x-final-url', url), body=body, path=path)
+                    continue
                 findings.append({'type': 'debug_endpoint', 'path': path, 'status_code': code, 'exposes_data': bool(exposes), 'severity': 'high' if exposes else 'medium'})
                 probe_log.append({'thread_id': thread_name, 'host': host, 'path': path, 'status_code': code, 'status': 'found', 'timestamp': time.time()})
                 if path in ('/v2/api-docs', '/v3/api-docs', '/openapi.json', '/swagger.json') and exposes:
@@ -1108,6 +1272,7 @@ def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False) -
         }
         assets.append(record)
         thread_status.append({'thread_id': thread_name, 'host': host, 'status': record['status'], 'findings': len(findings), 'timestamp': time.time()})
+        _emit_progress(progress, {'targets': list(deduped_hosts), 'assets': list(assets), 'discovered': [row['domain'] for row in assets if row.get('findings')], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
         return record
 
     if not deduped_hosts:
@@ -1123,6 +1288,103 @@ def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False) -
         'assets': sorted(assets, key=lambda r: r['domain']),
         'probe_log': probe_log,
         'thread_status': thread_status,
+        'threads': max_workers,
+    }
+
+
+# Ports that should not be exposed on a public web endpoint. Web ports 80/443 are
+# expected and never flagged. Value is (service, severity).
+_UNEXPECTED_PORTS: dict[int, tuple[str, str]] = {
+    21: ('ftp', 'high'),
+    22: ('ssh', 'medium'),
+    23: ('telnet', 'high'),
+    25: ('smtp', 'low'),
+    1433: ('mssql', 'critical'),
+    2375: ('docker-api', 'critical'),
+    2376: ('docker-tls', 'high'),
+    3306: ('mysql', 'critical'),
+    3389: ('rdp', 'high'),
+    5432: ('postgresql', 'critical'),
+    5601: ('kibana', 'high'),
+    5900: ('vnc', 'high'),
+    5984: ('couchdb', 'high'),
+    6379: ('redis', 'critical'),
+    8000: ('http-dev', 'low'),
+    8080: ('http-alt', 'low'),
+    8443: ('https-alt', 'low'),
+    8888: ('http-alt', 'low'),
+    9000: ('dev-service', 'medium'),
+    9200: ('elasticsearch', 'critical'),
+    11211: ('memcached', 'high'),
+    15672: ('rabbitmq-mgmt', 'medium'),
+    27017: ('mongodb', 'critical'),
+}
+
+
+def _tcp_port_open(ip: str, port: int, timeout: float = 1.5) -> bool:
+    family = socket.AF_INET6 if ':' in ip else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        return sock.connect_ex((ip, port)) == 0
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def _port_scan_tests(hosts: list[str], *, use_external_tools: bool = False, progress=None) -> dict:
+    """Resolve the IP(s) behind each live host and flag unexpected open ports."""
+    deduped_hosts = sorted(set(hosts))
+    assets: list[dict] = []
+    probe_log: list[dict] = []
+    thread_status: list[dict] = []
+    max_workers = _bounded_workers(len(deduped_hosts))
+
+    def scan_host(host: str) -> dict:
+        thread_name = threading.current_thread().name
+        findings: list[dict] = []
+        open_ports: list[int] = []
+        for ip in sorted(_resolve_host_ips(host)):
+            for port, (service, severity) in sorted(_UNEXPECTED_PORTS.items()):
+                attempt = {'thread_id': thread_name, 'host': host, 'ip': ip, 'port': port, 'status': 'checking', 'timestamp': time.time()}
+                probe_log.append(attempt)
+                if _tcp_port_open(ip, port):
+                    attempt['status'] = 'open'
+                    open_ports.append(port)
+                    findings.append({'type': 'open_port', 'ip': ip, 'port': port, 'service': service, 'severity': severity})
+                else:
+                    attempt['status'] = 'closed'
+
+        record = {
+            'domain': host,
+            'status': 'findings' if findings else 'no_findings',
+            'kind': 'port-scan',
+            'ports': sorted(set(open_ports)),
+            'findings': findings,
+            'source': ', '.join(f"{f['ip']}:{f['port']} {f['service']}" for f in findings) if findings else 'port-scan',
+            'sources': [f"{f['ip']}:{f['port']} {f['service']}" for f in findings] or ['port-scan'],
+            'source_count': len(findings),
+            'evidence': [],
+        }
+        assets.append(record)
+        thread_status.append({'thread_id': thread_name, 'host': host, 'status': record['status'], 'open_ports': record['ports'], 'timestamp': time.time()})
+        _emit_progress(progress, {'assets': list(assets), 'discovered': [row['domain'] for row in assets if row.get('findings')], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
+        return record
+
+    if not deduped_hosts:
+        return {'discovered': [], 'assets': [], 'probe_log': [], 'thread_status': [], 'threads': 0}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(scan_host, host) for host in deduped_hosts]
+        _drain_futures(futures, probe_log)
+
+    hits = [a for a in assets if a.get('findings')]
+    return {
+        'discovered': sorted(a['domain'] for a in hits),
+        'assets': sorted(hits, key=lambda r: r['domain']),
+        'probe_log': _cap_log(probe_log),
+        'thread_status': _cap_log(thread_status),
         'threads': max_workers,
     }
 
@@ -1180,7 +1442,7 @@ def _api_candidate_hosts() -> list[str]:
     return candidates
 
 
-def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: bool = False) -> dict:
+def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: bool = False, progress=None, scan_progress: dict | None = None) -> dict:
     job_name = (job.get('name') or '').strip()
     job_type = (job.get('type', 'passive') or 'passive').lower()
     if job_type in {'github', 'repo', 'monitor'}:
@@ -1229,10 +1491,27 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             if is_in_scope(host, allowed_scope):
                 deduped_targets.append(host)
 
-        deduped_targets, _truncated = _cap_hosts(deduped_targets)
-        probe_result = _probe_live_web_assets(deduped_targets, use_external_tools=use_external_tools)
+        previous_progress = scan_progress or {}
+        candidate_set = set(deduped_targets)
+        processed = list(dict.fromkeys(host for host in previous_progress.get('processed_hosts', []) if host in candidate_set))
+        processed_set = set(processed)
+        remaining = [host for host in deduped_targets if host not in processed_set]
+        batch, _truncated = _cap_hosts(remaining)
+        previous_assets = {asset['domain']: asset for asset in previous_progress.get('assets', [])
+                           if isinstance(asset, dict) and asset.get('domain') in candidate_set}
+
+        def report_progress(snapshot: dict) -> None:
+            if progress is None:
+                return
+            partial_assets = dict(previous_assets)
+            partial_assets.update({asset['domain']: asset for asset in snapshot.get('assets', []) if isinstance(asset, dict) and asset.get('domain')})
+            progress({**snapshot, 'targets': batch, 'assets': list(partial_assets.values()),
+                      'discovered': sorted(partial_assets), 'total_candidates': len(deduped_targets),
+                      'processed_count': len(processed), 'remaining_count': len(remaining)})
+
+        probe_result = _probe_live_web_assets(batch, use_external_tools=use_external_tools, progress=report_progress)
         live_assets = probe_result.get('assets', probe_result.get('discovered', [])) if isinstance(probe_result, dict) else probe_result
-        deduped = {}
+        deduped = dict(previous_assets)
         for asset in live_assets:
             domain = asset['domain']
             existing = deduped.setdefault(domain, {
@@ -1243,21 +1522,28 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
                 'source_count': 1,
                 'evidence': [],
             })
-            existing['evidence'] += asset['evidence']
+            existing['evidence'] = asset['evidence']
             existing['sources'] = list(dict.fromkeys(existing['sources'] + asset['sources']))
             existing['source_count'] = len(existing['sources'])
         ordered_assets = [deduped[host] for host in sorted(deduped)]
+        processed.extend(batch)
+        incomplete = len(processed) < len(deduped_targets)
         response = {
             'job': job_name,
             'program': job.get('program', DEFAULT_PROGRAM),
             'type': 'active',
-            'targets': deduped_targets,
-            'queued': deduped_targets,
-            'skipped': [host for host in sorted(set(merged_candidates)) if host and host not in deduped_targets],
-            'status': 'ok' if ordered_assets else 'no_new_assets',
+            'targets': batch,
+            'queued': batch,
+            'skipped': [host for host in sorted(set(merged_candidates)) if host and host not in candidate_set],
+            'status': 'queued' if incomplete else ('ok' if ordered_assets else 'no_new_assets'),
+            'job_state': 'queued' if incomplete else 'completed',
             'discovered': sorted(deduped),
             'assets': ordered_assets,
             'source_count': sum(len(asset.get('sources', [])) for asset in ordered_assets),
+            'total_candidates': len(deduped_targets),
+            'processed_count': len(processed),
+            'remaining_count': len(deduped_targets) - len(processed),
+            'processed_hosts': processed,
             'depends_on': ['aa-passive-discovery', 'american-airlines-passive-dns'],
         }
         if isinstance(probe_result, dict):
@@ -1293,7 +1579,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             live_hosts = [row.get('domain') for row in live_hosts if isinstance(row, dict) and row.get('domain')]
         deduped_hosts = sorted({host for host in live_hosts if isinstance(host, str) and host.strip()})
         deduped_hosts, _truncated = _cap_hosts(deduped_hosts)
-        enum_result = _enumerate_live_services(deduped_hosts, use_external_tools=use_external_tools)
+        enum_result = _enumerate_live_services(deduped_hosts, use_external_tools=use_external_tools, progress=progress)
         assets = enum_result.get('assets', [])
         response = {
             'job': job_name,
@@ -1337,7 +1623,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             payload = {}
         service_assets = [a for a in (payload.get('assets', []) or []) if isinstance(a, dict) and a.get('domain')]
         evaluated_hosts = sorted({a['domain'] for a in service_assets})
-        vhost_result = _run_vhost_discovery(service_assets)
+        vhost_result = _run_vhost_discovery(service_assets, progress=progress)
         assets = vhost_result.get('assets', [])
         response = {
             'job': job_name,
@@ -1401,7 +1687,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
                 deduped_hosts.append(host)
 
         deduped_hosts, _truncated = _cap_hosts(deduped_hosts)
-        enum_result = _directory_enumeration(deduped_hosts, use_external_tools=use_external_tools)
+        enum_result = _directory_enumeration(deduped_hosts, use_external_tools=use_external_tools, progress=progress)
         assets = enum_result.get('assets', [])
         response = {
             'job': job_name,
@@ -1433,7 +1719,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
         hosts = _combined_live_hosts()
         deduped_hosts = [h for h in hosts if is_in_scope(h, allowed_scope)]
         deduped_hosts, _truncated = _cap_hosts(deduped_hosts)
-        test_result = _application_security_tests(deduped_hosts, use_external_tools=use_external_tools)
+        test_result = _application_security_tests(deduped_hosts, use_external_tools=use_external_tools, progress=progress)
         assets = test_result.get('assets', [])
         response = {
             'job': job_name, 'program': job.get('program', DEFAULT_PROGRAM), 'type': 'active',
@@ -1459,7 +1745,7 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             }
         api_hosts = [h for h in _api_candidate_hosts() if is_in_scope(h, allowed_scope)]
         api_hosts, _truncated = _cap_hosts(api_hosts)
-        test_result = _api_endpoint_tests(api_hosts, use_external_tools=use_external_tools)
+        test_result = _api_endpoint_tests(api_hosts, use_external_tools=use_external_tools, progress=progress)
         assets = test_result.get('assets', [])
         response = {
             'job': job_name, 'program': job.get('program', DEFAULT_PROGRAM), 'type': 'active',
@@ -1468,6 +1754,33 @@ def run_passive_job(job: dict, allowed_scope: list[str], *, use_external_tools: 
             'discovered': test_result.get('discovered', []), 'assets': assets,
             'source_count': sum(len(a.get('findings', [])) for a in assets),
             'depends_on': ['directory-enumeration-live-hosts'],
+        }
+        response['probe_log'] = test_result.get('probe_log', [])
+        response['thread_status'] = test_result.get('thread_status', [])
+        response['probe_threads'] = test_result.get('threads', 0)
+        return response
+
+    if job_name == 'port-scan-live-hosts':
+        dep_path = RESULTS_DIR / 'service-enumeration-live-hosts.json'
+        if not dep_path.exists():
+            return {
+                'job': job_name, 'program': job.get('program', DEFAULT_PROGRAM), 'type': 'active',
+                'targets': [], 'queued': [], 'skipped': [], 'status': 'waiting_on_dependencies',
+                'job_state': 'waiting_on_dependencies', 'discovered': [], 'assets': [], 'source_count': 0,
+                'dependencies': ['service-enumeration-live-hosts'],
+            }
+        hosts = _combined_live_hosts()
+        deduped_hosts = [h for h in hosts if is_in_scope(h, allowed_scope)]
+        deduped_hosts, _truncated = _cap_hosts(deduped_hosts)
+        test_result = _port_scan_tests(deduped_hosts, use_external_tools=use_external_tools, progress=progress)
+        assets = test_result.get('assets', [])
+        response = {
+            'job': job_name, 'program': job.get('program', DEFAULT_PROGRAM), 'type': 'active',
+            'targets': deduped_hosts, 'queued': deduped_hosts, 'skipped': [],
+            'status': 'ok' if test_result.get('discovered') else 'no_findings',
+            'discovered': test_result.get('discovered', []), 'assets': assets,
+            'source_count': sum(len(a.get('findings', [])) for a in assets),
+            'depends_on': ['service-enumeration-live-hosts'],
         }
         response['probe_log'] = test_result.get('probe_log', [])
         response['thread_status'] = test_result.get('thread_status', [])
@@ -1582,7 +1895,7 @@ def main() -> None:
             lock_path = RUNNING_DIR / f'{job_path.stem}.lock'
             if lock_path.exists():
                 lock_path.unlink()
-            print(json.dumps({'job': job.get('name'), 'status': 'skipped_active', 'reason': 'requires --allow-active'}, indent=2))
+            print(json.dumps({'job': job.get('name'), 'status': 'skipped_active', 'reason': 'requires --allow-active'}, indent=2), file=sys.stderr)
             continue
         dependencies = job_workflow_dependencies(job.get('name'))
         if dependencies:
@@ -1601,22 +1914,83 @@ def main() -> None:
                 if state not in (COMPLETED_STATUSES | {'completed'}):
                     pending.append(dependency)
             if pending:
-                print(json.dumps({'job': job.get('name'), 'status': 'waiting_on_dependencies', 'dependencies': pending}, indent=2))
+                print(json.dumps({'job': job.get('name'), 'status': 'waiting_on_dependencies', 'dependencies': pending}, indent=2), file=sys.stderr)
                 continue
         if not args.force and _lock_is_active(job_path.stem):
-            print(json.dumps({'job': job.get('name'), 'status': 'busy', 'reason': 'another run holds the lock'}, indent=2))
+            print(json.dumps({'job': job.get('name'), 'status': 'busy', 'reason': 'another run holds the lock'}, indent=2), file=sys.stderr)
             continue
         if not args.force and not should_run_job(job_path):
             continue
         RUNNING_DIR.mkdir(parents=True, exist_ok=True)
         lock_path = RUNNING_DIR / f'{job_path.stem}.lock'
         lock_path.write_text(str(os.getpid()), encoding='utf-8')
+        out_path = RESULTS_DIR / f"{job_path.stem}.json"
+        progress_path = RESULTS_DIR / '.scan-progress' / f'{job_path.stem}.json'
+        scan_progress: dict = {}
+        if job.get('name') == 'confirm-live-web-assets':
+            try:
+                scan_progress = json.loads(progress_path.read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                try:
+                    old_result = json.loads(out_path.read_text(encoding='utf-8'))
+                except (OSError, ValueError):
+                    old_result = {}
+                if old_result.get('status') in COMPLETED_STATUSES:
+                    scan_progress = {'processed_hosts': old_result.get('processed_hosts', old_result.get('targets', [])),
+                                     'assets': old_result.get('assets', [])}
+            if args.force and scan_progress.get('completed'):
+                scan_progress = {}
+        progress_lock = threading.Lock()
+        running_payload = {
+            'job': job.get('name'),
+            'program': job.get('program', DEFAULT_PROGRAM),
+            'type': job.get('type', 'passive'),
+            'targets': job.get('targets', []),
+            'queued': job.get('targets', []),
+            'skipped': [],
+            'status': 'running',
+            'job_state': 'running',
+            'discovered': [],
+            'assets': [],
+            'source_count': 0,
+            'depends_on': job_workflow_dependencies(job.get('name')),
+            'probe_log': [],
+            'thread_status': [],
+            'probe_threads': 0,
+        }
+        if job.get('name') == 'confirm-live-web-assets':
+            running_payload.update({
+                'assets': scan_progress.get('assets', []),
+                'discovered': sorted(asset['domain'] for asset in scan_progress.get('assets', []) if isinstance(asset, dict) and asset.get('domain')),
+                'processed_count': len(scan_progress.get('processed_hosts', [])),
+                'processed_hosts': scan_progress.get('processed_hosts', []),
+            })
+        _atomic_write_json(out_path, running_payload)
+
+        def checkpoint(snapshot: dict) -> None:
+            assets = snapshot.get('assets', []) or []
+            payload = dict(running_payload)
+            targets = snapshot.get('targets', running_payload['targets']) or running_payload['targets']
+            payload.update({
+                'targets': targets,
+                'queued': targets,
+                'discovered': snapshot.get('discovered', []),
+                'assets': assets,
+                'source_count': sum(len(asset.get('findings', [])) for asset in assets if isinstance(asset, dict)),
+                'probe_log': _cap_log(snapshot.get('probe_log', []) or []),
+                'thread_status': _cap_log(snapshot.get('thread_status', []) or []),
+                'probe_threads': snapshot.get('threads', 0),
+            })
+            if job.get('name') == 'confirm-live-web-assets':
+                payload.update({key: snapshot[key] for key in ('total_candidates', 'processed_count', 'remaining_count') if key in snapshot})
+            with progress_lock:
+                _atomic_write_json(out_path, payload)
+
         try:
             allowed_scope = read_scope_file(job.get('program', DEFAULT_PROGRAM))
-            result = run_passive_job(job, allowed_scope, use_external_tools=args.external_probes)
+            result = run_passive_job(job, allowed_scope, use_external_tools=args.external_probes, progress=checkpoint, scan_progress=scan_progress)
             if not RESULTS_DIR.exists():
                 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-            out_path = RESULTS_DIR / f"{job_path.stem}.json"
             previous = None
             if out_path.exists():
                 try:
@@ -1626,7 +2000,13 @@ def main() -> None:
             # Active steps derive targets/results from the current run only; merging would
             # carry stale targets forward. Passive discovery still accumulates across runs.
             merged_result = _result_for_write(job.get('name'), previous, result)
-            out_path.write_text(json.dumps(merged_result, indent=2), encoding='utf-8')
+            _atomic_write_json(out_path, merged_result)
+            if job.get('name') == 'confirm-live-web-assets' and 'processed_hosts' in merged_result:
+                _atomic_write_json(progress_path, {
+                    'processed_hosts': merged_result['processed_hosts'],
+                    'assets': merged_result['assets'],
+                    'completed': merged_result.get('job_state') == 'completed',
+                })
             all_results.append(merged_result)
         finally:
             if lock_path.exists():

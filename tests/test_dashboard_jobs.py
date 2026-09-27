@@ -123,6 +123,18 @@ class DashboardJobMetadataTest(unittest.TestCase):
         finally:
             result_path.unlink(missing_ok=True)
 
+    def test_port_scan_waits_for_later_application_stages_but_api_does_not(self):
+        from worker import job_workflow_dependencies
+
+        self.assertEqual(
+            job_workflow_dependencies('port-scan-live-hosts'),
+            ['vhost-discovery-shared-infra', 'directory-enumeration-live-hosts', 'application-security-testing'],
+        )
+        self.assertEqual(
+            job_workflow_dependencies('api-endpoint-testing'),
+            ['directory-enumeration-live-hosts'],
+        )
+
     def test_resource_caps_bound_hosts_and_workers(self):
         import worker as w
         with patch.object(w, 'MAX_HOSTS_PER_RUN', 3), patch.object(w, 'MAX_WORKERS', 2):
@@ -248,6 +260,11 @@ class DashboardJobMetadataTest(unittest.TestCase):
         result = _probe_vhost('2001:db8::904b', 'host.example.com')
         self.assertIn('ok', result)
         self.assertFalse(result['ok'])
+        # Evidence must carry source/url so the dashboard Source column renders.
+        self.assertIn('source', result)
+        self.assertIn('url', result)
+        self.assertTrue(result['source'])
+        self.assertTrue(result['url'].startswith('http'))
 
     def test_run_vhost_discovery_survives_ipv6_candidate(self):
         # A single malformed/unreachable probe must not crash the whole run.
@@ -494,6 +511,149 @@ class DashboardJobMetadataTest(unittest.TestCase):
             debug = [f for f in asset['findings'] if f['type'] == 'debug_endpoint']
             self.assertTrue(any(f['path'] == '/actuator/env' and f['exposes_data'] for f in debug))
 
+    def test_api_debug_endpoint_ignores_login_redirect(self):
+        from worker import _api_endpoint_tests
+
+        class FakeResp:
+            def __init__(self, status, headers, body=b'', final_url='https://api.example.com/login'):
+                self.status = status
+                self._headers = headers
+                self._body = body
+                self._final = final_url
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def getcode(self):
+                return self.status
+            def geturl(self):
+                return self._final
+            def read(self, n=None):
+                return self._body
+            @property
+            def headers(self):
+                class H(dict):
+                    def items(inner):
+                        return list(super().items())
+                h = H(); h.update(self._headers); return h
+
+        # Every debug path 200s but is really a redirect to an HTML login page.
+        def fake_urlopen(req, timeout=8):
+            return FakeResp(200, {'Content-Type': 'text/html'}, b'<html><form><input type="password"></form></html>')
+
+        with patch('worker.urllib_request.urlopen', side_effect=fake_urlopen):
+            result = _api_endpoint_tests(['api.example.com'])
+            asset = next(a for a in result['assets'] if a['domain'] == 'api.example.com')
+            debug = [f for f in asset['findings'] if f['type'] == 'debug_endpoint']
+            self.assertEqual(debug, [])
+            self.assertEqual(asset['status'], 'no_findings')
+
+    def test_login_page_classifier_distinguishes_sso_and_application_login(self):
+        from worker import _login_page_fingerprint, _record_login_redirect
+
+        sso = _login_page_fingerprint(
+            'https://app.example.com/actuator/health',
+            'https://login.aa.com/sso/signin',
+            '<title>American Airlines Sign In</title><form action="/sso"><input type="password">',
+        )
+        app = _login_page_fingerprint(
+            'https://app.example.com/admin',
+            'https://app.example.com/login',
+            '<title>Customer Portal Login</title><form action="/login"><input type="password">',
+        )
+        self.assertEqual(sso['classification'], 'corporate_sso')
+        self.assertEqual(app['classification'], 'application_login')
+        self.assertEqual(sso['final_host'], 'login.aa.com')
+        self.assertTrue(app['password_form'])
+
+        probe_log = []
+        seen = set()
+        _record_login_redirect(probe_log, seen, thread_name='test', host='app.example.com', requested_url='https://app.example.com/a', final_url='https://login.aa.com/sso/signin', body='<title>American Airlines Sign In</title>')
+        _record_login_redirect(probe_log, seen, thread_name='test', host='app.example.com', requested_url='https://app.example.com/b', final_url='https://login.aa.com/sso/signin', body='<title>American Airlines Sign In</title>')
+        self.assertEqual(len(probe_log), 1)
+
+    def test_directory_enumeration_ignores_login_redirect(self):
+        from worker import _directory_enumeration
+
+        class FakeResp:
+            status = 200
+            headers = {'Content-Type': 'text/html'}
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def getcode(self):
+                return self.status
+            def geturl(self):
+                return 'https://app.example.com/login'
+            def read(self, n=None):
+                return b'<title>Login</title><form><input type="password"></form>'
+
+        with patch('worker.urllib_request.urlopen', return_value=FakeResp()):
+            result = _directory_enumeration(['app.example.com'], wordlist=['/admin'])
+
+        self.assertEqual(result['assets'][0]['paths'], [])
+        self.assertEqual(result['assets'][0]['status'], 'no_paths')
+
+    def test_application_security_ignores_login_page(self):
+        from worker import _application_security_tests
+
+        class FakeResp:
+            status = 200
+            headers = {'Content-Type': 'text/html'}
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def getcode(self):
+                return self.status
+            def geturl(self):
+                return 'https://app.example.com/signin'
+            def read(self, n=None):
+                return b'<title>Sign In</title><input name="username"><input type="password">'
+
+        with patch('worker.urllib_request.urlopen', return_value=FakeResp()):
+            result = _application_security_tests(['app.example.com'])
+
+        self.assertEqual(result['assets'][0]['findings'], [])
+        self.assertEqual(result['assets'][0]['status'], 'no_findings')
+
+    def test_highest_severity_returns_top_rank(self):
+        from dashboard_app import highest_severity
+        self.assertEqual(highest_severity([{'severity': 'low'}, {'severity': 'high'}, {'severity': 'medium'}]), 'High')
+        self.assertEqual(highest_severity([{'severity': 'info'}]), 'Info')
+        self.assertIsNone(highest_severity([]))
+        self.assertIsNone(highest_severity(None))
+
+    def test_port_scan_flags_unexpected_open_port(self):
+        from worker import _port_scan_tests
+
+        # host resolves to one IP; only the Redis port (6379) is open.
+        def fake_open(ip, port, timeout=1.5):
+            return ip == '203.0.113.5' and port == 6379
+
+        with patch('worker._resolve_host_ips', side_effect=lambda h: {'203.0.113.5'}), \
+             patch('worker._tcp_port_open', side_effect=fake_open):
+            result = _port_scan_tests(['host.example.com'])
+
+        asset = next(a for a in result['assets'] if a['domain'] == 'host.example.com')
+        open_ports = [f for f in asset['findings'] if f['type'] == 'open_port']
+        self.assertTrue(any(f['port'] == 6379 and f['service'] == 'redis' and f['severity'] == 'critical' for f in open_ports))
+        self.assertIn(6379, asset['ports'])
+        self.assertEqual(asset['status'], 'findings')
+        self.assertIn('host.example.com', result['discovered'])
+
+    def test_port_scan_no_findings_when_all_closed(self):
+        from worker import _port_scan_tests
+
+        with patch('worker._resolve_host_ips', side_effect=lambda h: {'203.0.113.9'}), \
+             patch('worker._tcp_port_open', side_effect=lambda ip, port, timeout=1.5: False):
+            result = _port_scan_tests(['host.example.com'])
+
+        # Hosts with no open ports are not reported at all.
+        self.assertEqual(result['assets'], [])
+        self.assertEqual(result['discovered'], [])
+
     def test_service_enumeration_uses_step3_live_asset_output(self):
         result_path = ROOT / 'results' / 'confirm-live-web-assets.json'
         result_path.parent.mkdir(parents=True, exist_ok=True)
@@ -551,6 +711,139 @@ class DashboardJobMetadataTest(unittest.TestCase):
 
         (root / 'aa-passive-discovery.json').unlink(missing_ok=True)
         (root / 'american-airlines-passive-dns.json').unlink(missing_ok=True)
+
+    def test_confirm_live_web_assets_advances_batches_and_keeps_discoveries(self):
+        import json
+        from tempfile import TemporaryDirectory
+        from worker import run_passive_job
+
+        with TemporaryDirectory() as directory, patch('worker.RESULTS_DIR', Path(directory)), \
+             patch('worker.MAX_HOSTS_PER_RUN', 2):
+            root = Path(directory)
+            (root / 'aa-passive-discovery.json').write_text(json.dumps({
+                'discovered': [f'h{number}.example.com' for number in range(5)], 'targets': [],
+            }), encoding='utf-8')
+            (root / 'american-airlines-passive-dns.json').write_text(json.dumps({'discovered': [], 'targets': []}), encoding='utf-8')
+            batches = []
+
+            def fake_probe(hosts, **kwargs):
+                batches.append(list(hosts))
+                assets = [{'domain': host, 'status': 'live', 'sources': ['http-probe'],
+                           'evidence': [{'source': 'http-probe', 'url': f'https://{host}'}]}
+                          for host in hosts if host == 'h0.example.com']
+                return {'assets': assets, 'discovered': [asset['domain'] for asset in assets]}
+
+            progress = {}
+            with patch('worker._probe_live_web_assets', side_effect=fake_probe):
+                for expected_processed in (2, 4, 5):
+                    result = run_passive_job({'name': 'confirm-live-web-assets', 'program': 'american-airlines'},
+                                             ['*.example.com'], scan_progress=progress)
+                    self.assertEqual(len(result['processed_hosts']), expected_processed)
+                    self.assertEqual(result['discovered'], ['h0.example.com'])
+                    self.assertEqual(result['status'] == 'ok', expected_processed == 5)
+                    progress = {'processed_hosts': result['processed_hosts'], 'assets': result['assets']}
+            self.assertEqual(batches, [
+                ['h0.example.com', 'h1.example.com'],
+                ['h2.example.com', 'h3.example.com'],
+                ['h4.example.com'],
+            ])
+
+    def test_confirm_live_progress_survives_queued_result_overwrite(self):
+        import io
+        import json
+        from contextlib import redirect_stdout
+        from tempfile import TemporaryDirectory
+        import worker
+
+        with TemporaryDirectory() as directory, \
+             patch.object(worker, 'RESULTS_DIR', Path(directory)), \
+             patch.object(worker, 'RUNNING_DIR', Path(directory) / '.running'), \
+             patch.object(worker, 'MAX_HOSTS_PER_RUN', 2), \
+             patch.object(worker, 'discover_jobs', return_value=[Path('confirm-live-web-assets.yaml')]), \
+             patch.object(worker, 'load_job', return_value={'name': 'confirm-live-web-assets', 'program': 'american-airlines', 'type': 'active'}), \
+             patch.object(worker, 'read_scope_file', return_value=['*.example.com']), \
+             patch('sys.argv', ['worker.py', '--allow-active']), \
+             patch.object(worker, '_probe_live_web_assets') as probe:
+            root = Path(directory)
+            (root / 'aa-passive-discovery.json').write_text(json.dumps({'status': 'ok', 'discovered': [f'h{number}.example.com' for number in range(5)]}), encoding='utf-8')
+            (root / 'american-airlines-passive-dns.json').write_text(json.dumps({'status': 'ok', 'discovered': []}), encoding='utf-8')
+            probe.side_effect = lambda hosts, **kwargs: {'assets': [
+                {'domain': host, 'sources': ['http-probe'], 'evidence': []} for host in hosts
+            ]}
+            out_path = root / 'confirm-live-web-assets.json'
+            for expected in (2, 4, 5):
+                if expected == 4:
+                    sys.argv.append('--force')
+                with redirect_stdout(io.StringIO()):
+                    worker.main()
+                if expected == 4:
+                    sys.argv.remove('--force')
+                payload = json.loads(out_path.read_text(encoding='utf-8'))
+                self.assertEqual(payload['processed_count'], expected)
+                self.assertEqual(payload['job_state'], 'completed' if expected == 5 else 'queued')
+                self.assertEqual(len(payload['assets']), expected)
+                if expected == 2:
+                    out_path.write_text(json.dumps({'status': 'queued', 'job_state': 'queued'}), encoding='utf-8')
+            self.assertEqual([call.args[0] for call in probe.call_args_list], [
+                ['h0.example.com', 'h1.example.com'],
+                ['h2.example.com', 'h3.example.com'],
+                ['h4.example.com'],
+            ])
+
+    def test_legacy_capped_confirm_result_is_eligible_for_continuation(self):
+        import json
+        from tempfile import TemporaryDirectory
+        from worker import should_run_job
+
+        with TemporaryDirectory() as directory, patch('worker.RESULTS_DIR', Path(directory)), \
+             patch('worker.MAX_HOSTS_PER_RUN', 2):
+            result_path = Path(directory) / 'confirm-live-web-assets.json'
+            result_path.write_text(json.dumps({'status': 'ok', 'targets': ['a.example.com', 'b.example.com']}), encoding='utf-8')
+            self.assertTrue(should_run_job(Path('confirm-live-web-assets.yaml')))
+
+    def test_legacy_confirm_result_resumes_at_next_batch(self):
+        import io
+        import json
+        from contextlib import redirect_stdout
+        from tempfile import TemporaryDirectory
+        import worker
+
+        with TemporaryDirectory() as directory, \
+             patch.object(worker, 'RESULTS_DIR', Path(directory)), \
+             patch.object(worker, 'RUNNING_DIR', Path(directory) / '.running'), \
+             patch.object(worker, 'MAX_HOSTS_PER_RUN', 2), \
+             patch.object(worker, 'discover_jobs', return_value=[Path('confirm-live-web-assets.yaml')]), \
+             patch.object(worker, 'load_job', return_value={'name': 'confirm-live-web-assets', 'program': 'american-airlines', 'type': 'active'}), \
+             patch.object(worker, 'read_scope_file', return_value=['*.example.com']), \
+             patch('sys.argv', ['worker.py', '--allow-active']), \
+             patch.object(worker, '_probe_live_web_assets', return_value={'assets': []}) as probe:
+            root = Path(directory)
+            (root / 'aa-passive-discovery.json').write_text(json.dumps({
+                'status': 'ok', 'discovered': [f'h{number}.example.com' for number in range(5)],
+            }), encoding='utf-8')
+            (root / 'american-airlines-passive-dns.json').write_text(json.dumps({'status': 'ok', 'discovered': []}), encoding='utf-8')
+            (root / 'confirm-live-web-assets.json').write_text(json.dumps({
+                'status': 'ok', 'targets': ['h0.example.com', 'h1.example.com'],
+                'assets': [{'domain': 'h0.example.com', 'sources': ['http-probe'], 'evidence': []}],
+            }), encoding='utf-8')
+            with redirect_stdout(io.StringIO()):
+                worker.main()
+            self.assertEqual(probe.call_args.args[0], ['h2.example.com', 'h3.example.com'])
+            payload = json.loads((root / 'confirm-live-web-assets.json').read_text(encoding='utf-8'))
+            self.assertEqual(payload['processed_count'], 4)
+            self.assertEqual(payload['discovered'], ['h0.example.com'])
+            self.assertEqual(payload['job_state'], 'queued')
+
+    def test_dashboard_shows_total_confirm_coverage(self):
+        job = {'name': 'confirm-live-web-assets', 'program': 'american-airlines',
+               'job_state': 'queued', 'status': 'queued', 'type': 'active',
+               'targets': ['a.example.com', 'b.example.com'], 'queued': [], 'skipped': [],
+               'discovered': [], 'assets': [], 'source_count': 0,
+               'raw': {'total_candidates': 5, 'processed_count': 2, 'remaining_count': 3}}
+        with patch('dashboard_app.list_jobs', return_value=[job]):
+            body = app.test_client().get('/').get_data(as_text=True)
+        self.assertIn('Checked:</strong> 2 / 5', body)
+        self.assertIn('2 / 5 hosts checked, 3 remaining', body)
 
     def test_dashboard_reports_dependency_wait_as_waiting_state(self):
         result_path = ROOT / 'results' / 'confirm-live-web-assets.json'
@@ -667,6 +960,34 @@ class DashboardJobMetadataTest(unittest.TestCase):
             self.assertTrue(all(item.get('source') for item in asset['evidence']))
             self.assertTrue(asset.get('source'))
 
+    def test_service_enumeration_emits_incremental_progress(self):
+        from worker import _enumerate_live_services
+
+        class FakeResponse:
+            status = 200
+            headers = {'Server': 'nginx'}
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def getcode(self):
+                return self.status
+
+        checkpoints = []
+
+        def fake_urlopen(req, timeout=8):
+            if req.full_url == 'https://alpha.example.com':
+                return FakeResponse()
+            raise OSError('no response')
+
+        with patch('worker.urllib_request.urlopen', side_effect=fake_urlopen):
+            _enumerate_live_services(['alpha.example.com'], progress=checkpoints.append)
+
+        self.assertTrue(checkpoints)
+        self.assertIn('alpha.example.com', checkpoints[-1]['discovered'])
+        self.assertEqual(checkpoints[-1]['targets'], ['alpha.example.com'])
+        self.assertEqual(checkpoints[-1]['assets'][0]['ports'], [443])
+
     def test_dashboard_can_queue_rerun_for_job(self):
         with patch('dashboard_app.subprocess.Popen', return_value=type('Proc', (), {'pid': 1234})()) as mock_popen, \
              patch.dict('os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token'}):
@@ -687,6 +1008,67 @@ class DashboardJobMetadataTest(unittest.TestCase):
                 response = client.post('/jobs/aa-passive-discovery/rerun')
                 self.assertEqual(response.status_code, 401)
                 mock_popen.assert_not_called()
+
+    def test_finding_review_survives_rescan_and_requires_auth(self):
+        from tempfile import TemporaryDirectory
+        from dashboard_app import review_candidates
+
+        jobs = [{'name': 'port-scan-live-hosts', 'assets': [{
+            'domain': 'host.example.com',
+            'findings': [{'type': 'open_port', 'ip': '203.0.113.4', 'port': 6379,
+                          'service': 'redis', 'severity': 'critical', 'detail': 'private evidence'}],
+        }]}]
+        finding_id = review_candidates(jobs)[0]['id']
+        with TemporaryDirectory() as directory, \
+             patch('dashboard_app.REVIEW_FILE', Path(directory) / 'reviews.json'), \
+             patch('dashboard_app.REVIEW_LOCK', Path(directory) / 'reviews.lock'), \
+             patch('dashboard_app.list_jobs', return_value=jobs), \
+             patch.dict('os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token'}):
+            with app.test_client() as client:
+                page = client.get('/review')
+                self.assertEqual(page.status_code, 200)
+                self.assertIn(b'host.example.com', page.data)
+                self.assertIn(b'href="https://host.example.com/"', page.data)
+                self.assertNotIn(b'private evidence', page.data)
+                endpoint = f'/review/{finding_id}'
+                decision = {'status': 'needs_account', 'scope': 'needs_verification'}
+                self.assertEqual(client.post(endpoint, json=decision).status_code, 401)
+                headers = {'X-BugBounty-Token': 'test-token'}
+                self.assertEqual(client.post(endpoint, json={'status': 'confirmed', 'scope': 'invalid'}, headers=headers).status_code, 400)
+                self.assertEqual(client.post('/review/' + '0' * 64, json=decision, headers=headers).status_code, 404)
+                self.assertEqual(client.post(endpoint, json=decision, headers=headers).status_code, 200)
+                self.assertIn(b'value="needs_account" selected', client.get('/review').data)
+                self.assertEqual(client.post(endpoint, json={'status': 'false_positive', 'scope': 'in_scope'}, headers=headers).status_code, 200)
+                self.assertIn(b'value="false_positive" selected', client.get('/review').data)
+                self.assertIn(b'value="in_scope" selected', client.get('/review').data)
+
+    def test_review_links_known_paths_and_rejects_unsafe_hosts(self):
+        from dashboard_app import review_candidates
+
+        jobs = [{'name': 'api-endpoint-testing', 'assets': [
+            {'domain': 'api.example.com', 'report_url': '/reports/api-endpoint-testing/api.example.com',
+             'findings': [{'type': 'debug_endpoint', 'path': '/actuator/health', 'severity': 'high'}]},
+            {'domain': 'api.example.com@malicious.test',
+             'findings': [{'type': 'debug_endpoint', 'path': '//malicious.test', 'severity': 'high'}]},
+        ]}]
+        candidates = review_candidates(jobs)
+        self.assertEqual(candidates[0]['target_url'], 'https://api.example.com/actuator/health')
+        self.assertEqual(candidates[0]['report_url'], '/reports/api-endpoint-testing/api.example.com')
+        self.assertIsNone(candidates[1]['target_url'])
+        web_port = review_candidates([{'name': 'port-scan-live-hosts', 'assets': [{
+            'domain': 'app.example.com', 'findings': [
+                {'type': 'open_port', 'service': 'http-alt', 'port': 8080},
+                {'type': 'open_port', 'service': 'redis', 'port': 6379},
+            ],
+        }]}])
+        self.assertEqual(web_port[0]['target_url'], 'http://app.example.com:8080/')
+        self.assertEqual(web_port[1]['target_url'], 'https://app.example.com/')
+        with patch('dashboard_app.list_jobs', return_value=jobs):
+            with app.test_client() as client:
+                page = client.get('/review')
+                self.assertIn(b'href="https://api.example.com/actuator/health"', page.data)
+                self.assertIn(b'href="/reports/api-endpoint-testing/api.example.com"', page.data)
+                self.assertNotIn(b'href="https://api.example.com@malicious.test', page.data)
 
     def test_rerun_launches_only_the_requested_job(self):
         with patch('dashboard_app.subprocess.Popen', return_value=type('Proc', (), {'pid': 4321})()) as mock_popen, \
