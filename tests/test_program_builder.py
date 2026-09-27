@@ -190,6 +190,38 @@ class ProgramBuilderTest(unittest.TestCase):
                 self.assertFalse(set(first.get_json()['jobs']) & set(second.get_json()['jobs']))
                 self.assertEqual(launch.call_count, 2)
 
+    def test_url_and_app_scope_creates_manual_only_program(self):
+        with TemporaryDirectory() as directory, \
+             patch('dashboard_app.ROOT', Path(directory)), \
+             patch('dashboard_app.JOBS_DIR', Path(directory) / 'jobs'), \
+             patch('dashboard_app.RESULTS_DIR', Path(directory) / 'results'), \
+             patch('dashboard_app.subprocess.Popen') as launch, \
+             patch.dict('dashboard_app.os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token', 'BUGBOUNTY_ALLOW_ACTIVE': '1'}):
+            scope = (b'identifier,asset_type,in_scope\n'
+                     b'https://app.example.com/restricted,URL,true\n'
+                     b'com.example.app,GOOGLE_PLAY_APP_ID,true\n')
+            with app.test_client() as client:
+                response = client.post('/programs/upload', data={
+                    'program_name': 'NBA Public',
+                    'scope_file': (io.BytesIO(scope), 'scope.csv'),
+                    'guidelines_text': 'Only known paths permitted.',
+                }, headers={'X-BugBounty-Token': 'test-token'})
+                self.assertEqual(response.status_code, 202)
+                self.assertEqual(response.get_json()['status'], 'manual_review')
+                self.assertEqual(response.get_json()['jobs'], [])
+                self.assertTrue((Path(directory) / 'programs/nba-public/scope-source.csv').exists())
+                inventory = json.loads((Path(directory) / 'programs/nba-public/scope-inventory.json').read_text())
+                self.assertEqual(inventory['eligible_asset_types'], {'URL': 1, 'GOOGLE_PLAY_APP_ID': 1})
+                self.assertEqual(list_jobs(), [])
+                self.assertIn(b'NBA Public', client.get('/').data)
+                duplicate = client.post('/programs/upload', data={
+                    'program_name': 'NBA Public',
+                    'scope_file': (io.BytesIO(scope), 'scope.csv'),
+                    'guidelines_text': 'Only known paths permitted.',
+                }, headers={'X-BugBounty-Token': 'test-token'})
+                self.assertEqual(duplicate.status_code, 409)
+                launch.assert_not_called()
+
     def test_rules_review_and_approval_requires_current_guidelines(self):
         with TemporaryDirectory() as directory, \
              patch('dashboard_app.ROOT', Path(directory)), \

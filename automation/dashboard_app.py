@@ -22,7 +22,7 @@ AUTOMATION_DIR = Path(__file__).resolve().parent
 if str(AUTOMATION_DIR) not in sys.path:
   sys.path.insert(0, str(AUTOMATION_DIR))
 
-from program_builder import active_approved, create_program, parse_scope, read_guidelines, set_active_approval, slug_from_program_name
+from program_builder import active_approved, create_manual_program, create_program, csv_scope_inventory, parse_scope, read_guidelines, set_active_approval, slug_from_program_name
 from stages import ACTIVE_STAGES, STAGE_BY_ID, STAGES, job_name_for, stage_for_job_name
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -869,7 +869,7 @@ def about_overview():
         <div class="card">
           <h2>Adding a program</h2>
           <p>Enter a unique program name and upload a HackerOne or Bugcrowd CSV, or a Markdown scope file, from New program on the dashboard. That name supplies the separate program folder and job names. Only explicitly in-scope domain entries become targets; unsupported assets must be reviewed manually.</p>
-          <p>Each program gets its own scope, guidelines, and nine jobs. Passive stages queue immediately; generated active stages remain blocked until an operator reviews the guidelines and confirms the pipeline's checks are permitted. The server's active-testing opt-in is also required. Prose rules are not automatically translated into scanner limits or exclusions.</p>
+          <p>Domain and wildcard scopes generate nine jobs. URL- and app-only CSVs are kept as manual-only inventories with no scans queued. Generated active stages remain blocked until an operator reviews the guidelines and confirms the pipeline's checks are permitted. The server's active-testing opt-in is also required. Prose rules are not automatically translated into scanner limits or exclusions.</p>
         </div>
 
         <div class="card">
@@ -974,6 +974,17 @@ def index():
     summary = summarize_jobs(jobs)
     grouped_jobs = group_jobs_by_program(jobs)
     workflow_order = STAGES
+    manual_programs = []
+    programs_dir = ROOT / 'programs'
+    if programs_dir.exists():
+      for inventory_path in sorted(programs_dir.glob('*/scope-inventory.json')):
+        try:
+          inventory = json.loads(inventory_path.read_text(encoding='utf-8'))
+          manual_programs.append({'slug': inventory_path.parent.name,
+                      'name': inventory.get('display_name', inventory_path.parent.name),
+                      'eligible_asset_types': inventory['eligible_asset_types']})
+        except (OSError, ValueError, KeyError, TypeError):
+          continue
     generated_programs = {job['program'] for job in jobs if
                 (JOBS_DIR / 'generated' / f"{job['program']}-passive-web-discovery.yaml").exists()}
     approved_programs = {program for program in generated_programs if active_approved(program, root=ROOT)}
@@ -1095,6 +1106,18 @@ def index():
             <span id="upload-status" role="status" aria-live="polite"></span>
           </form>
         </section>
+        {% if manual_programs %}
+          <section class="upload-area">
+            <h2>Manual scope review</h2>
+            {% for item in manual_programs %}
+              <p><strong>{{ item.name }}</strong> — No scans queued.
+                {% for asset_type, count in item.eligible_asset_types.items() %}
+                  <span>{{ asset_type }}: {{ count }}</span>{% if not loop.last %}, {% endif %}
+                {% endfor %}
+              </p>
+            {% endfor %}
+          </section>
+        {% endif %}
         <div class="card" style="margin-bottom:20px;">
           <h2 style="margin-top:0; margin-bottom:12px;">Workflow order</h2>
           <div style="display:flex; flex-wrap:wrap; gap:10px;">
@@ -1282,8 +1305,9 @@ def index():
           {% endfor %}
         {% else %}
           <div class="card">
-            <p>No result files have been generated yet.</p>
-            <p>Run the worker and a result file will appear in <code>results/</code>.</p>
+            {% if manual_programs %}<p>No automated jobs for these scopes.</p>
+            {% else %}<p>No result files have been generated yet.</p>
+            <p>Run the worker and a result file will appear in <code>results/</code>.</p>{% endif %}
           </div>
         {% endif %}
       </div>
@@ -1339,7 +1363,7 @@ def index():
               uploadStatus.textContent = result.message || 'Upload failed';
               return;
             }
-            uploadStatus.textContent = result.program + ' awaiting rules review';
+            uploadStatus.textContent = result.message || (result.program + ' awaiting rules review');
             saveViewState();
             window.location.reload();
           } catch (error) {
@@ -1535,7 +1559,7 @@ def index():
       </script>
     </body>
     </html>
-    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, generated_programs=generated_programs, approved_programs=approved_programs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs, workflow_order=workflow_order, highest_severity=highest_severity, asset_render_cap=ASSET_RENDER_CAP, evidence_render_cap=EVIDENCE_RENDER_CAP, thread_render_cap=THREAD_RENDER_CAP)
+    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, manual_programs=manual_programs, generated_programs=generated_programs, approved_programs=approved_programs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs, workflow_order=workflow_order, highest_severity=highest_severity, asset_render_cap=ASSET_RENDER_CAP, evidence_render_cap=EVIDENCE_RENDER_CAP, thread_render_cap=THREAD_RENDER_CAP)
 
 
 @app.route('/jobs/<job_name>/rerun', methods=['POST'])
@@ -1581,7 +1605,15 @@ def upload_program():
     if not guidelines.strip() or len(guidelines.encode('utf-8')) > 256 * 1024:
         return jsonify({'status': 'error', 'message': 'Program guidelines are required (max 256 KB)'}), 400
     try:
-        _, targets = parse_scope(uploaded.filename, contents.decode('utf-8-sig'))
+        scope_content = contents.decode('utf-8-sig')
+        if Path(uploaded.filename).suffix.lower() == '.csv':
+          inventory = dict(csv_scope_inventory(scope_content), display_name=request.form['program_name'].strip())
+          if inventory['manual_only']:
+              create_manual_program(slug, scope_content, guidelines, inventory, root=ROOT)
+              return jsonify({'status': 'manual_review', 'program': slug, 'jobs': [],
+                                'eligible_assets': sum(inventory['eligible_asset_types'].values()),
+                                'message': 'Manual-only inventory created; no scans queued'}), 202
+        _, targets = parse_scope(uploaded.filename, scope_content)
         jobs = create_program(slug, targets, root=ROOT, guidelines=guidelines)
     except (UnicodeDecodeError, ValueError) as exc:
         return jsonify({'status': 'error', 'message': str(exc)}), 400

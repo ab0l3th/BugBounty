@@ -25,6 +25,57 @@ def slug_from_program_name(name: str) -> str:
     return slug
 
 
+def csv_scope_inventory(content: str) -> dict:
+    reader = csv.DictReader(io.StringIO(content.lstrip('\ufeff')))
+    columns = {(column or '').strip().lower().replace(' ', '_') for column in reader.fieldnames or []}
+    if not columns.intersection({'identifier', 'target', 'asset_identifier', 'asset'}) or not columns.intersection(
+        {'in_scope', 'eligible_for_submission', 'eligible_for_bounty'}
+    ):
+        raise ValueError('CSV scope needs identifier and eligibility columns')
+    counts: dict[str, int] = {}
+    manual_only = False
+    rows = 0
+    for raw in reader:
+        if None in raw or any(value is None for value in raw.values()):
+            raise ValueError('Malformed CSV scope row')
+        row = {(key or '').strip().lower().replace(' ', '_'): value.strip() for key, value in raw.items()}
+        flag = row.get('in_scope', row.get('eligible_for_submission', row.get('eligible_for_bounty', ''))).lower()
+        kind = (row.get('asset_type') or row.get('type') or '').upper()
+        if flag not in {'true', 'yes', '1', 'false', 'no', '0'} or not kind:
+            raise ValueError('CSV scope has an ambiguous eligibility or asset type')
+        identifier = next((row[key] for key in ('identifier', 'target', 'asset_identifier', 'asset') if row.get(key)), '')
+        if not identifier:
+            raise ValueError('CSV scope has an asset without an identifier')
+        rows += 1
+        if kind == 'URL':
+            manual_only = True
+        if flag in {'true', 'yes', '1'}:
+            counts[kind] = counts.get(kind, 0) + 1
+            if kind not in {'DOMAIN', 'WILDCARD'}:
+                manual_only = True
+    if not counts:
+        raise ValueError('No explicitly eligible assets found')
+    return {'eligible_asset_types': counts, 'total_rows': rows, 'manual_only': manual_only}
+
+
+def create_manual_program(slug: str, scope_content: str, guidelines: str, inventory: dict, *, root: Path = ROOT) -> None:
+    if not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', slug):
+        raise ValueError('Invalid program name')
+    if not guidelines.strip() or len(guidelines.encode('utf-8')) > 256 * 1024:
+        raise ValueError('Program guidelines must contain text under 256 KB')
+    program_dir = root / 'programs' / slug
+    if program_dir.exists() or any((root / 'jobs' / 'generated').glob(f'{slug}-*.yaml')):
+        raise FileExistsError(f'Program already exists: {slug}')
+    program_dir.mkdir(parents=True)
+    (program_dir / 'scope.md').write_text(
+        f'# {slug} scope\n\n## Manual review required\nNo automated targets. Source CSV is preserved separately.\n', encoding='utf-8')
+    source = program_dir / 'scope-source.csv'
+    source.write_text(scope_content, encoding='utf-8')
+    source.chmod(0o600)
+    (program_dir / 'rules.md').write_text(guidelines.strip() + '\n', encoding='utf-8')
+    (program_dir / 'scope-inventory.json').write_text(json.dumps(inventory, indent=2), encoding='utf-8')
+
+
 def program_slug(filename: str, rows: list[dict] | None = None) -> str:
     names = [str(row.get('program_name') or row.get('program') or '').strip() for row in rows or []]
     label = next((name for name in names if name), '') or Path(filename).stem
