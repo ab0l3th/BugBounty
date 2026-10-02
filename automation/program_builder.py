@@ -110,11 +110,21 @@ def analyze_url_scope(content: str, guidelines: str) -> dict:
                        'port': port, 'path': path, 'query_present': bool(parsed.query),
                        'category': category, 'scope_kind': 'exact_url'})
     rate_match = re.search(r'(?:not exceed|maximum|limit of)\s+(\d+)\s+requests?\s+per\s+second', guidelines, re.IGNORECASE)
-    rate_limit = int(rate_match.group(1)) if rate_match else None
-    policy = {'automated_requests': 'blocked', 'max_requests_per_second': rate_limit,
-              'reason': 'No explicit, machine-verifiable permission for automated exact-URL requests'}
-    if re.search(r'(?:do not perform aggressive vulnerability scans|reports from automated tools or scans|automated scans? (?:are )?(?:prohibited|not allowed))', guidelines, re.IGNORECASE):
-        policy['reason'] = 'Program guidelines restrict automated or aggressive testing'
+    stated_limit = int(rate_match.group(1)) if rate_match else None
+    hard_ban = re.search(r'(?:\bno\s+|(?:do not|must not|prohibit(?:ed)?|not allowed)[^.!?\n]{0,50})automated\s+(?:requests?|testing|scans?)|automated\s+(?:requests?|testing|scans?)\s+(?:are\s+|is\s+)?(?:prohibited|not allowed|forbidden)', guidelines, re.IGNORECASE)
+    if hard_ban:
+        automation_status = 'blocked'
+        reason = 'Guidelines explicitly prohibit automated requests or scans'
+    elif stated_limit:
+        automation_status = 'manual_approval_required'
+        reason = 'Only an operator-approved exact-URL HEAD check is available; aggressive scanning remains disabled. Rate limits are not permission; automated findings may be ineligible and require manual verification'
+    else:
+        automation_status = 'blocked'
+        reason = 'No explicit request-rate limit was found in the guidelines'
+    policy = {'automated_requests': automation_status,
+              'stated_max_requests_per_second': stated_limit,
+              'max_requests_per_second': min(1, stated_limit) if stated_limit else None,
+              'method': 'HEAD', 'follows_redirects': False, 'reason': reason}
     return {'eligible_urls': inventory['eligible_asset_types'].get('URL', 0), 'invalid_urls': invalid_urls,
             'app_ids': len(app_assets), 'app_assets': app_assets,
             'categories': dict(Counter(asset['category'] for asset in assets)),

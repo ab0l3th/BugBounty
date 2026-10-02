@@ -1032,6 +1032,7 @@ def index():
         .manual-analysis table { width: 100%; border-collapse: collapse; margin-top: 10px; }
         .manual-analysis th, .manual-analysis td { text-align: left; padding: 6px; border-bottom: 1px solid #334155; }
         .analysis-policy { color: #fbbf24; }
+        .manual-analysis pre { background: #0f172a; padding: 12px; max-height: 240px; overflow: auto; white-space: pre-wrap; }
         .job { margin-bottom: 18px; padding: 0; background: #0f172a; border-left: 4px solid #38bdf8; border-radius: 8px; overflow: hidden; }
         summary { list-style: none; cursor: pointer; padding: 16px; display: block; }
         summary::-webkit-details-marker { display: none; }
@@ -1121,7 +1122,12 @@ def index():
                 {% endfor %}
               </p>
               <div class="manual-analysis" data-program="{{ item.slug }}">
-                <button type="button" class="analyze-manual-program">Analyze inventory offline</button>
+                <button type="button" class="analyze-manual-program">Start {{ item.name }} scope analysis</button>
+                <button type="button" class="review-manual-guidelines">Review guidelines</button>
+                <pre class="manual-guidelines" hidden></pre>
+                <label><input type="checkbox" class="manual-guidelines-ack"> I confirm these rules permit exact-URL HEAD checks</label>
+                <button type="button" class="approve-manual-checks" disabled>Approve URL checks</button>
+                <button type="button" class="start-manual-check" disabled>Start exact-URL check</button>
                 <span class="manual-analysis-status" role="status" aria-live="polite"></span>
                 <div class="manual-analysis-results"></div>
               </div>
@@ -1343,45 +1349,88 @@ def index():
         const guidelinesText = document.getElementById('guidelines-text');
         const uploadStatus = document.getElementById('upload-status');
         document.querySelectorAll('.manual-analysis').forEach(panel => {
-          panel.querySelector('button').addEventListener('click', async () => {
+          const analyzeButton = panel.querySelector('.analyze-manual-program');
+          const rulesButton = panel.querySelector('.review-manual-guidelines');
+          const guidelinesPre = panel.querySelector('.manual-guidelines');
+          const guidelinesAck = panel.querySelector('.manual-guidelines-ack');
+          const approveButton = panel.querySelector('.approve-manual-checks');
+          const startButton = panel.querySelector('.start-manual-check');
+          const status = panel.querySelector('.manual-analysis-status');
+          const output = panel.querySelector('.manual-analysis-results');
+          let currentAnalysis = null;
+
+          function renderCheckProgress(check) {
+            if (!check) return;
+            let results = output.querySelector('.manual-check-results');
+            if (!results) {
+              results = document.createElement('div');
+              results.className = 'manual-check-results';
+              output.append(results);
+            }
+            results.replaceChildren();
+            const table = document.createElement('table');
+            table.innerHTML = '<thead><tr><th>Host</th><th>Exact path</th><th>Status</th><th>Service</th><th>Redirect</th></tr></thead><tbody></tbody>';
+            const body = table.querySelector('tbody');
+            check.results.forEach(item => {
+              const row = document.createElement('tr');
+              const redirect = item.redirect ? item.redirect.host + item.redirect.path + (item.redirect.query_present ? ' (query redacted)' : '') : 'None';
+              [item.host, item.path, item.status || item.error || 'No response', item.server || item.content_type || 'Unknown', redirect].forEach(value => {
+                const cell = document.createElement('td');
+                cell.textContent = value;
+                row.append(cell);
+              });
+              body.append(row);
+            });
+            results.append(table);
+            status.textContent = check.state === 'stopped'
+              ? 'Exact-URL check stopped: ' + check.stopped_reason + '. ' + check.checked + ' checked, ' + check.remaining + ' remaining.'
+              : check.complete
+              ? 'Exact-URL check complete: ' + check.checked + ' checked; ' + check.skipped_query_urls + ' query URLs skipped.'
+              : 'Exact-URL check running: ' + check.checked + ' checked, ' + check.remaining + ' remaining; ' + check.skipped_query_urls + ' query URLs skipped.';
+          }
+
+          async function loadAnalysis() {
             const token = getToken(false);
-            if (!token) return;
-            const button = panel.querySelector('button');
-            const status = panel.querySelector('.manual-analysis-status');
-            const output = panel.querySelector('.manual-analysis-results');
-            button.disabled = true;
+            if (!token) return null;
             status.textContent = 'Analyzing saved inventory and guidelines locally...';
+            const response = await fetch('/programs/' + encodeURIComponent(panel.dataset.program) + '/analysis',
+              {headers: {'X-BugBounty-Token': token}});
+            const analysis = await response.json();
+            if (!response.ok) {
+              if (response.status === 401) localStorage.removeItem(TOKEN_KEY);
+              throw new Error(analysis.message || 'Analysis unavailable');
+            }
+            currentAnalysis = analysis;
+            return analysis;
+          }
+
+          async function refreshCheckProgress() {
+            try {
+              const analysis = await loadAnalysis();
+              renderCheckProgress(analysis.url_check);
+              if (analysis.url_check && !analysis.url_check.complete && analysis.url_check.state !== 'stopped') setTimeout(refreshCheckProgress, 5000);
+            } catch (error) {
+              status.textContent = error.message || 'Progress unavailable';
+            }
+          }
+
+          analyzeButton.addEventListener('click', async () => {
+            analyzeButton.disabled = true;
             output.replaceChildren();
             try {
-              const response = await fetch('/programs/' + encodeURIComponent(panel.dataset.program) + '/analysis',
-                {headers: {'X-BugBounty-Token': token}});
-              const analysis = await response.json();
-              if (!response.ok) {
-                if (response.status === 401) localStorage.removeItem(TOKEN_KEY);
-                status.textContent = analysis.message || 'Analysis unavailable';
-                return;
-              }
+              const analysis = await loadAnalysis();
               const policy = document.createElement('p');
               policy.className = 'analysis-policy';
               policy.textContent = 'Offline analysis only; no target requests sent. Automated requests: ' +
                 analysis.policy.automated_requests + '. ' + analysis.policy.reason +
-                (analysis.policy.max_requests_per_second ? ' Stated rate limit: ' + analysis.policy.max_requests_per_second + ' requests/second.' : '');
+                (analysis.policy.stated_max_requests_per_second ? ' Program limit: ' + analysis.policy.stated_max_requests_per_second + ' requests/second; this checker caps at 1 request/second.' : '');
               output.append(policy);
               const counts = document.createElement('p');
-              counts.textContent = analysis.eligible_urls + ' eligible URLs (' + Object.entries(analysis.categories).map(([key, value]) => key + ': ' + value).join(', ') + '); ' +
+              counts.textContent = analysis.eligible_urls + ' eligible exact URLs (' + Object.entries(analysis.categories).map(([key, value]) => key + ': ' + value).join(', ') + '); ' +
                 analysis.app_ids + ' app IDs; ' + analysis.invalid_urls + ' invalid URLs skipped.';
               output.append(counts);
-              if (analysis.app_assets.length) {
-                const apps = document.createElement('ul');
-                analysis.app_assets.forEach(asset => {
-                  const item = document.createElement('li');
-                  item.textContent = asset.platform + ': ' + asset.identifier;
-                  apps.append(item);
-                });
-                output.append(apps);
-              }
               const table = document.createElement('table');
-              table.innerHTML = '<thead><tr><th>Host</th><th>Exact path</th><th>Type</th><th>Query</th></tr></thead><tbody></tbody>';
+              table.innerHTML = '<thead><tr><th>Exact host</th><th>Path</th><th>Surface</th><th>Query</th></tr></thead><tbody></tbody>';
               const tbody = table.querySelector('tbody');
               analysis.assets.forEach(asset => {
                 const row = document.createElement('tr');
@@ -1401,11 +1450,88 @@ def index():
                 tbody.append(row);
               });
               output.append(table);
+              analysis.app_assets.forEach(asset => {
+                const item = document.createElement('p');
+                item.textContent = asset.platform + ' app ID: ' + asset.identifier;
+                output.append(item);
+              });
               status.textContent = 'Offline analysis complete';
+              renderCheckProgress(analysis.url_check);
+              const canStart = analysis.policy.automated_requests === 'manual_approval_required' && analysis.approved;
+              startButton.disabled = !canStart;
+              if (analysis.approved) {
+                guidelinesAck.checked = true;
+                approveButton.disabled = true;
+                rulesButton.textContent = 'Guidelines approved';
+              }
+              if (analysis.url_check && !analysis.url_check.complete && analysis.url_check.state !== 'stopped') setTimeout(refreshCheckProgress, 5000);
             } catch (error) {
-              status.textContent = 'Analysis unavailable';
+              status.textContent = error.message || 'Analysis unavailable';
             } finally {
-              button.disabled = false;
+              analyzeButton.disabled = false;
+            }
+          });
+
+          rulesButton.addEventListener('click', async () => {
+            const token = getToken(false);
+            if (!token) return;
+            try {
+              const response = await fetch('/programs/' + encodeURIComponent(panel.dataset.program) + '/guidelines',
+                {headers: {'X-BugBounty-Token': token}});
+              const rules = await response.json();
+              if (!response.ok) throw new Error(rules.message || 'Guidelines unavailable');
+              panel.dataset.digest = rules.guidelines_sha256;
+              guidelinesPre.textContent = rules.text;
+              guidelinesPre.hidden = false;
+              guidelinesAck.checked = rules.approved;
+              approveButton.disabled = rules.approved;
+              startButton.disabled = !rules.approved || !currentAnalysis || currentAnalysis.policy.automated_requests !== 'manual_approval_required';
+              status.textContent = rules.approved ? 'Current guidelines approved' : 'Read the rules, then explicitly approve permitted exact-URL checks';
+            } catch (error) {
+              status.textContent = error.message || 'Guidelines unavailable';
+            }
+          });
+
+          guidelinesAck.addEventListener('change', () => {
+            approveButton.disabled = !guidelinesAck.checked || !panel.dataset.digest;
+          });
+
+          approveButton.addEventListener('click', async () => {
+            const token = getToken(false);
+            if (!token || !panel.dataset.digest || !guidelinesAck.checked) return;
+            approveButton.disabled = true;
+            try {
+              const response = await fetch('/programs/' + encodeURIComponent(panel.dataset.program) + '/active-approval', {
+                method: 'POST', headers: {'Content-Type': 'application/json', 'X-BugBounty-Token': token},
+                body: JSON.stringify({approved: true, acknowledged: true, guidelines_sha256: panel.dataset.digest}),
+              });
+              const result = await response.json();
+              if (!response.ok) throw new Error(result.message || 'Approval failed');
+              status.textContent = 'Current guidelines approved';
+              if (currentAnalysis) currentAnalysis.approved = true;
+              startButton.disabled = !currentAnalysis || currentAnalysis.policy.automated_requests !== 'manual_approval_required';
+            } catch (error) {
+              status.textContent = error.message || 'Approval failed';
+              approveButton.disabled = false;
+            }
+          });
+
+          startButton.addEventListener('click', async () => {
+            const token = getToken(false);
+            if (!token) return;
+            startButton.disabled = true;
+            status.textContent = 'Starting exact-URL HEAD checks...';
+            try {
+              const response = await fetch('/programs/' + encodeURIComponent(panel.dataset.program) + '/url-check', {
+                method: 'POST', headers: {'X-BugBounty-Token': token},
+              });
+              const result = await response.json();
+              if (!response.ok) throw new Error(result.message || 'URL check could not start');
+              status.textContent = 'Running at ' + result.requests_per_second + ' request/second; ' + result.skipped_query_urls + ' query URLs skipped.';
+              setTimeout(refreshCheckProgress, 2000);
+            } catch (error) {
+              status.textContent = error.message || 'URL check could not start';
+              startButton.disabled = false;
             }
           });
         });
@@ -1734,7 +1860,7 @@ def upload_program():
 def program_guidelines(slug: str):
     if not _authorized_for_state_change():
         return jsonify({'status': 'error', 'message': 'unauthorized'}), 401
-    if not (JOBS_DIR / 'generated' / f'{slug}-passive-web-discovery.yaml').exists():
+    if not _program_exists(slug):
         return jsonify({'status': 'error', 'message': 'Program not found'}), 404
     try:
         text, digest = read_guidelines(slug, root=ROOT)
@@ -1752,6 +1878,15 @@ def manual_program_analysis(slug: str):
         analysis = load_manual_analysis(slug, root=ROOT)
     except (OSError, ValueError):
         return jsonify({'status': 'error', 'message': 'Program analysis unavailable'}), 404
+    check_path = RESULTS_DIR / f'manual-url-check-{slug}.json'
+    if check_path.exists():
+      try:
+        analysis['url_check'] = json.loads(check_path.read_text(encoding='utf-8'))
+      except (OSError, ValueError):
+        analysis['url_check'] = None
+    else:
+      analysis['url_check'] = None
+    analysis['approved'] = active_approved(slug, root=ROOT)
     return jsonify(analysis)
 
 
@@ -1759,7 +1894,7 @@ def manual_program_analysis(slug: str):
 def approve_program_active(slug: str):
     if not _authorized_for_state_change():
         return jsonify({'status': 'error', 'message': 'unauthorized'}), 401
-    if not (JOBS_DIR / 'generated' / f'{slug}-passive-web-discovery.yaml').exists():
+    if not _program_exists(slug):
         return jsonify({'status': 'error', 'message': 'Program not found'}), 404
     data = request.get_json(silent=True) or {}
     if data.get('acknowledged') is not True or type(data.get('approved')) is not bool:
@@ -1769,12 +1904,45 @@ def approve_program_active(slug: str):
     except (OSError, ValueError) as exc:
         return jsonify({'status': 'error', 'message': str(exc)}), 409
     started = False
-    if data['approved'] and os.environ.get('BUGBOUNTY_ALLOW_ACTIVE', '').strip().lower() in {'1', 'true', 'yes', 'on'}:
+    manual_program = (ROOT / 'programs' / slug / 'scope-inventory.json').is_file()
+    if data['approved'] and not manual_program and os.environ.get('BUGBOUNTY_ALLOW_ACTIVE', '').strip().lower() in {'1', 'true', 'yes', 'on'}:
         subprocess.Popen([sys.executable, str(ROOT / 'automation' / 'worker.py'), '--program', slug, '--allow-active'],
                          cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True)
         started = True
     return jsonify({'status': 'approved' if data['approved'] else 'revoked', 'active_run_started': started})
+
+
+def _program_exists(slug: str) -> bool:
+    return ((JOBS_DIR / 'generated' / f'{slug}-passive-web-discovery.yaml').is_file()
+            or (ROOT / 'programs' / slug / 'scope-inventory.json').is_file())
+
+
+@app.route('/programs/<slug>/url-check', methods=['POST'])
+def start_manual_url_check(slug: str):
+    if not _authorized_for_state_change():
+        return jsonify({'status': 'error', 'message': 'unauthorized'}), 401
+    if not (ROOT / 'programs' / slug / 'scope-inventory.json').is_file():
+        return jsonify({'status': 'error', 'message': 'Manual program not found'}), 404
+    try:
+        analysis = load_manual_analysis(slug, root=ROOT)
+    except (OSError, ValueError):
+        return jsonify({'status': 'error', 'message': 'Program analysis unavailable'}), 404
+    if analysis['policy']['automated_requests'] != 'manual_approval_required':
+        return jsonify({'status': 'error', 'message': analysis['policy']['reason']}), 409
+    if not active_approved(slug, root=ROOT):
+        return jsonify({'status': 'error', 'message': 'Review the current guidelines and explicitly approve these exact-URL checks first'}), 409
+    if _lock_is_active(f'manual-url-check-{slug}'):
+        return jsonify({'status': 'error', 'message': 'URL check already running'}), 409
+    try:
+      process = subprocess.Popen([sys.executable, str(ROOT / 'automation' / 'manual_url_checker.py'), slug],
+                     cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as exc:
+        return jsonify({'status': 'error', 'message': f'Could not start URL check: {exc}'}), 500
+    return jsonify({'status': 'running', 'pid': process.pid, 'requests_per_second': 1,
+            'method': 'HEAD', 'targets': analysis['eligible_urls'],
+            'skipped_query_urls': sum(1 for asset in analysis['assets'] if asset['query_present'])}), 202
 
 
 @app.route('/api/jobs')

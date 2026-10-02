@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / 'automation') not in sys.path:
     sys.path.insert(0, str(ROOT / 'automation'))
 
-from program_builder import active_approved, analyze_url_scope, create_program, parse_scope, read_guidelines, set_active_approval
+from program_builder import active_approved, analyze_url_scope, create_manual_program, create_program, parse_scope, read_guidelines, set_active_approval
 from stages import STAGES
 from worker import load_job, run_passive_job, job_workflow_dependencies
 import worker
@@ -26,8 +26,11 @@ class ProgramBuilderTest(unittest.TestCase):
                    'https://app.example.com/login,URL,true\n'
                    'com.example.app,GOOGLE_PLAY_APP_ID,true\n')
         analysis = analyze_url_scope(content, 'No aggressive scanning. Traffic must not exceed 3 requests per second.')
-        self.assertEqual(analysis['policy']['automated_requests'], 'blocked')
-        self.assertEqual(analysis['policy']['max_requests_per_second'], 3)
+        self.assertEqual(analysis['policy']['automated_requests'], 'manual_approval_required')
+        self.assertEqual(analysis['policy']['max_requests_per_second'], 1)
+        self.assertEqual(analysis['policy']['stated_max_requests_per_second'], 3)
+        self.assertEqual(analysis['policy']['method'], 'HEAD')
+        self.assertFalse(analysis['policy']['follows_redirects'])
         self.assertEqual(analysis['eligible_urls'], 2)
         self.assertEqual(analysis['app_ids'], 1)
         self.assertEqual(analysis['app_assets'][0]['platform'], 'Google Play')
@@ -40,6 +43,22 @@ class ProgramBuilderTest(unittest.TestCase):
         self.assertEqual(malformed['eligible_urls'], 1)
         self.assertEqual(malformed['invalid_urls'], 1)
         self.assertEqual(malformed['assets'], [])
+        prohibited = analyze_url_scope(
+            'identifier,asset_type,in_scope\napp.example.com,URL,true\n',
+            'Do not perform automated requests. Maximum 3 requests per second.')
+        self.assertEqual(prohibited['policy']['automated_requests'], 'blocked')
+
+    def test_automation_bans_override_rate_limits_but_report_restrictions_require_approval(self):
+        content = 'identifier,asset_type,in_scope\napp.example.com,URL,true\n'
+        for prohibition in ('No automated scans.', 'Automated scans are prohibited.',
+                            'Automated requests are not allowed.', 'Do not perform automated testing.'):
+            with self.subTest(prohibition=prohibition):
+                policy = analyze_url_scope(content, prohibition + ' Maximum 3 requests per second.')['policy']
+                self.assertEqual(policy['automated_requests'], 'blocked')
+        policy = analyze_url_scope(content, 'Reports from automated tools or scans are ineligible. '
+                                   'Do not perform aggressive vulnerability scans. Maximum 3 requests per second.')['policy']
+        self.assertEqual(policy['automated_requests'], 'manual_approval_required')
+        self.assertIn('manual verification', policy['reason'])
 
     def test_url_asset_bare_hostname_is_exact_host_not_wildcard(self):
         analysis = analyze_url_scope(
@@ -250,7 +269,7 @@ class ProgramBuilderTest(unittest.TestCase):
                 self.assertEqual(list_jobs(), [])
                 page = client.get('/')
                 self.assertIn(b'NBA Public', page.data)
-                self.assertIn(b'analyze-manual-program', page.data)
+                self.assertIn(b'Start exact-URL check', page.data)
                 duplicate = client.post('/programs/upload', data={
                     'program_name': 'NBA Public',
                     'scope_file': (io.BytesIO(scope), 'scope.csv'),
@@ -277,7 +296,7 @@ class ProgramBuilderTest(unittest.TestCase):
                 response = client.get('/programs/nba-public/analysis', headers={'X-BugBounty-Token': 'test-token'})
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.get_json()['categories'], {'api': 1})
-                self.assertEqual(response.get_json()['policy']['automated_requests'], 'blocked')
+                self.assertEqual(response.get_json()['policy']['automated_requests'], 'manual_approval_required')
                 self.assertNotIn(b'secret=private', response.data)
 
     def test_rules_review_and_approval_requires_current_guidelines(self):
@@ -421,6 +440,32 @@ class ProgramBuilderTest(unittest.TestCase):
                 worker.main()
             probe.assert_not_called()
             self.assertFalse((root / 'results/demo-confirm-live-web-assets.json').exists())
+
+    def test_manual_url_check_endpoint_requires_current_approval(self):
+        with TemporaryDirectory() as directory, \
+             patch('dashboard_app.ROOT', Path(directory)), \
+             patch('dashboard_app.RESULTS_DIR', Path(directory) / 'results'), \
+             patch('dashboard_app.RUNNING_DIR', Path(directory) / 'results' / '.running'), \
+             patch('dashboard_app.subprocess.Popen') as launch, \
+             patch.dict('dashboard_app.os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token'}):
+            root = Path(directory)
+            launch.return_value.pid = 9876
+            csv_text = 'identifier,asset_type,in_scope\nportal.example.com,URL,true\n'
+            inventory = {'eligible_asset_types': {'URL': 1}, 'total_rows': 1, 'manual_only': True,
+                         'display_name': 'Example'}
+            create_manual_program('example', csv_text, 'Maximum 3 requests per second.', inventory, root=root)
+            headers = {'X-BugBounty-Token': 'test-token'}
+            with app.test_client() as client:
+                self.assertEqual(client.post('/programs/example/url-check').status_code, 401)
+                blocked = client.post('/programs/example/url-check', headers=headers)
+                self.assertEqual(blocked.status_code, 409)
+                _, digest = read_guidelines('example', root=root)
+                set_active_approval('example', True, digest, root=root)
+                started = client.post('/programs/example/url-check', headers=headers)
+                self.assertEqual(started.status_code, 202)
+                command = launch.call_args.args[0]
+                self.assertEqual(command[1], str(root / 'automation/manual_url_checker.py'))
+                self.assertEqual(command[2], 'example')
 
 
 if __name__ == '__main__':
