@@ -277,6 +277,56 @@ def set_active_approval(slug: str, approved: bool, digest: str, *, root: Path = 
     temporary.replace(path)
 
 
+def auto_run_policy(guidelines: str) -> dict:
+    prohibition = r'(?:\bno\s+|(?:do not|must not|prohibit(?:ed)?|not allowed)[^.!?\n]{0,60})'
+    automation = r'(?:automated\s+(?:requests?|testing|scans?|scanning)|automation)'
+    reverse_ban = r'\s+(?:(?:are|is)\s+)?(?:prohibited|not allowed|forbidden)'
+    if re.search(prohibition + automation + '|' + automation + reverse_ban, guidelines, re.IGNORECASE):
+        raise ValueError('Guidelines prohibit automation; leave auto-run disabled')
+    limits = []
+    for match in re.finditer(
+        r'(?:not exceed|no more than|maximum|max|limit(?: of| to)?|rate(?: limit)?)[\s:=]+(\d+(?:\.\d+)?)\s*(?:(?:requests?|reqs?)\s*(?:per\s+|/\s*)(seconds?|secs?|s|minutes?|mins?|m)|rps)',
+        guidelines, re.IGNORECASE,
+    ):
+        limits.append(float(match.group(1)) / (60 if (match.group(2) or '').lower().startswith('m') else 1))
+    if limits and min(limits) <= 0:
+        raise ValueError('Guidelines do not permit request traffic')
+    rate = min([1.0, *limits])
+    stage_terms = {
+        'vhost-discovery': r'(?:vhost|virtual.host)[- ]?(?:discovery|testing|scanning)?',
+        'directory-enumeration': r'(?:directory[- ](?:enumeration|scanning)|content[- ]discovery|fuzzing|brute[- ]force)',
+        'application-testing': r'(?:application[- ]testing|vulnerability[- ]scann?(?:ing|s)?)',
+        'api-testing': r'(?:api[- ]testing|introspection|vulnerability[- ]scann?(?:ing|s)?)',
+        'port-scan': r'(?:port|network)[- ]scann?(?:ing|s)?',
+    }
+    blocked = {}
+    for stage, terms in stage_terms.items():
+        if re.search(prohibition + terms + '|' + terms + reverse_ban, guidelines, re.IGNORECASE):
+            blocked[stage] = 'Guidelines prohibit this stage'
+    if re.search(prohibition + r'aggressive[^.!?\n]{0,30}(?:testing|scann?(?:ing|s)?)', guidelines, re.IGNORECASE):
+        for stage in ('directory-enumeration', 'application-testing', 'api-testing', 'port-scan'):
+            blocked[stage] = 'Aggressive testing restrictions require manual stage review'
+    return {'enabled': True, 'requests_per_second': rate, 'max_workers': 2,
+            'allowed_stages': [stage['stage'] for stage in STAGES if stage['stage'] not in blocked],
+            'blocked_stages': blocked, 'external_probes': False}
+
+
+def configure_auto_run(slug: str, *, root: Path = ROOT) -> dict:
+    rules, digest = read_guidelines(slug, root=root)
+    if not active_approved(slug, root=root):
+        raise PermissionError('Current program guidelines must be approved for auto-run')
+    if (root / 'programs' / slug / 'scope-inventory.json').exists():
+        raise ValueError('URL/app scope requires the manual workflow; auto-run supports domain/wildcard scope only')
+    policy = auto_run_policy(rules)
+    policy['guidelines_sha256'] = digest
+    policy['scope_sha256'] = hashlib.sha256((root / 'programs' / slug / 'scope.md').read_bytes()).hexdigest()
+    path = root / 'programs' / slug / '.auto-run.json'
+    temporary = path.with_name('.auto-run.json.tmp')
+    temporary.write_text(json.dumps(policy, indent=2), encoding='utf-8')
+    temporary.replace(path)
+    return policy
+
+
 def create_program(slug: str, targets: list[str], *, root: Path = ROOT, guidelines: str | None = None) -> list[str]:
     if not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', slug):
         raise ValueError('Invalid program name')

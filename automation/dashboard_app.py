@@ -22,7 +22,7 @@ AUTOMATION_DIR = Path(__file__).resolve().parent
 if str(AUTOMATION_DIR) not in sys.path:
   sys.path.insert(0, str(AUTOMATION_DIR))
 
-from program_builder import active_approved, create_manual_program, create_program, csv_scope_inventory, load_manual_analysis, parse_scope, read_guidelines, set_active_approval, slug_from_program_name
+from program_builder import active_approved, auto_run_policy, configure_auto_run, create_manual_program, create_program, csv_scope_inventory, load_manual_analysis, parse_scope, read_guidelines, set_active_approval, slug_from_program_name
 from stages import ACTIVE_STAGES, STAGE_BY_ID, STAGES, job_name_for, stage_for_job_name
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -158,6 +158,8 @@ def _lock_is_active(job_name: str) -> bool:
 def _job_state_for(job_name: str, payload: Dict[str, Any] | None = None) -> str:
     if _lock_is_active(job_name):
         return 'running'
+    if payload and payload.get('auto_run') and payload.get('job_state') in {'stopped', 'blocked'}:
+      return payload['job_state']
     if payload and payload.get('manual_only') and payload.get('job_state') == 'running':
         return 'running' if _lock_is_active(f"manual-program-{payload['program']}") else 'stopped'
     if payload and payload.get('manual_only') and payload.get('job_state') == 'stopped':
@@ -826,6 +828,17 @@ def rerun_job(job_name: str) -> Dict[str, Any]:
         raise KeyError(f'Unknown job: {job_name}')
 
     program = match.get('program', 'unknown')
+    if (ROOT / 'programs' / program / '.auto-run.json').is_file():
+      if _lock_is_active(f'auto-program-{program}'):
+        raise PermissionError('This program is already running')
+      from auto_run import AutoRunGuard
+      try:
+        guard = AutoRunGuard(program, root=ROOT)
+      except (OSError, ValueError, PermissionError) as exc:
+        raise PermissionError(str(exc)) from exc
+      stage_id = stage_for_job_name(job_name)
+      if stage_id not in guard.policy['allowed_stages']:
+        raise PermissionError(guard.policy['blocked_stages'].get(stage_id, 'Stage not permitted for auto-run'))
     if match.get('raw', {}).get('manual_only'):
       from manual_workflow import stage_block_reason
       stage_id = stage_for_job_name(job_name)
@@ -1108,6 +1121,11 @@ def index():
     generated_programs = {job['program'] for job in jobs if
                 (JOBS_DIR / 'generated' / f"{job['program']}-passive-web-discovery.yaml").exists()}
     approved_programs = {program for program in generated_programs if active_approved(program, root=ROOT)}
+    auto_programs = {}
+    for program in generated_programs:
+      path = ROOT / 'programs' / program / '.auto-run.json'
+      if path.is_file():
+        auto_programs[program] = read_result_file(path)
     pending_manual_programs = [item for item in manual_programs if not (item['approved'] and item['workflow_queued'])]
     return render_template_string('''
     <!doctype html>
@@ -1229,6 +1247,7 @@ def index():
             <input id="guidelines-file" name="guidelines_file" type="file" accept=".md,.txt,text/plain,text/markdown">
             <label for="guidelines-text">Or paste guidelines</label>
             <textarea id="guidelines-text" name="guidelines_text"></textarea>
+            <label><input id="auto-run" name="auto_run" type="checkbox" value="true"> Auto-run permitted stages; I confirm the supplied guidelines authorize this program's automated checks</label>
             <button type="submit">Upload scope</button>
             <span id="upload-status" role="status" aria-live="polite"></span>
           </form>
@@ -1293,6 +1312,9 @@ def index():
             {% set program_summary = summarize_program_jobs(program_jobs) %}
             <details class="program-group" id="manual-workflow-{{ program_name }}" data-state-key="program-{{ program_name }}" open>
               <summary class="program-header">{{ program_label(program_name) }} <span class="program-count">({{ program_summary.jobs }} jobs)</span></summary>
+              {% if program_name in auto_programs %}
+                <p class="meta">Auto-run: {{ 'approved' if program_name in approved_programs else 'paused pending current guideline approval' }}; {{ auto_programs[program_name].requests_per_second }} request/second; {{ auto_programs[program_name].max_workers }} workers maximum</p>
+              {% endif %}
               <p><a href="{{ url_for('review_queue', program=program_name) }}">Review {{ program_label(program_name) }} findings</a></p>
               {% if program_name in generated_programs %}
                 <details class="program-rules" data-state-key="rules-{{ program_name }}" data-program="{{ program_name }}">
@@ -1331,6 +1353,7 @@ def index():
                     <p><strong>Program:</strong> {{ program_label(job.program) }}</p>
                     <p><strong>Type:</strong> {{ job.type }}</p>
                     <p><strong>Pipeline status:</strong> {{ job.status }}</p>
+                    {% if job.raw.reason %}<p class="meta">{{ job.raw.reason }}</p>{% endif %}
                     <p><strong>Source count:</strong> {{ job.source_count }}</p>
                     <p><strong>Targets:</strong> {{ job.targets|length }}</p>
                     {% if job.raw.total_candidates is defined %}<p><strong>Coverage:</strong> {{ job.raw.processed_count or 0 }} / {{ job.raw.total_candidates }} hosts checked, {{ job.raw.remaining_count or 0 }} remaining</p>{% endif %}
@@ -1476,6 +1499,7 @@ def index():
         const scopeFile = document.getElementById('scope-file');
         const guidelinesFile = document.getElementById('guidelines-file');
         const guidelinesText = document.getElementById('guidelines-text');
+        const autoRun = document.getElementById('auto-run');
         const uploadStatus = document.getElementById('upload-status');
         const boundManualPanels = new WeakSet();
         function bindManualReviews() {
@@ -1711,7 +1735,7 @@ def index():
         let uploadComplete = false;
         function uploadDraftPending() {
           return !uploadComplete && (uploadInProgress || scopeFile.files.length > 0 ||
-            guidelinesFile.files.length > 0 || !!programName.value.trim() || !!guidelinesText.value.trim());
+            guidelinesFile.files.length > 0 || !!programName.value.trim() || !!guidelinesText.value.trim() || autoRun.checked);
         }
         ['dragenter', 'dragover'].forEach(eventName => scopeDrop.addEventListener(eventName, event => {
           event.preventDefault();
@@ -1735,7 +1759,7 @@ def index():
           const button = uploadForm.querySelector('button');
           const submittedDraft = {
             name: programName.value, scope: scopeFile.files[0],
-            guidelines: guidelinesFile.files[0], text: guidelinesText.value,
+            guidelines: guidelinesFile.files[0], text: guidelinesText.value, autoRun: autoRun.checked,
           };
           button.disabled = true;
           uploadInProgress = true;
@@ -1752,7 +1776,8 @@ def index():
             uploadStatus.textContent = result.message || (result.program + ' awaiting rules review');
             uploadComplete = true;
             if (programName.value === submittedDraft.name && scopeFile.files[0] === submittedDraft.scope &&
-              guidelinesFile.files[0] === submittedDraft.guidelines && guidelinesText.value === submittedDraft.text) uploadForm.reset();
+              guidelinesFile.files[0] === submittedDraft.guidelines && guidelinesText.value === submittedDraft.text &&
+              autoRun.checked === submittedDraft.autoRun) uploadForm.reset();
             await refreshDashboard(true);
           } catch (error) {
             uploadStatus.textContent = 'Upload failed';
@@ -2005,7 +2030,7 @@ def index():
       </script>
     </body>
     </html>
-    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, manual_programs=manual_programs, pending_manual_programs=pending_manual_programs, generated_programs=generated_programs, approved_programs=approved_programs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs, workflow_order=workflow_order, highest_severity=highest_severity, asset_render_cap=ASSET_RENDER_CAP, evidence_render_cap=EVIDENCE_RENDER_CAP, thread_render_cap=THREAD_RENDER_CAP)
+    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, manual_programs=manual_programs, pending_manual_programs=pending_manual_programs, generated_programs=generated_programs, approved_programs=approved_programs, auto_programs=auto_programs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs, workflow_order=workflow_order, highest_severity=highest_severity, asset_render_cap=ASSET_RENDER_CAP, evidence_render_cap=EVIDENCE_RENDER_CAP, thread_render_cap=THREAD_RENDER_CAP)
 
 
 @app.route('/jobs/<job_name>/rerun', methods=['POST'])
@@ -2050,26 +2075,50 @@ def upload_program():
         guidelines = request.form.get('guidelines_text', '')
     if not guidelines.strip() or len(guidelines.encode('utf-8')) > 256 * 1024:
         return jsonify({'status': 'error', 'message': 'Program guidelines are required (max 256 KB)'}), 400
+    automatic = request.form.get('auto_run', '').strip().lower()
+    if automatic not in {'', 'false', '0', 'true', '1', 'on'}:
+      return jsonify({'status': 'error', 'message': 'Invalid auto-run acknowledgment'}), 400
+    automatic = automatic in {'true', '1', 'on'}
     try:
+        if automatic:
+            auto_run_policy(guidelines)
         scope_content = contents.decode('utf-8-sig')
         if Path(uploaded.filename).suffix.lower() == '.csv':
           inventory = dict(csv_scope_inventory(scope_content), display_name=request.form['program_name'].strip())
           if inventory['manual_only']:
+              if automatic:
+                raise ValueError('URL/app scope is manual-only; uncheck auto-run and approve its manual workflow')
               create_manual_program(slug, scope_content, guidelines, inventory, root=ROOT)
               return jsonify({'status': 'manual_review', 'program': slug, 'jobs': [],
                                 'eligible_assets': sum(inventory['eligible_asset_types'].values()),
                                 'message': 'Manual-only inventory created; no scans queued'}), 202
         _, targets = parse_scope(uploaded.filename, scope_content)
         jobs = create_program(slug, targets, root=ROOT, guidelines=guidelines)
+        policy = None
+        if automatic:
+          _, digest = read_guidelines(slug, root=ROOT)
+          set_active_approval(slug, True, digest, root=ROOT)
+          policy = configure_auto_run(slug, root=ROOT)
     except (UnicodeDecodeError, ValueError) as exc:
         return jsonify({'status': 'error', 'message': str(exc)}), 400
     except FileExistsError:
         return jsonify({'status': 'error', 'message': 'Program already exists'}), 409
 
     command = [sys.executable, str(ROOT / 'automation' / 'worker.py'), '--program', slug]
-    subprocess.Popen(command, cwd=str(ROOT), stdin=subprocess.DEVNULL,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    return jsonify({'status': 'pending_review', 'program': slug, 'targets': len(targets), 'jobs': jobs}), 202
+    if automatic:
+      command.append('--auto-run')
+    try:
+      subprocess.Popen(command, cwd=str(ROOT), stdin=subprocess.DEVNULL,
+               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+      return jsonify({'status': 'error', 'program': slug, 'message': 'Program saved but worker could not start; retry through its workflow'}), 500
+    payload = {'status': 'auto_running' if automatic else 'pending_review', 'program': slug,
+           'targets': len(targets), 'jobs': jobs, 'auto_run': automatic}
+    if policy:
+      payload.update({'requests_per_second': policy['requests_per_second'], 'max_workers': policy['max_workers'],
+              'blocked_stages': policy['blocked_stages'],
+              'message': f"{request.form['program_name'].strip()} auto-run started: {policy['requests_per_second']:g} request/second, {policy['max_workers']} workers maximum"})
+    return jsonify(payload), 202
 
 
 @app.route('/programs/<slug>/guidelines')
@@ -2115,8 +2164,13 @@ def approve_program_active(slug: str):
     data = request.get_json(silent=True) or {}
     if data.get('acknowledged') is not True or type(data.get('approved')) is not bool:
         return jsonify({'status': 'error', 'message': 'Rules review and explicit decision required'}), 400
+    automatic = (ROOT / 'programs' / slug / '.auto-run.json').is_file()
     try:
+        if data['approved'] and automatic:
+            auto_run_policy(read_guidelines(slug, root=ROOT)[0])
         set_active_approval(slug, data['approved'], data.get('guidelines_sha256', ''), root=ROOT)
+        if data['approved'] and automatic:
+            configure_auto_run(slug, root=ROOT)
     except (OSError, ValueError) as exc:
         return jsonify({'status': 'error', 'message': str(exc)}), 409
     started = False
@@ -2125,7 +2179,12 @@ def approve_program_active(slug: str):
     if data['approved'] and manual_program:
       from manual_workflow import queue_manual_workflow
       manual_jobs = queue_manual_workflow(slug, root=ROOT)
-    if data['approved'] and not manual_program and os.environ.get('BUGBOUNTY_ALLOW_ACTIVE', '').strip().lower() in {'1', 'true', 'yes', 'on'}:
+    if data['approved'] and automatic and not _lock_is_active(f'auto-program-{slug}'):
+      subprocess.Popen([sys.executable, str(ROOT / 'automation' / 'worker.py'), '--program', slug, '--auto-run'],
+               cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+               stderr=subprocess.DEVNULL, start_new_session=True)
+      started = True
+    elif data['approved'] and not manual_program and not automatic and os.environ.get('BUGBOUNTY_ALLOW_ACTIVE', '').strip().lower() in {'1', 'true', 'yes', 'on'}:
         subprocess.Popen([sys.executable, str(ROOT / 'automation' / 'worker.py'), '--program', slug, '--allow-active'],
                          cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True)

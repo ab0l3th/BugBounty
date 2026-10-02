@@ -20,6 +20,227 @@ from dashboard_app import app, group_jobs_by_program, job_workflow_metadata, lis
 
 
 class ProgramBuilderTest(unittest.TestCase):
+    def test_auto_run_policy_defaults_and_testing_restrictions(self):
+        from program_builder import auto_run_policy
+        policy = auto_run_policy('Automated testing is permitted. Respect scope exclusions.')
+        self.assertEqual(policy['requests_per_second'], 1)
+        self.assertEqual(policy['max_workers'], 2)
+        self.assertEqual(len(policy['allowed_stages']), 9)
+        self.assertFalse(policy['external_probes'])
+        limited = auto_run_policy('Maximum 0.5 requests per second. Port scanning is prohibited. No directory enumeration.')
+        self.assertEqual(limited['requests_per_second'], 0.5)
+        self.assertNotIn('port-scan', limited['allowed_stages'])
+        self.assertNotIn('directory-enumeration', limited['allowed_stages'])
+        self.assertEqual(auto_run_policy('Rate limit: 12 requests per minute.')['requests_per_second'], 0.2)
+        self.assertEqual(auto_run_policy('Maximum 0.25 RPS.')['requests_per_second'], 0.25)
+        for rules in ('No automated scans.', 'Automation is prohibited.', 'Do not perform automated testing.'):
+            with self.subTest(rules=rules), self.assertRaises(ValueError):
+                auto_run_policy(rules)
+
+    def test_auto_run_configuration_requires_current_approval_and_domain_scope(self):
+        from program_builder import configure_auto_run
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_program('automatic', ['*.example.com'], root=root, guidelines='Automation allowed.')
+            with self.assertRaises(PermissionError):
+                configure_auto_run('automatic', root=root)
+            _, digest = read_guidelines('automatic', root=root)
+            set_active_approval('automatic', True, digest, root=root)
+            policy = configure_auto_run('automatic', root=root)
+            self.assertEqual(policy['guidelines_sha256'], digest)
+            self.assertTrue(policy['scope_sha256'])
+            self.assertTrue((root / 'programs/automatic/.auto-run.json').exists())
+
+    def test_auto_run_guard_paces_requests_and_enforces_scope_and_revocation(self):
+        from auto_run import AutoRunGuard
+        from program_builder import configure_auto_run
+        from urllib.request import Request
+        from urllib.error import URLError
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_program('automatic', ['*.example.com'], root=root, guidelines='Maximum 0.5 requests per second.')
+            _, digest = read_guidelines('automatic', root=root)
+            set_active_approval('automatic', True, digest, root=root)
+            configure_auto_run('automatic', root=root)
+            now = [0.0]
+            calls = []
+            sleeps = []
+
+            def fake_sleep(delay):
+                sleeps.append(delay)
+                now[0] += delay
+
+            guard = AutoRunGuard('automatic', root=root, open_request=lambda req, **kwargs: calls.append(req.full_url),
+                                  sleep_fn=fake_sleep, monotonic_fn=lambda: now[0])
+            guard.scope = ['*.example.com']
+            guard.stage = 'application-testing'
+            guard.urlopen('https://app.example.com/')
+            guard.urlopen('https://api.example.com/health')
+            self.assertEqual(sleeps, [2.0])
+            with self.assertRaises(URLError):
+                guard.urlopen('https://outside.example.org/')
+            with self.assertRaises(URLError):
+                guard.urlopen(Request('https://203.0.113.8/', headers={'Host': 'outside.example.org'}))
+            self.assertEqual(len(calls), 2)
+            set_active_approval('automatic', False, digest, root=root)
+            with self.assertRaises(PermissionError):
+                guard.urlopen('https://app.example.com/')
+            self.assertEqual(len(calls), 2)
+
+    def test_auto_run_pipeline_executes_all_nine_stages_in_order_with_shared_pacing(self):
+        from auto_run import run_auto_pipeline
+        from program_builder import configure_auto_run
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_program('automatic', ['*.example.com'], root=root, guidelines='Automated checks allowed.')
+            _, digest = read_guidelines('automatic', root=root)
+            set_active_approval('automatic', True, digest, root=root)
+            configure_auto_run('automatic', root=root)
+            now = [0.0]
+            calls = []
+            stages = []
+            original_http = worker.urllib_request.urlopen
+            original_workers = worker.MAX_WORKERS
+
+            def fake_sleep(delay):
+                now[0] += delay
+
+            def fake_open(req, **kwargs):
+                calls.append((req.full_url, now[0]))
+                return None
+
+            def fake_stage(job, scope, **kwargs):
+                stages.append(job['stage'])
+                self.assertFalse(kwargs['use_external_tools'])
+                self.assertLessEqual(worker.MAX_WORKERS, 2)
+                url = 'https://crt.sh/?q=example.com' if job['type'] == 'passive' else 'https://app.example.com/'
+                worker.urllib_request.urlopen(url)
+                return {'job': job['name'], 'program': 'automatic', 'type': job['type'], 'status': 'ok',
+                        'targets': ['app.example.com'], 'discovered': ['app.example.com'], 'assets': [], 'source_count': 0}
+
+            with patch.object(worker, 'ROOT', root), patch.object(worker, 'RESULTS_DIR', root / 'results'), \
+                 patch.object(worker, 'RUNNING_DIR', root / 'results/.running'), \
+                 patch.object(worker, 'run_passive_job', side_effect=fake_stage):
+                results = run_auto_pipeline('automatic', root=root, open_request=fake_open,
+                                            sleep_fn=fake_sleep, monotonic_fn=lambda: now[0])
+                self.assertEqual(stages, [stage['stage'] for stage in STAGES])
+                self.assertEqual(len(results), 9)
+                self.assertTrue(all(result['job_state'] == 'completed' for result in results))
+                self.assertTrue(all(later[1] - earlier[1] >= 1 for earlier, later in zip(calls, calls[1:])))
+                self.assertFalse((root / 'results/.running/auto-program-automatic.lock').exists())
+            self.assertIs(worker.urllib_request.urlopen, original_http)
+            self.assertEqual(worker.MAX_WORKERS, original_workers)
+
+    def test_auto_run_guard_covers_worker_http_dns_vhost_and_tcp(self):
+        from auto_run import AutoRunGuard
+        from program_builder import configure_auto_run
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_program('automatic', ['*.example.com'], root=root, guidelines='Automated testing allowed.')
+            _, digest = read_guidelines('automatic', root=root)
+            set_active_approval('automatic', True, digest, root=root)
+            configure_auto_run('automatic', root=root)
+            now = [0.0]
+            calls = []
+
+            class Response:
+                status = 200
+                headers = {'Server': 'mock-edge'}
+                def __enter__(self): return self
+                def __exit__(self, *args): return False
+                def getcode(self): return 200
+                def read(self, *args): return b'public test response'
+
+            def fake_open(req, **kwargs):
+                calls.append((req.full_url, now[0]))
+                return Response()
+
+            guard = AutoRunGuard('automatic', root=root, open_request=fake_open,
+                                  sleep_fn=lambda delay: now.__setitem__(0, now[0] + delay), monotonic_fn=lambda: now[0])
+            guard.scope = ['*.example.com']
+            with patch.object(worker, '_resolve_host_ips', return_value={'203.0.113.7'}) as resolve, \
+                 patch.object(worker, '_tcp_port_open', return_value=True) as tcp:
+                with guard.installed(worker):
+                    guard.stage = 'vhost-discovery'
+                    self.assertEqual(worker._resolve_host_ips('app.example.com'), {'203.0.113.7'})
+                    self.assertEqual(worker._fetch_headers_body('https://app.example.com/')[0], 200)
+                    self.assertTrue(worker._probe_vhost('203.0.113.7', 'app.example.com')['ok'])
+                    guard.stage = 'port-scan'
+                    self.assertTrue(worker._tcp_port_open('203.0.113.7', 6379))
+                    self.assertFalse(worker._tcp_port_open('198.51.100.99', 6379))
+                resolve.assert_called_once_with('app.example.com')
+                tcp.assert_called_once_with('203.0.113.7', 6379, 1.5)
+            self.assertEqual([timestamp for _, timestamp in calls], [1.0, 2.0])
+            self.assertEqual(now[0], 3.0)
+
+    def test_auto_run_pipeline_marks_forbidden_stages_without_executing_them(self):
+        from auto_run import run_auto_pipeline
+        from program_builder import configure_auto_run
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_program('automatic', ['*.example.com'], root=root, guidelines='Automated testing allowed. No port scanning.')
+            _, digest = read_guidelines('automatic', root=root)
+            set_active_approval('automatic', True, digest, root=root)
+            configure_auto_run('automatic', root=root)
+            stages = []
+
+            def fake_stage(job, scope, **kwargs):
+                stages.append(job['stage'])
+                return {'job': job['name'], 'program': 'automatic', 'type': job['type'], 'status': 'ok', 'assets': [], 'discovered': []}
+
+            with patch.object(worker, 'ROOT', root), patch.object(worker, 'RESULTS_DIR', root / 'results'), \
+                 patch.object(worker, 'RUNNING_DIR', root / 'results/.running'), \
+                 patch.object(worker, 'run_passive_job', side_effect=fake_stage):
+                results = run_auto_pipeline('automatic', root=root)
+            self.assertNotIn('port-scan', stages)
+            self.assertEqual(len(stages), 8)
+            self.assertEqual(results[-1]['job_state'], 'blocked')
+
+    def test_auto_run_guard_redirects_and_scope_change_fail_closed(self):
+        from auto_run import AutoRunGuard
+        from program_builder import configure_auto_run
+        from urllib.error import URLError
+        from urllib.request import HTTPRedirectHandler, Request
+        from email.message import Message
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_program('automatic', ['*.example.com'], root=root, guidelines='Automated checks allowed.')
+            _, digest = read_guidelines('automatic', root=root)
+            set_active_approval('automatic', True, digest, root=root)
+            configure_auto_run('automatic', root=root)
+            now = [0.0]
+            guard = AutoRunGuard('automatic', root=root, sleep_fn=lambda delay: now.__setitem__(0, now[0] + delay),
+                                  monotonic_fn=lambda: now[0])
+            guard.scope = ['*.example.com']
+            guard.stage = 'confirm-live-web-assets'
+            redirect = next(handler for handler in guard.open_request.__self__.handlers if isinstance(handler, HTTPRedirectHandler))
+            req = Request('https://app.example.com/')
+            guard.before_http(req)
+            followed = redirect.redirect_request(req, None, 302, 'redirect', Message(), 'https://api.example.com/public')
+            self.assertEqual(followed.full_url, 'https://api.example.com/public')
+            self.assertEqual(now[0], 1)
+            for target in ('https://outside.example.org/', 'https://app.example.com/login', 'http://app.example.com/'):
+                with self.subTest(target=target), self.assertRaises(URLError):
+                    redirect.redirect_request(req, None, 302, 'redirect', Message(), target)
+            (root / 'programs/automatic/scope.md').write_text('# Changed scope\n\n## In scope\n- *.other.example\n')
+            with self.assertRaises(PermissionError):
+                guard.before_http(Request('https://app.example.com/'))
+
+    def test_worker_dispatches_opted_in_program_to_guarded_pipeline(self):
+        from program_builder import configure_auto_run
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_program('automatic', ['*.example.com'], root=root, guidelines='Automated testing permitted.')
+            _, digest = read_guidelines('automatic', root=root)
+            set_active_approval('automatic', True, digest, root=root)
+            configure_auto_run('automatic', root=root)
+            with patch.object(worker, 'ROOT', root), patch.object(worker, 'JOBS_DIR', root / 'jobs'), \
+                 patch('auto_run.run_auto_pipeline', return_value=[]) as pipeline, \
+                 patch('sys.argv', ['worker.py', '--program', 'automatic', '--auto-run']), \
+                 redirect_stdout(io.StringIO()):
+                worker.main()
+            pipeline.assert_called_once_with('automatic', root=root, job_name=None, force=False)
+
     def test_url_scope_analysis_is_exact_and_blocks_ambiguous_rules(self):
         content = ('identifier,asset_type,in_scope\n'
                    'https://app.example.com/account?token=private,URL,true\n'
@@ -500,6 +721,91 @@ class ProgramBuilderTest(unittest.TestCase):
                             json={'approved': False, 'acknowledged': True, 'guidelines_sha256': digest})
                 self.assertIn(b'class="manual-analysis" data-program="aa-manual"', client.get('/').data)
                 self.assertEqual(client.post('/jobs/aa-manual-passive-web-discovery/rerun', headers=headers).status_code, 409)
+                launch.assert_not_called()
+
+    def test_upload_auto_run_acknowledges_guidelines_and_starts_scoped_worker(self):
+        with TemporaryDirectory() as directory, \
+             patch('dashboard_app.ROOT', Path(directory)), \
+             patch('dashboard_app.JOBS_DIR', Path(directory) / 'jobs'), \
+             patch('dashboard_app.RESULTS_DIR', Path(directory) / 'results'), \
+             patch('dashboard_app.subprocess.Popen') as launch, \
+             patch.dict('dashboard_app.os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token', 'BUGBOUNTY_ALLOW_ACTIVE': '0'}):
+            root = Path(directory)
+            with app.test_client() as client:
+                response = client.post('/programs/upload', headers={'X-BugBounty-Token': 'test-token'}, data={
+                    'program_name': 'Third Bounty', 'auto_run': 'true',
+                    'scope_file': (io.BytesIO(b'identifier,asset_type,in_scope\n*.example.com,WILDCARD,true\n'), 'scope.csv'),
+                    'guidelines_text': 'Automated testing permitted. Port scanning is prohibited.',
+                })
+                self.assertEqual(response.status_code, 202)
+                self.assertEqual(response.get_json()['status'], 'auto_running')
+                self.assertEqual(len(response.get_json()['jobs']), 9)
+                self.assertEqual(response.get_json()['requests_per_second'], 1)
+                self.assertIn('port-scan', response.get_json()['blocked_stages'])
+                self.assertTrue(active_approved('third-bounty', root=root))
+                self.assertTrue((root / 'programs/third-bounty/.auto-run.json').exists())
+                self.assertEqual(launch.call_args.args[0][-3:], ['--program', 'third-bounty', '--auto-run'])
+                launch.assert_called_once()
+
+                launch.reset_mock()
+                (root / 'programs/third-bounty/rules.md').write_text('Automation allowed. Maximum 0.5 requests per second.')
+                _, new_digest = read_guidelines('third-bounty', root=root)
+                response = client.post('/programs/third-bounty/active-approval', headers={'X-BugBounty-Token': 'test-token'},
+                                       json={'approved': True, 'acknowledged': True, 'guidelines_sha256': new_digest})
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(response.get_json()['active_run_started'])
+                self.assertIn('--auto-run', launch.call_args.args[0])
+                profile = json.loads((root / 'programs/third-bounty/.auto-run.json').read_text())
+                self.assertEqual(profile['requests_per_second'], 0.5)
+                launch.reset_mock()
+                with patch('dashboard_app._lock_is_active', return_value=True):
+                    response = client.post('/programs/third-bounty/active-approval', headers={'X-BugBounty-Token': 'test-token'},
+                                           json={'approved': True, 'acknowledged': True, 'guidelines_sha256': new_digest})
+                self.assertFalse(response.get_json()['active_run_started'])
+                launch.assert_not_called()
+                with patch('dashboard_app._lock_is_active', return_value=True):
+                    response = client.post('/jobs/third-bounty-application-testing/rerun', headers={'X-BugBounty-Token': 'test-token'})
+                self.assertEqual(response.status_code, 409)
+                launch.assert_not_called()
+
+    def test_auto_run_revocation_preserves_partial_results_and_stops_next_stage(self):
+        from auto_run import run_auto_pipeline
+        from program_builder import configure_auto_run
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_program('automatic', ['*.example.com'], root=root, guidelines='Automated testing allowed.')
+            _, digest = read_guidelines('automatic', root=root)
+            set_active_approval('automatic', True, digest, root=root)
+            configure_auto_run('automatic', root=root)
+
+            def revoke(job, scope, **kwargs):
+                kwargs['progress']({'assets': [{'domain': 'app.example.com', 'evidence': ['partial observation']}], 'discovered': []})
+                set_active_approval('automatic', False, digest, root=root)
+                return {'status': 'ok', 'assets': []}
+
+            with patch.object(worker, 'ROOT', root), patch.object(worker, 'RESULTS_DIR', root / 'results'), \
+                 patch.object(worker, 'RUNNING_DIR', root / 'results/.running'), \
+                 patch.object(worker, 'run_passive_job', side_effect=revoke) as run:
+                results = run_auto_pipeline('automatic', root=root)
+            run.assert_called_once()
+            self.assertEqual(results[0]['job_state'], 'stopped')
+            self.assertEqual(results[0]['assets'][0]['evidence'], ['partial observation'])
+            self.assertFalse((root / 'results/.running/auto-program-automatic.lock').exists())
+
+    def test_auto_run_upload_rejects_bans_or_manual_scope_without_creating_program(self):
+        with TemporaryDirectory() as directory, patch('dashboard_app.ROOT', Path(directory)), \
+             patch('dashboard_app.subprocess.Popen') as launch, \
+             patch.dict('dashboard_app.os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token'}):
+            with app.test_client() as client:
+                for kind, rules in [('WILDCARD', 'No automated scans.'), ('URL', 'Automation allowed.')]:
+                    with self.subTest(kind=kind):
+                        response = client.post('/programs/upload', headers={'X-BugBounty-Token': 'test-token'}, data={
+                            'program_name': 'Rejected', 'auto_run': 'true',
+                            'scope_file': (io.BytesIO(f'identifier,asset_type,in_scope\napp.example.com,{kind},true\n'.encode()), 'scope.csv'),
+                            'guidelines_text': rules,
+                        })
+                        self.assertEqual(response.status_code, 400)
+                        self.assertFalse((Path(directory) / 'programs/rejected').exists())
                 launch.assert_not_called()
 
     def test_manual_review_keeps_pending_programs_and_incomplete_workflows(self):

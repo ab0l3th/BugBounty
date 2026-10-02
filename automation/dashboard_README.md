@@ -55,7 +55,29 @@ a saved scanner HTML report. Download the Markdown draft, independently verify
 the observation, and fill in confirmed reproduction steps, demonstrated impact,
 and eligibility before manually reporting. Drafts do not submit reports.
 
-## Manual scope workflows
+## Opt-In Auto-Run
+
+For a new domain/wildcard bounty, select **Auto-run permitted stages** when
+uploading scope and guidelines. This checkbox explicitly acknowledges the supplied
+guidelines and starts a program-scoped pipeline without a second approval click.
+Leave it unchecked to keep the existing passive discovery and approval workflow.
+URL/app-only scope remains manual-only and cannot opt in through this checkbox.
+
+Auto-run advances the canonical stages in dependency order. Recognized testing
+bans mark stages blocked; stages requiring their results remain waiting. Defaults
+are at most 1 request per second and 2 workers, with lower stated limits taking
+precedence. External curl/nmap/whatweb probes are disabled. HTTP requests,
+redirects, worker DNS lookups, and TCP checks share program pacing and a lock.
+Redirects must remain in scope; login, excessive, and HTTPS-downgrade redirects
+are skipped. Public passive lookups use the existing discovery providers.
+
+Approval, guidelines, scope, and configuration are checked during execution.
+Revocation or changes stop further requests. Reapproval under current guidelines
+refreshes the policy and can resume the pipeline, without overlapping an existing
+program run. Report drafts still require independent manual verification and
+program eligibility review; missing rate limits do not authorize prohibited tests.
+
+## Manual Scope Workflows
 
 Checking the manual scope confirmation checkbox loads the current guidelines,
 saves approval, and queues nine manual-only steps beneath the existing program

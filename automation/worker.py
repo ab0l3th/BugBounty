@@ -1909,7 +1909,10 @@ def main() -> None:
     parser.add_argument('--force', action='store_true', help='Re-run completed jobs even when result files already exist.')
     parser.add_argument('--allow-active', action='store_true', help='Permit jobs that make live connections to targets (steps 3 and 4). Off by default for passive-only safety.')
     parser.add_argument('--external-probes', action='store_true', help='Enable curl/nmap/whatweb checks alongside Python HTTP probes for live asset confirmation.')
+    parser.add_argument('--auto-run', action='store_true', help='Run an explicitly approved per-program pipeline with scope and traffic guards.')
     args = parser.parse_args()
+    if args.auto_run and not args.program:
+        parser.error('--auto-run requires --program')
 
     # External probes are inherently active, so they imply active mode.
     allow_active = args.allow_active or args.external_probes
@@ -1921,6 +1924,19 @@ def main() -> None:
         jobs = [path for path in jobs if path.stem == args.job or load_job(path).get('name') == args.job]
 
     all_results = []
+    automatic_programs = {load_job(path).get('program') for path in jobs
+                          if (ROOT / 'programs' / load_job(path).get('program', '') / '.auto-run.json').is_file()}
+    if args.auto_run:
+        automatic_programs.add(args.program)
+    if automatic_programs and args.external_probes:
+        parser.error('External probes are disabled for auto-run programs')
+    for program in sorted(automatic_programs):
+        from auto_run import run_auto_pipeline
+        try:
+            all_results.extend(run_auto_pipeline(program, root=ROOT, job_name=args.job, force=args.force))
+        except (OSError, ValueError, PermissionError) as exc:
+            print(json.dumps({'program': program, 'status': 'auto_run_stopped', 'reason': str(exc)}), file=sys.stderr)
+    jobs = [path for path in jobs if load_job(path).get('program') not in automatic_programs]
     for job_path in jobs:
         job = load_job(job_path)
         job['stage'] = job.get('stage') or stage_for_job_name(job.get('name', ''))
