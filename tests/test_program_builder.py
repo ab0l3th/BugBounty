@@ -30,7 +30,8 @@ class ProgramBuilderTest(unittest.TestCase):
         self.assertEqual(analysis['policy']['max_requests_per_second'], 1)
         self.assertEqual(analysis['policy']['stated_max_requests_per_second'], 3)
         self.assertEqual(analysis['policy']['method'], 'HEAD')
-        self.assertFalse(analysis['policy']['follows_redirects'])
+        self.assertTrue(analysis['policy']['follows_redirects'])
+        self.assertTrue(analysis['policy']['skips_login_redirects'])
         self.assertEqual(analysis['eligible_urls'], 2)
         self.assertEqual(analysis['app_ids'], 1)
         self.assertEqual(analysis['app_assets'][0]['platform'], 'Google Play')
@@ -68,6 +69,10 @@ class ProgramBuilderTest(unittest.TestCase):
         self.assertEqual(analysis['assets'][0]['host'], 'portal.example.com')
         self.assertEqual(analysis['assets'][0]['path'], '/')
         self.assertEqual(analysis['policy']['automated_requests'], 'blocked')
+        wildcard = analyze_url_scope('identifier,asset_type,in_scope\n*.example.com,URL,true\n',
+                         'Maximum 3 requests per second.')
+        self.assertEqual(wildcard['assets'], [])
+        self.assertEqual(wildcard['invalid_urls'], 1)
 
     def test_dashboard_imports_as_gunicorn_package(self):
         subprocess.run([sys.executable, '-c', 'from automation.dashboard_app import app'],
@@ -440,6 +445,53 @@ class ProgramBuilderTest(unittest.TestCase):
                 worker.main()
             probe.assert_not_called()
             self.assertFalse((root / 'results/demo-confirm-live-web-assets.json').exists())
+
+    def test_manual_scope_approval_queues_below_existing_program_and_starts_one_step(self):
+        with TemporaryDirectory() as directory, \
+             patch('dashboard_app.ROOT', Path(directory)), \
+             patch('dashboard_app.JOBS_DIR', Path(directory) / 'jobs'), \
+             patch('dashboard_app.RESULTS_DIR', Path(directory) / 'results'), \
+             patch('dashboard_app.RUNNING_DIR', Path(directory) / 'results' / '.running'), \
+             patch('dashboard_app.subprocess.Popen') as launch, \
+             patch.dict('dashboard_app.os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token', 'BUGBOUNTY_ALLOW_ACTIVE': '1'}):
+            root = Path(directory)
+            launch.return_value.pid = 9876
+            create_program('zz-existing', ['*.existing.example'], root=root, guidelines='Authorized testing.')
+            create_manual_program('aa-manual', 'identifier,asset_type,in_scope\napp.example.com,URL,true\n',
+                                  'Maximum 3 requests per second.', {'eligible_asset_types': {'URL': 1}}, root=root)
+            _, digest = read_guidelines('aa-manual', root=root)
+            headers = {'X-BugBounty-Token': 'test-token'}
+            with app.test_client() as client:
+                approval = client.post('/programs/aa-manual/active-approval', headers=headers,
+                                       json={'approved': True, 'acknowledged': True, 'guidelines_sha256': digest})
+                self.assertEqual(approval.status_code, 200)
+                self.assertEqual(len(approval.get_json()['manual_jobs']), 9)
+                self.assertFalse(approval.get_json()['active_run_started'])
+                launch.assert_not_called()
+                self.assertFalse((root / 'jobs/generated/aa-manual-passive-web-discovery.yaml').exists())
+                page = client.get('/')
+                self.assertEqual(page.status_code, 200)
+                self.assertLess(page.data.index(b'data-state-key="program-zz-existing"'),
+                                page.data.index(b'data-state-key="program-aa-manual"'))
+                self.assertEqual(page.data.count(b'Start step manually'), 9)
+                self.assertIn(b'TCP port scanning requires explicit permission', page.data)
+                blocked = client.post('/jobs/aa-manual-passive-dns-discovery/rerun', headers=headers)
+                self.assertEqual(blocked.status_code, 409)
+                self.assertIn('Complete passive-web-discovery', blocked.get_json()['message'])
+                launch.assert_not_called()
+                started = client.post('/jobs/aa-manual-passive-web-discovery/rerun', headers=headers)
+                self.assertEqual(started.status_code, 202)
+                command = launch.call_args.args[0]
+                self.assertEqual(command[1:], [str(root / 'automation/manual_workflow.py'), 'aa-manual', 'passive-web-discovery'])
+                launch.reset_mock()
+                with patch('dashboard_app._lock_is_active', return_value=True):
+                    self.assertEqual(client.post('/jobs/aa-manual-passive-web-discovery/rerun', headers=headers).status_code, 409)
+                    self.assertEqual(client.post('/programs/aa-manual/url-check', headers=headers).status_code, 409)
+                launch.assert_not_called()
+                client.post('/programs/aa-manual/active-approval', headers=headers,
+                            json={'approved': False, 'acknowledged': True, 'guidelines_sha256': digest})
+                self.assertEqual(client.post('/jobs/aa-manual-passive-web-discovery/rerun', headers=headers).status_code, 409)
+                launch.assert_not_called()
 
     def test_manual_url_check_endpoint_requires_current_approval(self):
         with TemporaryDirectory() as directory, \

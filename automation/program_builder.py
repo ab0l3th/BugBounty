@@ -78,7 +78,7 @@ def analyze_url_scope(content: str, guidelines: str) -> dict:
             continue
         value = next((row[key] for key in ('identifier', 'target', 'asset_identifier', 'asset') if row.get(key)), '')
         bare_host = parse_scope_pattern(value)
-        if bare_host == value.lower().rstrip('.'):
+        if bare_host == value.lower().rstrip('.') and '*' not in value:
             identity = hashlib.sha256(value.encode('utf-8')).hexdigest()
             if identity in seen:
                 continue
@@ -117,14 +117,15 @@ def analyze_url_scope(content: str, guidelines: str) -> dict:
         reason = 'Guidelines explicitly prohibit automated requests or scans'
     elif stated_limit:
         automation_status = 'manual_approval_required'
-        reason = 'Only an operator-approved exact-URL HEAD check is available; aggressive scanning remains disabled. Rate limits are not permission; automated findings may be ineligible and require manual verification'
+        reason = 'Only operator-approved bounded exact-scope checks are available; aggressive scanning remains disabled. Rate limits are not permission; automated findings may be ineligible and require manual verification'
     else:
         automation_status = 'blocked'
         reason = 'No explicit request-rate limit was found in the guidelines'
     policy = {'automated_requests': automation_status,
               'stated_max_requests_per_second': stated_limit,
               'max_requests_per_second': min(1, stated_limit) if stated_limit else None,
-              'method': 'HEAD', 'follows_redirects': False, 'reason': reason}
+              'method': 'HEAD', 'follows_redirects': True, 'max_redirects': 3,
+              'skips_login_redirects': True, 'redirects_must_be_in_scope': True, 'reason': reason}
     return {'eligible_urls': inventory['eligible_asset_types'].get('URL', 0), 'invalid_urls': invalid_urls,
             'app_ids': len(app_assets), 'app_assets': app_assets,
             'categories': dict(Counter(asset['category'] for asset in assets)),

@@ -1043,20 +1043,21 @@ def _write_finding_report(job_name: str, host: str, findings: list[dict]) -> str
     return f'/reports/{job_name}/{host}'
 
 
-def _application_security_tests(hosts: list[str], *, use_external_tools: bool = False, progress=None, report_job_name: str = 'application-security-testing') -> dict:
+def _application_security_tests(hosts: list[str], *, use_external_tools: bool = False, progress=None, report_job_name: str = 'application-security-testing', fetch=None, write_reports: bool = True, workers: int | None = None) -> dict:
+    fetch = fetch or _fetch_headers_body
     deduped_hosts = sorted(set(hosts))
     assets: list[dict] = []
     probe_log: list[dict] = []
     login_seen: set[str] = set()
     thread_status: list[dict] = []
-    max_workers = _bounded_workers(len(deduped_hosts))
+    max_workers = workers or _bounded_workers(len(deduped_hosts))
 
     def test_host(host: str) -> dict:
         thread_name = threading.current_thread().name
         url = f'https://{host}'
         findings: list[dict] = []
         try:
-            code, hdrs, body = _fetch_headers_body(url)
+            code, hdrs, body = fetch(url)
         except urllib_error.HTTPError as exc:
             code = exc.code
             hdrs = {str(k).lower(): str(v) for k, v in (exc.headers.items() if exc.headers else [])}
@@ -1093,7 +1094,7 @@ def _application_security_tests(hosts: list[str], *, use_external_tools: bool = 
 
         # CORS reflection check with an untrusted Origin (read-only).
         try:
-            _, cors_hdrs, _ = _fetch_headers_body(url, extra_headers={'Origin': 'https://evil.example'})
+            _, cors_hdrs, _ = fetch(url, extra_headers={'Origin': 'https://evil.example'})
             acao = cors_hdrs.get('access-control-allow-origin', '')
             acac = cors_hdrs.get('access-control-allow-credentials', '')
             if acao == 'https://evil.example' or (acao == '*' and acac.lower() == 'true'):
@@ -1113,7 +1114,7 @@ def _application_security_tests(hosts: list[str], *, use_external_tools: bool = 
             'source_count': len(findings),
             'evidence': [{'source': 'app-test', 'url': url, 'detail': f.get('type')} for f in findings],
         }
-        report_url = _write_finding_report(report_job_name, host, findings)
+        report_url = _write_finding_report(report_job_name, host, findings) if write_reports else None
         if report_url:
             record['report_url'] = report_url
         assets.append(record)
@@ -1222,13 +1223,14 @@ def _is_login_redirect(requested_url: str, final_url: str, body: str) -> bool:
     return (redirected and url_login) or body_login
 
 
-def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False, progress=None) -> dict:
+def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False, progress=None, fetch=None, workers: int | None = None) -> dict:
+    fetch = fetch or _fetch_headers_body
     deduped_hosts = sorted(set(hosts))
     assets: list[dict] = []
     probe_log: list[dict] = []
     login_seen: set[str] = set()
     thread_status: list[dict] = []
-    max_workers = _bounded_workers(len(deduped_hosts))
+    max_workers = workers or _bounded_workers(len(deduped_hosts))
 
     def test_host(host: str) -> dict:
         thread_name = threading.current_thread().name
@@ -1237,7 +1239,7 @@ def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False, p
         for path in _API_DEBUG_PATHS:
             url = f'https://{host}{path}'
             try:
-                code, hdrs, body = _fetch_headers_body(url)
+                code, hdrs, body = fetch(url)
             except urllib_error.HTTPError as exc:
                 code, hdrs, body = exc.code, {}, ''
             except (urllib_error.URLError, ValueError, OSError):
@@ -1260,7 +1262,7 @@ def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False, p
 
         # GraphQL introspection (read-only query).
         try:
-            code, hdrs, body = _fetch_headers_body(f'https://{host}/graphql', extra_headers={'Content-Type': 'application/json'}, method='POST', data=_GRAPHQL_INTROSPECTION)
+            code, hdrs, body = fetch(f'https://{host}/graphql', extra_headers={'Content-Type': 'application/json'}, method='POST', data=_GRAPHQL_INTROSPECTION)
             if code == 200 and '__schema' in body:
                 findings.append({'type': 'graphql_introspection', 'detail': 'introspection enabled', 'severity': 'medium'})
         except Exception:
@@ -1272,7 +1274,7 @@ def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False, p
                 continue
             url = f'https://{host}{doc_path}'
             try:
-                code, hdrs, body = _fetch_headers_body(url)
+                code, hdrs, body = fetch(url)
             except urllib_error.HTTPError as exc:
                 code, hdrs, body = exc.code, {}, ''
             except (urllib_error.URLError, ValueError, OSError):

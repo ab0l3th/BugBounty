@@ -1,4 +1,6 @@
 import sys
+import io
+import json
 import unittest
 from email.message import Message
 from pathlib import Path
@@ -10,8 +12,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / 'automation') not in sys.path:
     sys.path.insert(0, str(ROOT / 'automation'))
 
-from manual_url_checker import run_url_check
+from manual_url_checker import ApprovedScopeClient, run_url_check
 from program_builder import create_manual_program, read_guidelines, set_active_approval
+from manual_workflow import queue_manual_workflow, run_manual_stage, stage_block_reason
+from stages import STAGES
 
 
 class ManualUrlCheckerTest(unittest.TestCase):
@@ -127,6 +131,122 @@ class ManualUrlCheckerTest(unittest.TestCase):
             self.assertEqual(sleeps, [1.0])
             self.assertEqual(result['checked'], 2)
             self.assertTrue(result['complete'])
+
+    def test_in_scope_non_login_redirect_is_followed_at_one_rps(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_manual_program('sample', 'identifier,asset_type,in_scope\napp.example.com,URL,true\n',
+                                  'Maximum 3 requests per second.', {'manual_only': True}, root=root)
+            _, digest = read_guidelines('sample', root=root)
+            set_active_approval('sample', True, digest, root=root)
+            calls = []
+            sleeps = []
+            now = [0.0]
+
+            def fake_open(request, timeout=8):
+                calls.append((request.full_url, request.get_method()))
+                headers = Message()
+                if len(calls) == 1:
+                    headers['Location'] = '/public'
+                raise HTTPError(request.full_url, 302 if len(calls) == 1 else 200, 'response', headers, None)
+
+            def fake_sleep(delay):
+                sleeps.append(delay)
+                now[0] += delay
+
+            result = run_url_check('sample', root=root, open_request=fake_open,
+                                   sleep_fn=fake_sleep, monotonic_fn=lambda: now[0])
+            self.assertEqual(calls, [('https://app.example.com/', 'HEAD'), ('https://app.example.com/public', 'HEAD')])
+            self.assertEqual(sleeps, [1.0])
+            self.assertEqual(result['results'][0]['final_url'], 'https://app.example.com/public')
+
+    def test_redirects_stop_before_login_scope_exit_query_or_downgrade(self):
+        for destination, expected in [('/login', 'login_redirect'), ('https://sso.app.example.com/', 'login_redirect'),
+                                       ('https://outside.example.com/', 'outside_scope'), ('/public?token=secret', 'outside_scope'),
+                                       ('http://app.example.com/', 'https_downgrade')]:
+            with self.subTest(destination=destination), TemporaryDirectory() as directory:
+                root = Path(directory)
+                create_manual_program('sample', 'identifier,asset_type,in_scope\napp.example.com,URL,true\n',
+                                      'Maximum 3 requests per second.', {'manual_only': True}, root=root)
+                _, digest = read_guidelines('sample', root=root)
+                set_active_approval('sample', True, digest, root=root)
+                calls = []
+
+                def fake_open(request, timeout=8):
+                    calls.append(request.full_url)
+                    headers = Message()
+                    headers['Location'] = destination
+                    raise HTTPError(request.full_url, 302, 'redirect', headers, None)
+
+                result = run_url_check('sample', root=root, open_request=fake_open)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(result['results'][0]['redirect_stop'], expected)
+                self.assertNotIn('token=secret', str(result))
+
+    def test_exact_url_scope_does_not_expand_into_other_paths(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_manual_program('sample', 'identifier,asset_type,in_scope\nhttps://app.example.com/allowed,URL,true\n',
+                                  'Maximum 3 requests per second.', {'manual_only': True}, root=root)
+            _, digest = read_guidelines('sample', root=root)
+            set_active_approval('sample', True, digest, root=root)
+            client = ApprovedScopeClient('sample', root=root, open_request=lambda *args, **kwargs: self.fail('Must not request another path'))
+            self.assertTrue(client.allows('https://app.example.com/allowed'))
+            self.assertFalse(client.allows('https://app.example.com/other'))
+            self.assertEqual(client.request('https://app.example.com/other')['error'], 'OutsideExactScope')
+
+    def test_approved_manual_workflow_queues_nine_steps_without_automatic_jobs(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._make_approved_program(root)
+            names = queue_manual_workflow('sample', root=root)
+            self.assertEqual(len(names), 9)
+            self.assertFalse((root / 'jobs/generated').exists())
+            self.assertTrue(all(json.loads((root / 'results' / f'{name}.json').read_text())['job_state'] == 'queued' for name in names))
+            self.assertIn('Complete passive-web-discovery', stage_block_reason('sample', 'passive-dns-discovery', root=root))
+            self.assertIn('explicit permission', stage_block_reason('sample', 'port-scan', root=root))
+            run_manual_stage('sample', 'passive-web-discovery', root=root)
+            self.assertIsNone(stage_block_reason('sample', 'passive-dns-discovery', root=root))
+            _, digest = read_guidelines('sample', root=root)
+            set_active_approval('sample', False, digest, root=root)
+            self.assertIn('approved', stage_block_reason('sample', 'passive-web-discovery', root=root))
+
+    def test_all_nine_manual_steps_use_bounded_scoped_transports(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_manual_program('sample', 'identifier,asset_type,in_scope\napp.example.com,URL,true\n',
+                                  'Maximum 3 requests per second. Allow port scanning.', {'manual_only': True}, root=root)
+            _, digest = read_guidelines('sample', root=root)
+            set_active_approval('sample', True, digest, root=root)
+            queue_manual_workflow('sample', root=root)
+            calls = []
+            now = [0.0]
+
+            def fake_open(request, timeout=8):
+                calls.append((request.full_url, request.get_method(), now[0]))
+                headers = Message()
+                headers['Content-Type'] = 'application/json'
+                headers['Server'] = 'mock-edge'
+                return HTTPError(request.full_url, 200, 'mock response', headers, io.BytesIO(b'{"sample":true}'))
+
+            def fake_sleep(delay):
+                now[0] += delay
+
+            client = ApprovedScopeClient('sample', root=root, open_request=fake_open,
+                                         sleep_fn=fake_sleep, monotonic_fn=lambda: now[0])
+            with patch('worker._resolve_host_ips', return_value={'203.0.113.9'}), \
+                 patch('worker._tcp_port_open', return_value=False), \
+                 patch('worker.DEFAULT_CONTENT_WORDLIST', ['/public']), \
+                 patch('worker.subprocess.run') as external:
+                for stage in STAGES:
+                    result = run_manual_stage('sample', stage['stage'], root=root, client=client)
+                    self.assertEqual(result['job_state'], 'completed', result.get('error'))
+                external.assert_not_called()
+            self.assertTrue(calls)
+            self.assertTrue(all(url.startswith('https://app.example.com') for url, _, _ in calls))
+            self.assertTrue(all(method in {'HEAD', 'GET'} for _, method, _ in calls))
+            self.assertTrue(all(later[2] - earlier[2] >= 1 for earlier, later in zip(calls, calls[1:])))
+            self.assertEqual(len(list((root / 'results').glob('*.json'))), 9)
 
     def test_revocation_or_guideline_change_during_wait_stops_the_next_request(self):
         for change_rules in (False, True):

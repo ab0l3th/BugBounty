@@ -34,3 +34,41 @@ sudo systemctl status bugbounty-dashboard.service
 ```
 
 The dashboard is intentionally private-only and should be accessed on your local network rather than exposed publicly.
+
+## Finding review
+
+Use the review link inside a program or job. Review queues never combine findings
+from different programs. Columns can be sorted, and the severity filter can show
+only MEDIUM, HIGH, and CRITICAL scanner signals. Scanner severity and confidence
+are independent, color-coded triage values, not confirmed impact ratings.
+
+Every finding has a program-bound verification draft, including findings without
+a saved scanner HTML report. Download the Markdown draft, independently verify
+the observation, and fill in confirmed reproduction steps, demonstrated impact,
+and eligibility before manually reporting. Drafts do not submit reports.
+
+## Manual scope workflows
+
+Reviewing and approving a manual CSV scope queues nine manual-only steps beneath
+the existing program workflows. Approval does not launch any step and does not
+create jobs that the automatic runner can pick up. Dependencies, current
+guidelines, and exact scope are checked again for each manual start.
+
+The manual workflow uses offline scope inventory, exact-host DNS, bounded HTTP
+liveness and service checks, shared-IP checks of uploaded hosts, curated path
+checks, application/API observations, and explicitly permitted TCP checks.
+Follow-up active steps use only hosts confirmed live. URL-restricted assets never
+expand into domain-wide or wildcard scope. App IDs remain inventory-only.
+
+All manual HTTP requests, including redirect hops, are serialized at no more than
+1 request per second. Redirects must remain in uploaded scope; login/SSO,
+query-bearing, looping, excessive, and HTTPS-downgrade redirects are skipped.
+Manual HTTP checks use GET/HEAD only, bounded response reads, and no external
+scanners or POST probes. Standalone URL checks and workflow steps share a
+per-program lock. Approval revocation or guideline changes stop further requests.
+
+Explicit testing bans still block the relevant steps. TCP port scanning requires
+explicit permission in the guidelines and exact-host scope. A request-rate limit
+is not permission to run prohibited tests, and manually verifying a finding does
+not make a prohibited scan compliant. Automated findings may also be ineligible
+for reporting even when the requests themselves are permitted.

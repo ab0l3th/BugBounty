@@ -1070,6 +1070,56 @@ class DashboardJobMetadataTest(unittest.TestCase):
                 self.assertIn(b'href="/reports/api-endpoint-testing/api.example.com"', page.data)
                 self.assertNotIn(b'href="https://api.example.com@malicious.test', page.data)
 
+    def test_review_is_program_and_job_scoped_with_severity_sort_and_filter(self):
+        jobs = [
+            {'name': 'alpha-app', 'program': 'alpha', 'assets': [
+                {'domain': 'low.alpha.test', 'findings': [{'type': 'insecure_cookie', 'severity': 'low'}]},
+                {'domain': 'high.alpha.test', 'findings': [{'type': 'debug_endpoint', 'severity': 'high'}]},
+                {'domain': 'medium.alpha.test', 'findings': [{'type': 'error_disclosure', 'severity': 'medium'}]},
+            ]},
+            {'name': 'alpha-api', 'program': 'alpha', 'assets': [
+                {'domain': 'api.alpha.test', 'findings': [{'type': 'debug_endpoint', 'severity': 'high'}]},
+            ]},
+            {'name': 'beta-app', 'program': 'beta', 'assets': [
+                {'domain': 'secret.beta.test', 'findings': [{'type': 'debug_endpoint', 'severity': 'critical'}]},
+            ]},
+        ]
+        with patch('dashboard_app.list_jobs', return_value=jobs), app.test_client() as client:
+            directory = client.get('/review')
+            self.assertIn(b'Choose a program', directory.data)
+            self.assertNotIn(b'secret.beta.test', directory.data)
+            page = client.get('/review?program=alpha&job=alpha-app&minimum=medium')
+            self.assertNotIn(b'secret.beta.test', page.data)
+            self.assertNotIn(b'api.alpha.test', page.data)
+            self.assertNotIn(b'low.alpha.test', page.data)
+            self.assertLess(page.data.index(b'high.alpha.test'), page.data.index(b'medium.alpha.test'))
+            self.assertIn(b'Scanner severity', page.data)
+            self.assertIn(b'badge severity-high', page.data)
+            self.assertIn(b'badge confidence-medium', page.data)
+            ascending = client.get('/review?program=alpha&job=alpha-app&sort=severity&direction=asc')
+            self.assertLess(ascending.data.index(b'low.alpha.test'), ascending.data.index(b'high.alpha.test'))
+
+    def test_every_finding_has_a_program_bound_verification_draft(self):
+        from dashboard_app import review_candidates
+        jobs = [{'name': 'alpha-ports', 'program': 'alpha', 'assets': [{
+            'domain': 'host.alpha.test', 'findings': [
+                {'type': 'open_port', 'port': 6379, 'service': 'redis', 'severity': 'critical', 'detail': '<script>untrusted</script>'},
+            ],
+        }]}]
+        finding_id = review_candidates(jobs)[0]['id']
+        with patch('dashboard_app.list_jobs', return_value=jobs), app.test_client() as client:
+            url = f'/programs/alpha/findings/{finding_id}/writeup'
+            page = client.get(url)
+            self.assertEqual(page.status_code, 200)
+            self.assertIn(b'Manual verification and reporting draft', page.data)
+            self.assertIn(b'CRITICAL', page.data)
+            self.assertIn(b'6379', page.data)
+            self.assertNotIn(b'<script>untrusted</script>', page.data)
+            download = client.get(url + '?download=1')
+            self.assertEqual(download.mimetype, 'text/markdown')
+            self.assertIn('attachment', download.headers['Content-Disposition'])
+            self.assertEqual(client.get(f'/programs/beta/findings/{finding_id}/writeup').status_code, 404)
+
     def test_rerun_launches_only_the_requested_job(self):
         with patch('dashboard_app.subprocess.Popen', return_value=type('Proc', (), {'pid': 4321})()) as mock_popen, \
              patch.dict('os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token'}):

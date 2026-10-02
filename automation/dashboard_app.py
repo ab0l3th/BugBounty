@@ -158,6 +158,10 @@ def _lock_is_active(job_name: str) -> bool:
 def _job_state_for(job_name: str, payload: Dict[str, Any] | None = None) -> str:
     if _lock_is_active(job_name):
         return 'running'
+    if payload and payload.get('manual_only') and payload.get('job_state') == 'running':
+        return 'running' if _lock_is_active(f"manual-program-{payload['program']}") else 'stopped'
+    if payload and payload.get('manual_only') and payload.get('job_state') == 'stopped':
+        return 'stopped'
     if payload and payload.get('status') == 'waiting_on_dependencies':
         return 'waiting_on_dependencies'
     if payload and payload.get('job_state') == 'waiting_on_dependencies':
@@ -232,11 +236,14 @@ def review_candidates(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     report_url = expected_report
                 candidates.append({
                     'id': hashlib.sha256(identity.encode('utf-8')).hexdigest(),
+                  'program': job.get('program', 'unknown'),
                     'job': job['name'],
                     'host': asset['domain'],
                     'target_url': target_url,
                     'report_url': report_url,
                     'evidence': evidence,
+                    'finding': finding,
+                    'severity': str(finding.get('severity', 'unknown')).lower(),
                     'confidence': 'medium' if finding_type in {'error_disclosure', 'graphql_introspection'} else 'low',
                     'scope': 'needs verification',
                 })
@@ -262,11 +269,33 @@ def write_reviews(reviews: Dict[str, Any]) -> None:
 def review_queue():
     reviews = read_reviews()
     candidates = review_candidates(list_jobs())
+    programs = sorted({item['program'] for item in candidates})
+    program = request.args.get('program')
+    job = request.args.get('job')
+    if not program and len(programs) == 1:
+        program = programs[0]
+    if not program:
+        return render_template_string('''<h1>Choose a program</h1>
+      {% for program in programs %}<p><a href="{{ url_for('review_queue', program=program) }}">{{ program_label(program) }}</a></p>
+      {% else %}<p>No scanner findings to review.</p>{% endfor %}''', programs=programs, program_label=program_label)
+    candidates = [item for item in candidates if item['program'] == program and (not job or item['job'] == job)]
     for candidate in candidates:
         decision = reviews.get(candidate['id'], {})
         candidate['decision'] = decision.get('status', 'needs_review')
         candidate['scope'] = decision.get('scope', 'needs_verification')
-    candidates.sort(key=lambda item: (item['decision'] != 'needs_review', item['job'], item['host']))
+    minimum = request.args.get('minimum', 'all')
+    if minimum == 'medium':
+      candidates = [item for item in candidates if _SEVERITY_ORDER.get(item['severity'], 0) >= 3]
+    sort = request.args.get('sort', 'severity')
+    direction = request.args.get('direction', 'desc' if sort in {'severity', 'confidence'} else 'asc')
+    sorters = {'host': lambda item: item['host'], 'job': lambda item: item['job'],
+           'type': lambda item: item['evidence']['type'],
+           'severity': lambda item: _SEVERITY_ORDER.get(item['severity'], 0),
+           'confidence': lambda item: {'low': 1, 'medium': 2, 'high': 3}.get(item['confidence'], 0),
+           'scope': lambda item: item['scope'], 'decision': lambda item: item['decision']}
+    candidates.sort(key=sorters.get(sort, sorters['severity']), reverse=direction == 'desc')
+    columns = [('host', 'Asset'), ('job', 'Job'), ('type', 'Observed evidence'), ('severity', 'Scanner severity'),
+           ('confidence', 'Confidence'), ('scope', 'Scope'), ('decision', 'Review')]
     return render_template_string('''<!doctype html>
   <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Finding Review</title><style>
@@ -275,20 +304,35 @@ def review_queue():
   table { width:100%; border-collapse:collapse; } th,td { text-align:left; vertical-align:top; border-bottom:1px solid #334155; padding:10px; }
   select,button { background:#1f2937; color:#e5e7eb; border:1px solid #475569; padding:7px; }
   code { overflow-wrap:anywhere; } .meta { color:#94a3b8; } .row { display:flex; flex-wrap:wrap; gap:6px; }
-  @media(max-width:700px) { table,tbody,tr,td { display:block; } thead { display:none; } tr { padding:10px 0; } td { border:0; padding:4px; } }
-  </style></head><body><main><p><a href="/">← Dashboard</a></p><h1>Finding review</h1>
+  .badge { display:inline-block; padding:3px 7px; border:1px solid currentColor; border-radius:4px; }
+  .severity-critical,.severity-high { color:#fca5a5; background:#450a0a; }
+  .severity-medium,.confidence-medium { color:#fde68a; background:#422006; }
+  .severity-low,.confidence-low { color:#93c5fd; background:#172554; }
+  .severity-info,.severity-unknown { color:#cbd5e1; background:#334155; }
+  .confidence-high { color:#86efac; background:#052e16; }
+  form { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:12px; }
+  form label { display:flex; align-items:center; flex-wrap:wrap; gap:6px; }
+  @media(max-width:700px) { table,tbody,tr,td { display:block; } thead { display:none; } tr { padding:10px 0; } td { border:0; padding:4px; }
+    td:nth-child(4)::before { content:'Scanner severity: '; } td:nth-child(5)::before { content:'Confidence: '; } }
+  </style></head><body><main><p><a href="/">← Dashboard</a></p><h1>{{ program_label(program) }} finding review</h1>
+  {% if job %}<p>{{ job }}</p>{% endif %}
   <p class="meta">Scanner signals need manual verification. Confidence is a triage estimate, not a confirmed vulnerability rating. Scope must be checked against program rules.</p>
-  <table><thead><tr><th>Asset / job</th><th>Observed evidence</th><th>Confidence</th><th>Scope</th><th>Review</th></tr></thead><tbody>
-  {% for item in candidates %}<tr><td>{% if item.target_url %}<a href="{{ item.target_url }}" target="_blank" rel="noopener noreferrer"><code>{{ item.host }}</code></a>{% else %}<code>{{ item.host }}</code>{% endif %}<br><small>{{ item.job }}</small></td>
-  <td><strong>{{ item.evidence.type }}</strong><br>{% for key, value in item.evidence.items() if key != 'type' %}<small>{{ key }}: {{ value }}</small><br>{% endfor %}{% if item.target_url and item.evidence.path %}<a href="{{ item.target_url }}" target="_blank" rel="noopener noreferrer">Open path</a><br>{% elif item.target_url and item.evidence.type == 'open_port' %}<a href="{{ item.target_url }}" target="_blank" rel="noopener noreferrer">Open host</a><br>{% endif %}{% if item.report_url %}<a href="{{ item.report_url }}" target="_blank" rel="noopener noreferrer">View write-up</a>{% endif %}</td>
-  <td>{{ item.confidence }}</td><td><select class="scope" aria-label="Scope for {{ item.host }}">
+  <form method="get"><input type="hidden" name="program" value="{{ program }}">{% if job %}<input type="hidden" name="job" value="{{ job }}">{% endif %}
+  <label>Scanner severity <select name="minimum" onchange="this.form.submit()"><option value="all">All severities</option><option value="medium" {% if minimum == 'medium' %}selected{% endif %}>MEDIUM and above</option></select></label>
+  <label>Sort <select name="sort" onchange="this.form.submit()">{% for key,label in columns %}<option value="{{ key }}" {% if sort == key %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+  <label>Order <select name="direction" onchange="this.form.submit()"><option value="desc" {% if direction == 'desc' %}selected{% endif %}>Descending</option><option value="asc" {% if direction == 'asc' %}selected{% endif %}>Ascending</option></select></label></form>
+  <table><thead><tr>{% for key,label in columns %}<th aria-sort="{{ ('descending' if direction == 'desc' else 'ascending') if sort == key else 'none' }}"><a href="{{ url_for('review_queue', program=program, job=job, minimum=minimum, sort=key, direction='asc' if sort == key and direction == 'desc' else 'desc') }}">{{ label }}</a></th>{% endfor %}</tr></thead><tbody>
+  {% for item in candidates %}<tr><td>{% if item.target_url %}<a href="{{ item.target_url }}" target="_blank" rel="noopener noreferrer"><code>{{ item.host }}</code></a>{% else %}<code>{{ item.host }}</code>{% endif %}</td><td>{{ item.job }}</td>
+  <td><strong>{{ item.evidence.type }}</strong><br>{% for key, value in item.evidence.items() if key != 'type' %}<small>{{ key }}: {{ value }}</small><br>{% endfor %}{% if item.target_url and item.evidence.path %}<a href="{{ item.target_url }}" target="_blank" rel="noopener noreferrer">Open path</a><br>{% elif item.target_url and item.evidence.type == 'open_port' %}<a href="{{ item.target_url }}" target="_blank" rel="noopener noreferrer">Open host</a><br>{% endif %}<a href="{{ url_for('finding_writeup', slug=item.program, finding_id=item.id) }}">View write-up</a>{% if item.report_url %}<br><a href="{{ item.report_url }}" target="_blank" rel="noopener noreferrer">Scanner report</a>{% endif %}</td>
+  <td><span class="badge severity-{{ item.severity if item.severity in ['critical','high','medium','low','info'] else 'unknown' }}">{{ item.severity|upper }}</span></td>
+  <td><span class="badge confidence-{{ item.confidence }}">{{ item.confidence|upper }}</span></td><td><select class="scope" aria-label="Scope for {{ item.host }}">
   {% for value, label in [('needs_verification', 'Needs verification'), ('in_scope', 'In scope'), ('out_of_scope', 'Out of scope')] %}
   <option value="{{ value }}" {% if item.scope == value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></td>
   <td><div class="row"><select class="decision" aria-label="Review status for {{ item.host }}">
   {% for value, label in [('needs_review', 'Needs review'), ('needs_account', 'Needs account'), ('confirmed', 'Confirmed'), ('false_positive', 'False positive')] %}
   <option value="{{ value }}" {% if item.decision == value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select>
   <button type="button" data-id="{{ item.id }}">Save</button></div></td></tr>
-  {% else %}<tr><td colspan="5">No scanner findings to review.</td></tr>{% endfor %}
+  {% else %}<tr><td colspan="7">No scanner findings to review.</td></tr>{% endfor %}
   </tbody></table></main><script>
   document.querySelectorAll('button[data-id]').forEach(button => button.addEventListener('click', async () => {
     const row = button.closest('tr');
@@ -303,7 +347,60 @@ def review_queue():
     button.textContent = 'Saved';
     } catch (error) { alert('Review was not saved'); } finally { button.disabled = false; }
   }));
-  </script></body></html>''', candidates=candidates)
+    </script></body></html>''', candidates=candidates, program=program, program_label=program_label,
+                   job=job, minimum=minimum, sort=sort, direction=direction, columns=columns)
+
+
+@app.route('/programs/<slug>/findings/<finding_id>/writeup')
+def finding_writeup(slug: str, finding_id: str):
+    candidate = next((item for item in review_candidates(list_jobs())
+              if item['program'] == slug and item['id'] == finding_id), None)
+    if candidate is None:
+      return 'Finding not found', 404
+    decision = read_reviews().get(finding_id, {})
+    checks = {
+        'open_port': 'Confirm the reported TCP port and service only if port checks are explicitly allowed. A reachable port does not prove unauthenticated access or impact.',
+        'missing_security_headers': 'Inspect response headers at the exact observed URL. Record missing headers and demonstrate relevant application impact; missing headers alone may be ineligible.',
+        'tech_disclosure': 'Confirm the exact advertised header and version. Check report eligibility; a version banner alone does not demonstrate an exploitable vulnerability.',
+        'insecure_cookie': 'Inspect the observed Set-Cookie attributes. Establish whether the cookie is security-sensitive without exposing another user\'s session.',
+        'error_disclosure': 'Confirm the observed error or stack trace using a permitted request. Identify what sensitive information is disclosed and redact it in the report.',
+        'cors_misconfig': 'Confirm the returned origin and credentials headers. Use your own test account to establish whether unauthorized cross-origin reads are actually possible.',
+        'debug_endpoint': 'Confirm the exact observed endpoint is not a login page, then establish whether it exposes sensitive data without collecting unnecessary records.',
+        'graphql_introspection': 'Check whether introspection testing is permitted. Confirm the observation and establish distinct, demonstrable impact rather than reporting introspection alone.',
+        'unauthenticated_endpoint': 'Confirm the documented endpoint requires authorization and that the returned data is not intentionally public. Use only your own account and minimal records.',
+    }
+    verification = checks.get(candidate['evidence']['type'], 'Independently verify the recorded scanner observation and demonstrate impact using only permitted, non-destructive checks.')
+    draft = '\n'.join([
+      '# Manual verification and reporting draft', '',
+      f"Program: {program_label(slug)}", f"Job: {candidate['job']}",
+      f"Asset: {candidate['host']}", f"Finding: {candidate['evidence']['type']}",
+      f"Scanner severity (unverified): {candidate['severity'].upper()}",
+      f"Confidence: {candidate['confidence'].upper()}",
+      f"Review status: {decision.get('status', 'needs_review')}",
+      f"Scope status: {decision.get('scope', 'needs_verification')}", '',
+      '## Observed scanner evidence', '```json', json.dumps(candidate['finding'], indent=2), '```', '',
+      '## Manual verification',
+      '1. Review the current program scope, exclusions, testing restrictions, and request limit.',
+      '2. Verify the exact asset and observed path are authorized before making any request.',
+      f"3. Independently reproduce the scanner observation on {candidate['target_url'] or candidate['host']} using only permitted tests and your own accounts.",
+      '4. Record the exact request, response, timestamp, prerequisites, and sanitized evidence.',
+      '5. Rule out login redirects, false positives, and intended behavior.', '',
+      '## Finding-specific checks', verification, '',
+      '## Confirmed reproduction steps', '[Analyst: enter verified steps and prerequisites]', '',
+      '## Expected and actual behavior', '[Analyst: enter independently verified behavior]', '',
+      '## Demonstrated impact', '[Analyst: enter proven impact; do not infer impact from scanner severity]', '',
+      '## Remediation', '[Analyst: propose a fix after confirming the root cause]', '',
+      '## Reporting decision',
+      'Unverified draft only. Manually confirm scope, impact, and report eligibility before submitting.',
+      'Manual verification does not authorize prohibited automated testing.',
+    ])
+    if request.args.get('download') == '1':
+      return app.response_class(draft, mimetype='text/markdown',
+                    headers={'Content-Disposition': f'attachment; filename="finding-{finding_id}.md"'})
+    return render_template_string('''<!doctype html><html lang="en"><meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Manual verification draft</title><style>body {font-family:Arial,sans-serif;margin:24px;} pre {white-space:pre-wrap;overflow-wrap:anywhere;max-width:1000px;}</style>
+      <p><a href="{{ url_for('review_queue', program=slug) }}">Program findings</a> | <a href="?download=1">Download Markdown</a></p>
+      <pre>{{ draft }}</pre></html>''', draft=draft, slug=slug)
 
 
 @app.route('/review/<finding_id>', methods=['POST'])
@@ -665,7 +762,7 @@ def list_jobs() -> List[Dict[str, Any]]:
       return sorted(jobs, key=lambda item: (item.get('workflow_step', 99), item['name']))
 
     for path in sorted(RESULTS_DIR.glob('*.json')):
-        if path.name.startswith('.') or path.stem in seen:
+        if path.name.startswith('.') or path.name.startswith('manual-url-check-') or path.stem in seen:
             continue
         payload = read_result_file(path)
         if not payload:
@@ -729,6 +826,18 @@ def rerun_job(job_name: str) -> Dict[str, Any]:
         raise KeyError(f'Unknown job: {job_name}')
 
     program = match.get('program', 'unknown')
+    if match.get('raw', {}).get('manual_only'):
+      from manual_workflow import stage_block_reason
+      stage_id = stage_for_job_name(job_name)
+      reason = stage_block_reason(program, stage_id, root=ROOT)
+      if reason:
+        raise PermissionError(reason)
+      if _lock_is_active(f'manual-program-{program}') or _lock_is_active(f'manual-url-check-{program}'):
+        raise PermissionError('Another manual check for this program is running')
+      process = subprocess.Popen([sys.executable, str(ROOT / 'automation' / 'manual_workflow.py'), program, stage_id],
+                     cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+      return {'status': 'queued', 'job': job_name, 'program': program, 'pid': process.pid}
     if program != 'american-airlines' and stage_for_job_name(job_name) in ACTIVE_STAGES and not active_approved(program, root=ROOT):
       raise PermissionError('Program guidelines have not been approved')
     result_path = RESULTS_DIR / f'{job_name}.json'
@@ -982,9 +1091,17 @@ def index():
           inventory = json.loads(inventory_path.read_text(encoding='utf-8'))
           manual_programs.append({'slug': inventory_path.parent.name,
                       'name': inventory.get('display_name', inventory_path.parent.name),
+                      'workflow_queued': (inventory_path.parent / '.manual-workflow.json').exists(),
                       'eligible_asset_types': inventory['eligible_asset_types']})
         except (OSError, ValueError, KeyError, TypeError):
           continue
+      manual_slugs = {item['slug'] for item in manual_programs}
+      grouped_jobs = {**{program: entries for program, entries in grouped_jobs.items() if program not in manual_slugs},
+              **{program: entries for program, entries in grouped_jobs.items() if program in manual_slugs}}
+      from manual_workflow import stage_block_reason
+      for job in jobs:
+        if job.get('raw', {}).get('manual_only'):
+          job['blocked_reason'] = stage_block_reason(job['program'], stage_for_job_name(job['name']), root=ROOT)
     generated_programs = {job['program'] for job in jobs if
                 (JOBS_DIR / 'generated' / f"{job['program']}-passive-web-discovery.yaml").exists()}
     approved_programs = {program for program in generated_programs if active_approved(program, root=ROOT)}
@@ -1081,7 +1198,6 @@ def index():
           <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
             <h1 style="margin:0;">BugBounty Dashboard</h1>
             <a href="/about" style="color:#7dd3fc; text-decoration:none; background:#1f2937; border:1px solid #334155; border-radius:8px; padding:7px 10px; font-size:14px;">About</a>
-            <a href="/review" style="color:#7dd3fc; text-decoration:none; background:#1f2937; border:1px solid #334155; border-radius:8px; padding:7px 10px; font-size:14px;">Finding review</a>
           </div>
           <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; background:#1f2937; border:1px solid #334155; border-radius:10px; padding:8px 12px;">
             <label for="refresh-interval" style="font-size:14px; color:#cbd5e1;">Auto refresh</label>
@@ -1116,7 +1232,7 @@ def index():
           <section class="upload-area">
             <h2>Manual scope review</h2>
             {% for item in manual_programs %}
-              <p><strong>{{ item.name }}</strong> — No scans queued.
+              <p><strong>{{ item.name }}</strong> — {{ 'Nine manual steps queued below existing programs.' if item.workflow_queued else 'No scans queued.' }}
                 {% for asset_type, count in item.eligible_asset_types.items() %}
                   <span>{{ asset_type }}: {{ count }}</span>{% if not loop.last %}, {% endif %}
                 {% endfor %}
@@ -1125,8 +1241,8 @@ def index():
                 <button type="button" class="analyze-manual-program">Start {{ item.name }} scope analysis</button>
                 <button type="button" class="review-manual-guidelines">Review guidelines</button>
                 <pre class="manual-guidelines" hidden></pre>
-                <label><input type="checkbox" class="manual-guidelines-ack"> I confirm these rules permit exact-URL HEAD checks</label>
-                <button type="button" class="approve-manual-checks" disabled>Approve URL checks</button>
+                <label><input type="checkbox" class="manual-guidelines-ack"> I confirm these rules permit the manually started workflow and bounded GET/HEAD checks</label>
+                <button type="button" class="approve-manual-checks" disabled>Approve manual scope</button>
                 <button type="button" class="start-manual-check" disabled>Start exact-URL check</button>
                 <span class="manual-analysis-status" role="status" aria-live="polite"></span>
                 <div class="manual-analysis-results"></div>
@@ -1168,6 +1284,7 @@ def index():
             {% set program_summary = summarize_program_jobs(program_jobs) %}
             <details class="program-group" data-state-key="program-{{ program_name }}" open>
               <summary class="program-header">{{ program_label(program_name) }} <span class="program-count">({{ program_summary.jobs }} jobs)</span></summary>
+              <p><a href="{{ url_for('review_queue', program=program_name) }}">Review {{ program_label(program_name) }} findings</a></p>
               {% if program_name in generated_programs %}
                 <details class="program-rules" data-state-key="rules-{{ program_name }}" data-program="{{ program_name }}">
                   <summary>Program guidelines: <span class="approval-status">{{ 'Active approved' if program_name in approved_programs else 'Review required' }}</span></summary>
@@ -1197,8 +1314,10 @@ def index():
                     </div>
                   </summary>
                   <div class="job-content">
+                    <p><a href="{{ url_for('review_queue', program=job.program, job=job.name) }}">Review job findings</a></p>
                     <div class="rerun-form">
-                      <button class="rerun-button" type="button" onclick="rerunJob('{{ job.name }}', this)" {% if job.program in generated_programs and job.type == 'active' and job.program not in approved_programs %}disabled title="Review guidelines before active testing"{% endif %}>Re-run job</button>
+                      <button class="rerun-button" type="button" onclick="rerunJob('{{ job.name }}', this)" {% if job.blocked_reason %}disabled title="{{ job.blocked_reason }}"{% elif job.program in generated_programs and job.type == 'active' and job.program not in approved_programs %}disabled title="Review guidelines before active testing"{% endif %}>{{ 'Start step manually' if job.raw.manual_only else 'Re-run job' }}</button>
+                      {% if job.blocked_reason %}<span class="meta">{{ job.blocked_reason }}</span>{% endif %}
                     </div>
                     <p><strong>Program:</strong> {{ program_label(job.program) }}</p>
                     <p><strong>Type:</strong> {{ job.type }}</p>
@@ -1507,7 +1626,24 @@ def index():
               });
               const result = await response.json();
               if (!response.ok) throw new Error(result.message || 'Approval failed');
-              status.textContent = 'Current guidelines approved';
+              status.textContent = result.manual_jobs ? 'Manual scope approved; nine steps queued below existing programs' : 'Current guidelines approved';
+              if (result.manual_jobs) {
+                const queuedLink = document.createElement('a');
+                queuedLink.href = '/';
+                queuedLink.textContent = ' Open queued workflow';
+                status.append(queuedLink);
+                const workflowResponse = await fetch('/');
+                if (workflowResponse.ok) {
+                  const documentCopy = new DOMParser().parseFromString(await workflowResponse.text(), 'text/html');
+                  const key = 'program-' + panel.dataset.program;
+                  const queued = documentCopy.querySelector('[data-state-key="' + key + '"]');
+                  if (queued) {
+                    const existing = document.querySelector('[data-state-key="' + key + '"]');
+                    if (existing) existing.replaceWith(queued);
+                    else document.querySelector('.wrap').append(queued);
+                  }
+                }
+              }
               if (currentAnalysis) currentAnalysis.approved = true;
               startButton.disabled = !currentAnalysis || currentAnalysis.policy.automated_requests !== 'manual_approval_required';
             } catch (error) {
@@ -1800,8 +1936,8 @@ def rerun_job_endpoint(job_name: str):
         result = rerun_job(job_name)
     except KeyError:
         return jsonify({'status': 'error', 'message': f'Unknown job: {job_name}'}), 404
-    except PermissionError:
-      return jsonify({'status': 'error', 'message': 'Review program guidelines before active testing'}), 409
+    except PermissionError as exc:
+      return jsonify({'status': 'error', 'message': str(exc)}), 409
     return jsonify(result), 202
 
 
@@ -1905,12 +2041,17 @@ def approve_program_active(slug: str):
         return jsonify({'status': 'error', 'message': str(exc)}), 409
     started = False
     manual_program = (ROOT / 'programs' / slug / 'scope-inventory.json').is_file()
+    manual_jobs = []
+    if data['approved'] and manual_program:
+      from manual_workflow import queue_manual_workflow
+      manual_jobs = queue_manual_workflow(slug, root=ROOT)
     if data['approved'] and not manual_program and os.environ.get('BUGBOUNTY_ALLOW_ACTIVE', '').strip().lower() in {'1', 'true', 'yes', 'on'}:
         subprocess.Popen([sys.executable, str(ROOT / 'automation' / 'worker.py'), '--program', slug, '--allow-active'],
                          cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True)
         started = True
-    return jsonify({'status': 'approved' if data['approved'] else 'revoked', 'active_run_started': started})
+    return jsonify({'status': 'approved' if data['approved'] else 'revoked', 'active_run_started': started,
+            'manual_jobs': manual_jobs})
 
 
 def _program_exists(slug: str) -> bool:
@@ -1932,7 +2073,7 @@ def start_manual_url_check(slug: str):
         return jsonify({'status': 'error', 'message': analysis['policy']['reason']}), 409
     if not active_approved(slug, root=ROOT):
         return jsonify({'status': 'error', 'message': 'Review the current guidelines and explicitly approve these exact-URL checks first'}), 409
-    if _lock_is_active(f'manual-url-check-{slug}'):
+    if _lock_is_active(f'manual-url-check-{slug}') or _lock_is_active(f'manual-program-{slug}'):
         return jsonify({'status': 'error', 'message': 'URL check already running'}), 409
     try:
       process = subprocess.Popen([sys.executable, str(ROOT / 'automation' / 'manual_url_checker.py'), slug],
