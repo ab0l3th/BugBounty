@@ -49,8 +49,10 @@ and eligibility before manually reporting. Drafts do not submit reports.
 
 ## Manual scope workflows
 
-Reviewing and approving a manual CSV scope queues nine manual-only steps beneath
-the existing program workflows. Approval does not launch any step and does not
+Checking the manual scope confirmation checkbox loads the current guidelines,
+saves approval, and queues nine manual-only steps beneath the existing program
+workflows. There is no separate approval button. Unchecking it revokes approval
+without deleting saved results. Approval does not launch any step and does not
 create jobs that the automatic runner can pick up. Dependencies, current
 guidelines, and exact scope are checked again for each manual start.
 

@@ -471,6 +471,10 @@ class ProgramBuilderTest(unittest.TestCase):
                 self.assertFalse((root / 'jobs/generated/aa-manual-passive-web-discovery.yaml').exists())
                 page = client.get('/')
                 self.assertEqual(page.status_code, 200)
+                self.assertIn(b'data-approved="true"', page.data)
+                self.assertNotIn(b'approve-manual-checks', page.data)
+                self.assertIn(b'cursor: not-allowed', page.data)
+                self.assertIn(b'approved: desiredApproval', page.data)
                 self.assertLess(page.data.index(b'data-state-key="program-zz-existing"'),
                                 page.data.index(b'data-state-key="program-aa-manual"'))
                 self.assertEqual(page.data.count(b'Start step manually'), 9)

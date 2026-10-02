@@ -1091,6 +1091,7 @@ def index():
           inventory = json.loads(inventory_path.read_text(encoding='utf-8'))
           manual_programs.append({'slug': inventory_path.parent.name,
                       'name': inventory.get('display_name', inventory_path.parent.name),
+                      'approved': active_approved(inventory_path.parent.name, root=ROOT),
                       'workflow_queued': (inventory_path.parent / '.manual-workflow.json').exists(),
                       'eligible_asset_types': inventory['eligible_asset_types']})
         except (OSError, ValueError, KeyError, TypeError):
@@ -1125,7 +1126,8 @@ def index():
         .upload-area input[type=text] { background: #0f172a; color: #e5e7eb; border: 1px solid #475569; padding: 8px; }
         .upload-area textarea { width: min(100%, 600px); min-height: 90px; background: #0f172a; color: #e5e7eb; border: 1px solid #475569; }
         .upload-area button { background: #0ea5e9; color: #082f49; border: 0; padding: 8px 12px; font-weight: bold; cursor: pointer; }
-        .upload-area button:disabled { opacity: .6; cursor: wait; }
+        .upload-area button:disabled { opacity: .6; cursor: not-allowed; }
+        .upload-area button[aria-busy=true] { cursor: progress; }
         #upload-status { color: #cbd5e1; font-size: 14px; }
         .summary-row { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 16px; margin-bottom: 20px; }
         .pill { background: #0f172a; border: 1px solid #334155; border-radius: 10px; padding: 16px; text-align: center; }
@@ -1237,12 +1239,11 @@ def index():
                   <span>{{ asset_type }}: {{ count }}</span>{% if not loop.last %}, {% endif %}
                 {% endfor %}
               </p>
-              <div class="manual-analysis" data-program="{{ item.slug }}">
+              <div class="manual-analysis" data-program="{{ item.slug }}" data-approved="{{ 'true' if item.approved else 'false' }}">
                 <button type="button" class="analyze-manual-program">Start {{ item.name }} scope analysis</button>
                 <button type="button" class="review-manual-guidelines">Review guidelines</button>
                 <pre class="manual-guidelines" hidden></pre>
-                <label><input type="checkbox" class="manual-guidelines-ack"> I confirm these rules permit the manually started workflow and bounded GET/HEAD checks</label>
-                <button type="button" class="approve-manual-checks" disabled>Approve manual scope</button>
+                <label><input type="checkbox" class="manual-guidelines-ack" {% if item.approved %}checked{% endif %}> I confirm these rules permit the manually started workflow and bounded GET/HEAD checks; queue the nine manual steps</label>
                 <button type="button" class="start-manual-check" disabled>Start exact-URL check</button>
                 <span class="manual-analysis-status" role="status" aria-live="polite"></span>
                 <div class="manual-analysis-results"></div>
@@ -1472,11 +1473,11 @@ def index():
           const rulesButton = panel.querySelector('.review-manual-guidelines');
           const guidelinesPre = panel.querySelector('.manual-guidelines');
           const guidelinesAck = panel.querySelector('.manual-guidelines-ack');
-          const approveButton = panel.querySelector('.approve-manual-checks');
           const startButton = panel.querySelector('.start-manual-check');
           const status = panel.querySelector('.manual-analysis-status');
           const output = panel.querySelector('.manual-analysis-results');
           let currentAnalysis = null;
+          let approvedState = panel.dataset.approved === 'true';
 
           function renderCheckProgress(check) {
             if (!check) return;
@@ -1520,6 +1521,7 @@ def index():
               throw new Error(analysis.message || 'Analysis unavailable');
             }
             currentAnalysis = analysis;
+            approvedState = analysis.approved;
             return analysis;
           }
 
@@ -1580,7 +1582,6 @@ def index():
               startButton.disabled = !canStart;
               if (analysis.approved) {
                 guidelinesAck.checked = true;
-                approveButton.disabled = true;
                 rulesButton.textContent = 'Guidelines approved';
               }
               if (analysis.url_check && !analysis.url_check.complete && analysis.url_check.state !== 'stopped') setTimeout(refreshCheckProgress, 5000);
@@ -1591,64 +1592,90 @@ def index():
             }
           });
 
-          rulesButton.addEventListener('click', async () => {
+          async function loadManualGuidelines(preserveAcknowledgement = false) {
             const token = getToken(false);
-            if (!token) return;
+            if (!token) throw new Error('Dashboard token required to load current guidelines');
+            status.textContent = 'Loading current program guidelines...';
+            const response = await fetch('/programs/' + encodeURIComponent(panel.dataset.program) + '/guidelines',
+              {headers: {'X-BugBounty-Token': token}});
+            const rules = await response.json();
+            if (!response.ok) {
+              if (response.status === 401) localStorage.removeItem(TOKEN_KEY);
+              throw new Error(rules.message || 'Guidelines unavailable');
+            }
+            panel.dataset.digest = rules.guidelines_sha256;
+            guidelinesPre.textContent = rules.text;
+            guidelinesPre.hidden = false;
+            approvedState = rules.approved;
+            if (!preserveAcknowledgement) guidelinesAck.checked = rules.approved;
+            if (currentAnalysis) currentAnalysis.approved = rules.approved;
+            startButton.disabled = !rules.approved || !currentAnalysis || currentAnalysis.policy.automated_requests !== 'manual_approval_required';
+            status.textContent = rules.approved ? 'Current guidelines approved' : 'Review the displayed rules, then check the confirmation to queue nine manual steps';
+          }
+
+          rulesButton.addEventListener('click', async () => {
             try {
-              const response = await fetch('/programs/' + encodeURIComponent(panel.dataset.program) + '/guidelines',
-                {headers: {'X-BugBounty-Token': token}});
-              const rules = await response.json();
-              if (!response.ok) throw new Error(rules.message || 'Guidelines unavailable');
-              panel.dataset.digest = rules.guidelines_sha256;
-              guidelinesPre.textContent = rules.text;
-              guidelinesPre.hidden = false;
-              guidelinesAck.checked = rules.approved;
-              approveButton.disabled = rules.approved;
-              startButton.disabled = !rules.approved || !currentAnalysis || currentAnalysis.policy.automated_requests !== 'manual_approval_required';
-              status.textContent = rules.approved ? 'Current guidelines approved' : 'Read the rules, then explicitly approve permitted exact-URL checks';
+              await loadManualGuidelines();
             } catch (error) {
               status.textContent = error.message || 'Guidelines unavailable';
             }
           });
 
-          guidelinesAck.addEventListener('change', () => {
-            approveButton.disabled = !guidelinesAck.checked || !panel.dataset.digest;
-          });
-
-          approveButton.addEventListener('click', async () => {
-            const token = getToken(false);
-            if (!token || !panel.dataset.digest || !guidelinesAck.checked) return;
-            approveButton.disabled = true;
+          guidelinesAck.addEventListener('change', async () => {
+            const desiredApproval = guidelinesAck.checked;
+            let decisionSaved = false;
+            guidelinesAck.disabled = true;
+            guidelinesAck.setAttribute('aria-busy', 'true');
+            rulesButton.disabled = true;
+            analyzeButton.disabled = true;
+            startButton.disabled = true;
             try {
+              await loadManualGuidelines(true);
+              await loadAnalysis();
+              const token = getToken(false);
+              if (!token) throw new Error('Dashboard token required to save approval');
+              status.textContent = desiredApproval ? 'Saving approval and queueing nine manual steps...' : 'Revoking manual scope approval...';
               const response = await fetch('/programs/' + encodeURIComponent(panel.dataset.program) + '/active-approval', {
                 method: 'POST', headers: {'Content-Type': 'application/json', 'X-BugBounty-Token': token},
-                body: JSON.stringify({approved: true, acknowledged: true, guidelines_sha256: panel.dataset.digest}),
+                body: JSON.stringify({approved: desiredApproval, acknowledged: true, guidelines_sha256: panel.dataset.digest}),
               });
               const result = await response.json();
               if (!response.ok) throw new Error(result.message || 'Approval failed');
-              status.textContent = result.manual_jobs ? 'Manual scope approved; nine steps queued below existing programs' : 'Current guidelines approved';
-              if (result.manual_jobs) {
+              decisionSaved = true;
+              approvedState = desiredApproval;
+              guidelinesAck.checked = approvedState;
+              currentAnalysis.approved = approvedState;
+              status.textContent = approvedState ? 'Manual scope approved; nine steps queued below existing programs' : 'Approval revoked; manual scan starts are blocked';
+              if (approvedState) {
                 const queuedLink = document.createElement('a');
-                queuedLink.href = '/';
-                queuedLink.textContent = ' Open queued workflow';
+                queuedLink.href = '#manual-workflow-' + panel.dataset.program;
+                queuedLink.textContent = ' Go to queued steps';
                 status.append(queuedLink);
-                const workflowResponse = await fetch('/');
-                if (workflowResponse.ok) {
-                  const documentCopy = new DOMParser().parseFromString(await workflowResponse.text(), 'text/html');
-                  const key = 'program-' + panel.dataset.program;
-                  const queued = documentCopy.querySelector('[data-state-key="' + key + '"]');
-                  if (queued) {
-                    const existing = document.querySelector('[data-state-key="' + key + '"]');
-                    if (existing) existing.replaceWith(queued);
-                    else document.querySelector('.wrap').append(queued);
-                  }
+              }
+              const workflowResponse = await fetch('/');
+              if (!workflowResponse.ok) throw new Error('Queue refresh unavailable');
+              const documentCopy = new DOMParser().parseFromString(await workflowResponse.text(), 'text/html');
+              const key = 'program-' + panel.dataset.program;
+              const queued = documentCopy.querySelector('[data-state-key="' + key + '"]');
+              if (queued) {
+                queued.id = 'manual-workflow-' + panel.dataset.program;
+                const existing = document.querySelector('[data-state-key="' + key + '"]');
+                if (existing) existing.replaceWith(queued);
+                else document.querySelector('.wrap').append(queued);
+                if (approvedState) {
+                  queued.open = true;
+                  queued.scrollIntoView({behavior: 'smooth', block: 'start'});
                 }
               }
-              if (currentAnalysis) currentAnalysis.approved = true;
-              startButton.disabled = !currentAnalysis || currentAnalysis.policy.automated_requests !== 'manual_approval_required';
             } catch (error) {
-              status.textContent = error.message || 'Approval failed';
-              approveButton.disabled = false;
+              guidelinesAck.checked = approvedState;
+              status.textContent = decisionSaved ? 'Approval decision saved; reload the dashboard to refresh queued steps' : error.message || 'Approval failed';
+            } finally {
+              guidelinesAck.disabled = false;
+              guidelinesAck.removeAttribute('aria-busy');
+              rulesButton.disabled = false;
+              analyzeButton.disabled = false;
+              startButton.disabled = !approvedState || !currentAnalysis || currentAnalysis.policy.automated_requests !== 'manual_approval_required';
             }
           });
 
