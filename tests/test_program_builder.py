@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / 'automation') not in sys.path:
     sys.path.insert(0, str(ROOT / 'automation'))
 
-from program_builder import active_approved, create_program, parse_scope, read_guidelines, set_active_approval
+from program_builder import active_approved, analyze_url_scope, create_program, parse_scope, read_guidelines, set_active_approval
 from stages import STAGES
 from worker import load_job, run_passive_job, job_workflow_dependencies
 import worker
@@ -20,6 +20,36 @@ from dashboard_app import app, group_jobs_by_program, job_workflow_metadata, lis
 
 
 class ProgramBuilderTest(unittest.TestCase):
+    def test_url_scope_analysis_is_exact_and_blocks_ambiguous_rules(self):
+        content = ('identifier,asset_type,in_scope\n'
+                   'https://app.example.com/account?token=private,URL,true\n'
+                   'https://app.example.com/login,URL,true\n'
+                   'com.example.app,GOOGLE_PLAY_APP_ID,true\n')
+        analysis = analyze_url_scope(content, 'No aggressive scanning. Traffic must not exceed 3 requests per second.')
+        self.assertEqual(analysis['policy']['automated_requests'], 'blocked')
+        self.assertEqual(analysis['policy']['max_requests_per_second'], 3)
+        self.assertEqual(analysis['eligible_urls'], 2)
+        self.assertEqual(analysis['app_ids'], 1)
+        self.assertEqual(analysis['app_assets'][0]['platform'], 'Google Play')
+        self.assertEqual(analysis['assets'][0]['host'], 'app.example.com')
+        self.assertEqual(analysis['assets'][0]['path'], '/account')
+        self.assertTrue(analysis['assets'][0]['query_present'])
+        self.assertNotIn('token=private', json.dumps(analysis))
+        self.assertEqual(analysis['assets'][1]['category'], 'login')
+        malformed = analyze_url_scope('identifier,asset_type,in_scope\nhttps://example.com:bad/path,URL,true\n', 'No automated scans.')
+        self.assertEqual(malformed['eligible_urls'], 1)
+        self.assertEqual(malformed['invalid_urls'], 1)
+        self.assertEqual(malformed['assets'], [])
+
+    def test_url_asset_bare_hostname_is_exact_host_not_wildcard(self):
+        analysis = analyze_url_scope(
+            'identifier,asset_type,in_scope\nportal.example.com,URL,true\n',
+            'No automated scans. Requests must not exceed 3 requests per second.')
+        self.assertEqual(analysis['assets'][0]['scope_kind'], 'exact_host')
+        self.assertEqual(analysis['assets'][0]['host'], 'portal.example.com')
+        self.assertEqual(analysis['assets'][0]['path'], '/')
+        self.assertEqual(analysis['policy']['automated_requests'], 'blocked')
+
     def test_dashboard_imports_as_gunicorn_package(self):
         subprocess.run([sys.executable, '-c', 'from automation.dashboard_app import app'],
                        cwd=ROOT, check=True, capture_output=True)
@@ -218,7 +248,9 @@ class ProgramBuilderTest(unittest.TestCase):
                 inventory = json.loads((Path(directory) / 'programs/nba-public/scope-inventory.json').read_text())
                 self.assertEqual(inventory['eligible_asset_types'], {'URL': 1, 'GOOGLE_PLAY_APP_ID': 1})
                 self.assertEqual(list_jobs(), [])
-                self.assertIn(b'NBA Public', client.get('/').data)
+                page = client.get('/')
+                self.assertIn(b'NBA Public', page.data)
+                self.assertIn(b'analyze-manual-program', page.data)
                 duplicate = client.post('/programs/upload', data={
                     'program_name': 'NBA Public',
                     'scope_file': (io.BytesIO(scope), 'scope.csv'),
@@ -226,6 +258,27 @@ class ProgramBuilderTest(unittest.TestCase):
                 }, headers={'X-BugBounty-Token': 'test-token'})
                 self.assertEqual(duplicate.status_code, 409)
                 launch.assert_not_called()
+
+    def test_existing_url_program_analysis_requires_token_and_redacts_query(self):
+        with TemporaryDirectory() as directory, \
+             patch('dashboard_app.ROOT', Path(directory)), \
+             patch('dashboard_app.JOBS_DIR', Path(directory) / 'jobs'), \
+             patch.dict('dashboard_app.os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token'}):
+            root = Path(directory)
+            scope = ('identifier,asset_type,in_scope\n'
+                     'https://app.example.com/api/info?secret=private,URL,true\n')
+            inventory = {'eligible_asset_types': {'URL': 1}, 'total_rows': 1, 'manual_only': True,
+                         'display_name': 'NBA Public'}
+            from program_builder import create_manual_program
+            create_manual_program('nba-public', scope, 'No aggressive scans. Maximum 3 requests per second.',
+                                  inventory, root=root)
+            with app.test_client() as client:
+                self.assertEqual(client.get('/programs/nba-public/analysis').status_code, 401)
+                response = client.get('/programs/nba-public/analysis', headers={'X-BugBounty-Token': 'test-token'})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.get_json()['categories'], {'api': 1})
+                self.assertEqual(response.get_json()['policy']['automated_requests'], 'blocked')
+                self.assertNotIn(b'secret=private', response.data)
 
     def test_rules_review_and_approval_requires_current_guidelines(self):
         with TemporaryDirectory() as directory, \

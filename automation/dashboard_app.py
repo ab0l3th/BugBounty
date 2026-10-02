@@ -22,7 +22,7 @@ AUTOMATION_DIR = Path(__file__).resolve().parent
 if str(AUTOMATION_DIR) not in sys.path:
   sys.path.insert(0, str(AUTOMATION_DIR))
 
-from program_builder import active_approved, create_manual_program, create_program, csv_scope_inventory, parse_scope, read_guidelines, set_active_approval, slug_from_program_name
+from program_builder import active_approved, create_manual_program, create_program, csv_scope_inventory, load_manual_analysis, parse_scope, read_guidelines, set_active_approval, slug_from_program_name
 from stages import ACTIVE_STAGES, STAGE_BY_ID, STAGES, job_name_for, stage_for_job_name
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -1027,6 +1027,11 @@ def index():
         .program-rules pre { background: #0f172a; padding: 12px; max-height: 300px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
         .program-rules button { background: #1f2937; color: #e5e7eb; border: 1px solid #475569; padding: 7px 10px; cursor: pointer; }
         .program-rules button:disabled { opacity: .55; cursor: not-allowed; }
+        .manual-analysis { margin: 8px 0 18px; }
+        .manual-analysis button { background: #1f2937; color: #e5e7eb; border: 1px solid #475569; padding: 7px 10px; cursor: pointer; }
+        .manual-analysis table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        .manual-analysis th, .manual-analysis td { text-align: left; padding: 6px; border-bottom: 1px solid #334155; }
+        .analysis-policy { color: #fbbf24; }
         .job { margin-bottom: 18px; padding: 0; background: #0f172a; border-left: 4px solid #38bdf8; border-radius: 8px; overflow: hidden; }
         summary { list-style: none; cursor: pointer; padding: 16px; display: block; }
         summary::-webkit-details-marker { display: none; }
@@ -1115,6 +1120,11 @@ def index():
                   <span>{{ asset_type }}: {{ count }}</span>{% if not loop.last %}, {% endif %}
                 {% endfor %}
               </p>
+              <div class="manual-analysis" data-program="{{ item.slug }}">
+                <button type="button" class="analyze-manual-program">Analyze inventory offline</button>
+                <span class="manual-analysis-status" role="status" aria-live="polite"></span>
+                <div class="manual-analysis-results"></div>
+              </div>
             {% endfor %}
           </section>
         {% endif %}
@@ -1332,6 +1342,73 @@ def index():
         const guidelinesFile = document.getElementById('guidelines-file');
         const guidelinesText = document.getElementById('guidelines-text');
         const uploadStatus = document.getElementById('upload-status');
+        document.querySelectorAll('.manual-analysis').forEach(panel => {
+          panel.querySelector('button').addEventListener('click', async () => {
+            const token = getToken(false);
+            if (!token) return;
+            const button = panel.querySelector('button');
+            const status = panel.querySelector('.manual-analysis-status');
+            const output = panel.querySelector('.manual-analysis-results');
+            button.disabled = true;
+            status.textContent = 'Analyzing saved inventory and guidelines locally...';
+            output.replaceChildren();
+            try {
+              const response = await fetch('/programs/' + encodeURIComponent(panel.dataset.program) + '/analysis',
+                {headers: {'X-BugBounty-Token': token}});
+              const analysis = await response.json();
+              if (!response.ok) {
+                if (response.status === 401) localStorage.removeItem(TOKEN_KEY);
+                status.textContent = analysis.message || 'Analysis unavailable';
+                return;
+              }
+              const policy = document.createElement('p');
+              policy.className = 'analysis-policy';
+              policy.textContent = 'Offline analysis only; no target requests sent. Automated requests: ' +
+                analysis.policy.automated_requests + '. ' + analysis.policy.reason +
+                (analysis.policy.max_requests_per_second ? ' Stated rate limit: ' + analysis.policy.max_requests_per_second + ' requests/second.' : '');
+              output.append(policy);
+              const counts = document.createElement('p');
+              counts.textContent = analysis.eligible_urls + ' eligible URLs (' + Object.entries(analysis.categories).map(([key, value]) => key + ': ' + value).join(', ') + '); ' +
+                analysis.app_ids + ' app IDs; ' + analysis.invalid_urls + ' invalid URLs skipped.';
+              output.append(counts);
+              if (analysis.app_assets.length) {
+                const apps = document.createElement('ul');
+                analysis.app_assets.forEach(asset => {
+                  const item = document.createElement('li');
+                  item.textContent = asset.platform + ': ' + asset.identifier;
+                  apps.append(item);
+                });
+                output.append(apps);
+              }
+              const table = document.createElement('table');
+              table.innerHTML = '<thead><tr><th>Host</th><th>Exact path</th><th>Type</th><th>Query</th></tr></thead><tbody></tbody>';
+              const tbody = table.querySelector('tbody');
+              analysis.assets.forEach(asset => {
+                const row = document.createElement('tr');
+                const hostCell = document.createElement('td');
+                const hostLink = document.createElement('a');
+                hostLink.href = (asset.scheme || 'https') + '://' + asset.host + (asset.port ? ':' + asset.port : '') + asset.path;
+                hostLink.target = '_blank';
+                hostLink.rel = 'noopener noreferrer';
+                hostLink.textContent = asset.host;
+                hostCell.append(hostLink);
+                row.append(hostCell);
+                [asset.path, asset.category, asset.query_present ? 'Present (redacted)' : 'None'].forEach(value => {
+                  const cell = document.createElement('td');
+                  cell.textContent = value;
+                  row.append(cell);
+                });
+                tbody.append(row);
+              });
+              output.append(table);
+              status.textContent = 'Offline analysis complete';
+            } catch (error) {
+              status.textContent = 'Analysis unavailable';
+            } finally {
+              button.disabled = false;
+            }
+          });
+        });
         let uploadInProgress = false;
         let uploadComplete = false;
         function uploadDraftPending() {
@@ -1665,6 +1742,17 @@ def program_guidelines(slug: str):
         return jsonify({'status': 'error', 'message': 'Guidelines unavailable'}), 404
     return jsonify({'program': slug, 'text': text, 'guidelines_sha256': digest,
                     'approved': active_approved(slug, root=ROOT)})
+
+
+@app.route('/programs/<slug>/analysis')
+def manual_program_analysis(slug: str):
+    if not _authorized_for_state_change():
+        return jsonify({'status': 'error', 'message': 'unauthorized'}), 401
+    try:
+        analysis = load_manual_analysis(slug, root=ROOT)
+    except (OSError, ValueError):
+        return jsonify({'status': 'error', 'message': 'Program analysis unavailable'}), 404
+    return jsonify(analysis)
 
 
 @app.route('/programs/<slug>/active-approval', methods=['POST'])

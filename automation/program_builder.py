@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from collections import Counter
 import hashlib
 import io
 import json
@@ -56,6 +57,78 @@ def csv_scope_inventory(content: str) -> dict:
     if not counts:
         raise ValueError('No explicitly eligible assets found')
     return {'eligible_asset_types': counts, 'total_rows': rows, 'manual_only': manual_only}
+
+
+def analyze_url_scope(content: str, guidelines: str) -> dict:
+    inventory = csv_scope_inventory(content)
+    assets: list[dict] = []
+    app_assets: list[dict] = []
+    seen: set[str] = set()
+    invalid_urls = 0
+    for raw in csv.DictReader(io.StringIO(content.lstrip('\ufeff'))):
+        row = {(key or '').strip().lower().replace(' ', '_'): (value or '').strip() for key, value in raw.items()}
+        if row.get('in_scope', row.get('eligible_for_submission', row.get('eligible_for_bounty', ''))).lower() not in {'true', 'yes', '1'}:
+            continue
+        if (row.get('asset_type') or row.get('type') or '').upper() != 'URL':
+            kind = (row.get('asset_type') or row.get('type') or '').upper()
+            if kind in {'GOOGLE_PLAY_APP_ID', 'APPLE_STORE_APP_ID'} and row.get('in_scope', row.get('eligible_for_submission', row.get('eligible_for_bounty', ''))).lower() in {'true', 'yes', '1'}:
+                identifier = next((row[key] for key in ('identifier', 'target', 'asset_identifier', 'asset') if row.get(key)), '')
+                app_assets.append({'platform': 'Google Play' if kind == 'GOOGLE_PLAY_APP_ID' else 'Apple App Store',
+                                   'identifier': identifier})
+            continue
+        value = next((row[key] for key in ('identifier', 'target', 'asset_identifier', 'asset') if row.get(key)), '')
+        bare_host = parse_scope_pattern(value)
+        if bare_host == value.lower().rstrip('.'):
+            identity = hashlib.sha256(value.encode('utf-8')).hexdigest()
+            if identity in seen:
+                continue
+            seen.add(identity)
+            host = value.lower().rstrip('.')
+            category = ('login' if re.search(r'(^|[.-])(?:login|signin|sign-in|sso)([.-]|$)', host, re.IGNORECASE)
+                        else 'api' if re.search(r'(^|[.-])api([.-]|$)', host, re.IGNORECASE) else 'web')
+            assets.append({'id': identity, 'scheme': None, 'host': host, 'port': None,
+                           'path': '/', 'query_present': False, 'category': category,
+                           'scope_kind': 'exact_host'})
+            continue
+        try:
+            parsed = urlsplit(value)
+            port = parsed.port
+        except ValueError:
+            invalid_urls += 1
+            continue
+        if parsed.scheme not in {'https', 'http'} or not parsed.hostname or parsed.username or parsed.password:
+            invalid_urls += 1
+            continue
+        identity = hashlib.sha256(value.encode('utf-8')).hexdigest()
+        if identity in seen:
+            continue
+        seen.add(identity)
+        path = parsed.path or '/'
+        category = ('login' if re.search(r'/(?:login|signin|sign-in|sso)(?:/|$)', path, re.IGNORECASE)
+                    else 'api' if re.search(r'/api(?:/|$)', path, re.IGNORECASE) else 'web')
+        assets.append({'id': identity, 'scheme': parsed.scheme, 'host': parsed.hostname,
+                       'port': port, 'path': path, 'query_present': bool(parsed.query),
+                       'category': category, 'scope_kind': 'exact_url'})
+    rate_match = re.search(r'(?:not exceed|maximum|limit of)\s+(\d+)\s+requests?\s+per\s+second', guidelines, re.IGNORECASE)
+    rate_limit = int(rate_match.group(1)) if rate_match else None
+    policy = {'automated_requests': 'blocked', 'max_requests_per_second': rate_limit,
+              'reason': 'No explicit, machine-verifiable permission for automated exact-URL requests'}
+    if re.search(r'(?:do not perform aggressive vulnerability scans|reports from automated tools or scans|automated scans? (?:are )?(?:prohibited|not allowed))', guidelines, re.IGNORECASE):
+        policy['reason'] = 'Program guidelines restrict automated or aggressive testing'
+    return {'eligible_urls': inventory['eligible_asset_types'].get('URL', 0), 'invalid_urls': invalid_urls,
+            'app_ids': len(app_assets), 'app_assets': app_assets,
+            'categories': dict(Counter(asset['category'] for asset in assets)),
+            'policy': policy, 'assets': assets}
+
+
+def load_manual_analysis(slug: str, *, root: Path = ROOT) -> dict:
+    if not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', slug):
+        raise ValueError('Invalid program name')
+    program_dir = root / 'programs' / slug
+    if not (program_dir / 'scope-inventory.json').is_file():
+        raise FileNotFoundError('Manual program inventory not found')
+    return analyze_url_scope((program_dir / 'scope-source.csv').read_text(encoding='utf-8'),
+                             (program_dir / 'rules.md').read_text(encoding='utf-8'))
 
 
 def create_manual_program(slug: str, scope_content: str, guidelines: str, inventory: dict, *, root: Path = ROOT) -> None:
