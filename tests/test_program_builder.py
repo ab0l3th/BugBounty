@@ -471,7 +471,8 @@ class ProgramBuilderTest(unittest.TestCase):
                 self.assertFalse((root / 'jobs/generated/aa-manual-passive-web-discovery.yaml').exists())
                 page = client.get('/')
                 self.assertEqual(page.status_code, 200)
-                self.assertIn(b'data-approved="true"', page.data)
+                self.assertNotIn(b'<h2>Manual scope review</h2>', page.data)
+                self.assertNotIn(b'class="manual-analysis" data-program="aa-manual"', page.data)
                 self.assertNotIn(b'approve-manual-checks', page.data)
                 self.assertIn(b'cursor: not-allowed', page.data)
                 self.assertIn(b'approved: desiredApproval', page.data)
@@ -494,8 +495,33 @@ class ProgramBuilderTest(unittest.TestCase):
                 launch.assert_not_called()
                 client.post('/programs/aa-manual/active-approval', headers=headers,
                             json={'approved': False, 'acknowledged': True, 'guidelines_sha256': digest})
+                self.assertIn(b'class="manual-analysis" data-program="aa-manual"', client.get('/').data)
                 self.assertEqual(client.post('/jobs/aa-manual-passive-web-discovery/rerun', headers=headers).status_code, 409)
                 launch.assert_not_called()
+
+    def test_manual_review_keeps_pending_programs_and_incomplete_workflows(self):
+        from manual_workflow import queue_manual_workflow
+        with TemporaryDirectory() as directory, \
+             patch('dashboard_app.ROOT', Path(directory)), \
+             patch('dashboard_app.JOBS_DIR', Path(directory) / 'jobs'), \
+             patch('dashboard_app.RESULTS_DIR', Path(directory) / 'results'), \
+             patch('dashboard_app.RUNNING_DIR', Path(directory) / 'results/.running'):
+            root = Path(directory)
+            for slug in ('ready', 'pending'):
+                create_manual_program(slug, 'identifier,asset_type,in_scope\napp.example.com,URL,true\n',
+                                      'Maximum 3 requests per second.', {'eligible_asset_types': {'URL': 1}}, root=root)
+            _, digest = read_guidelines('ready', root=root)
+            set_active_approval('ready', True, digest, root=root)
+            queue_manual_workflow('ready', root=root)
+            with app.test_client() as client:
+                page = client.get('/')
+                self.assertEqual(page.status_code, 200)
+                self.assertNotIn(b'class="manual-analysis" data-program="ready"', page.data)
+                self.assertIn(b'class="manual-analysis" data-program="pending"', page.data)
+                self.assertIn(b'data-state-key="program-ready"', page.data)
+                (root / 'results/ready-port-scan.json').unlink()
+                incomplete = client.get('/')
+                self.assertIn(b'class="manual-analysis" data-program="ready"', incomplete.data)
 
     def test_manual_url_check_endpoint_requires_current_approval(self):
         with TemporaryDirectory() as directory, \

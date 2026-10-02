@@ -1084,6 +1084,7 @@ def index():
     grouped_jobs = group_jobs_by_program(jobs)
     workflow_order = STAGES
     manual_programs = []
+    manual_job_names = {job['name'] for job in jobs if job.get('raw', {}).get('manual_only')}
     programs_dir = ROOT / 'programs'
     if programs_dir.exists():
       for inventory_path in sorted(programs_dir.glob('*/scope-inventory.json')):
@@ -1092,7 +1093,8 @@ def index():
           manual_programs.append({'slug': inventory_path.parent.name,
                       'name': inventory.get('display_name', inventory_path.parent.name),
                       'approved': active_approved(inventory_path.parent.name, root=ROOT),
-                      'workflow_queued': (inventory_path.parent / '.manual-workflow.json').exists(),
+                        'workflow_queued': (inventory_path.parent / '.manual-workflow.json').exists() and all(
+                          job_name_for(inventory_path.parent.name, stage['stage']) in manual_job_names for stage in STAGES),
                       'eligible_asset_types': inventory['eligible_asset_types']})
         except (OSError, ValueError, KeyError, TypeError):
           continue
@@ -1106,6 +1108,7 @@ def index():
     generated_programs = {job['program'] for job in jobs if
                 (JOBS_DIR / 'generated' / f"{job['program']}-passive-web-discovery.yaml").exists()}
     approved_programs = {program for program in generated_programs if active_approved(program, root=ROOT)}
+    pending_manual_programs = [item for item in manual_programs if not (item['approved'] and item['workflow_queued'])]
     return render_template_string('''
     <!doctype html>
     <html lang="en">
@@ -1230,10 +1233,11 @@ def index():
             <span id="upload-status" role="status" aria-live="polite"></span>
           </form>
         </section>
-        {% if manual_programs %}
-          <section class="upload-area">
+        {% if pending_manual_programs %}
+          <section class="upload-area" id="manual-scope-review">
             <h2>Manual scope review</h2>
-            {% for item in manual_programs %}
+            {% for item in pending_manual_programs %}
+              <div class="manual-review-entry">
               <p><strong>{{ item.name }}</strong> — {{ 'Nine manual steps queued below existing programs.' if item.workflow_queued else 'No scans queued.' }}
                 {% for asset_type, count in item.eligible_asset_types.items() %}
                   <span>{{ asset_type }}: {{ count }}</span>{% if not loop.last %}, {% endif %}
@@ -1247,6 +1251,7 @@ def index():
                 <button type="button" class="start-manual-check" disabled>Start exact-URL check</button>
                 <span class="manual-analysis-status" role="status" aria-live="polite"></span>
                 <div class="manual-analysis-results"></div>
+              </div>
               </div>
             {% endfor %}
           </section>
@@ -1665,6 +1670,9 @@ def index():
                 if (approvedState) {
                   queued.open = true;
                   queued.scrollIntoView({behavior: 'smooth', block: 'start'});
+                  const reviewSection = panel.closest('#manual-scope-review');
+                  panel.closest('.manual-review-entry').remove();
+                  if (!reviewSection.querySelector('.manual-review-entry')) reviewSection.remove();
                 }
               }
             } catch (error) {
@@ -1952,7 +1960,7 @@ def index():
       </script>
     </body>
     </html>
-    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, manual_programs=manual_programs, generated_programs=generated_programs, approved_programs=approved_programs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs, workflow_order=workflow_order, highest_severity=highest_severity, asset_render_cap=ASSET_RENDER_CAP, evidence_render_cap=EVIDENCE_RENDER_CAP, thread_render_cap=THREAD_RENDER_CAP)
+    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, manual_programs=manual_programs, pending_manual_programs=pending_manual_programs, generated_programs=generated_programs, approved_programs=approved_programs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs, workflow_order=workflow_order, highest_severity=highest_severity, asset_render_cap=ASSET_RENDER_CAP, evidence_render_cap=EVIDENCE_RENDER_CAP, thread_render_cap=THREAD_RENDER_CAP)
 
 
 @app.route('/jobs/<job_name>/rerun', methods=['POST'])

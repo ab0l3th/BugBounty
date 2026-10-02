@@ -55,6 +55,10 @@ workflows. There is no separate approval button. Unchecking it revokes approval
 without deleting saved results. Approval does not launch any step and does not
 create jobs that the automatic runner can pick up. Dependencies, current
 guidelines, and exact scope are checked again for each manual start.
+Once approval and all nine queued steps are present, the program disappears from
+manual scope review and is managed through its workflow below existing programs.
+Other pending programs remain visible. Revoked approval, changed guidelines, or
+an incomplete workflow make the review entry available again.
 
 The manual workflow uses offline scope inventory, exact-host DNS, bounded HTTP
 liveness and service checks, shared-IP checks of uploaded hosts, curated path
