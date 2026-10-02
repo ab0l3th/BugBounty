@@ -35,6 +35,14 @@ sudo systemctl status bugbounty-dashboard.service
 
 The dashboard is intentionally private-only and should be accessed on your local network rather than exposed publicly.
 
+## Background refresh
+
+The refresh timer and Refresh data button update counters and workflow content in
+place, without navigation or saving/restoring expanded sections. Existing detail
+nodes, open/closed states, scroll position, focus, file selections, and in-progress
+upload or guideline inputs remain intact. Approval, upload, and job-start actions
+also refresh in place. Failed refreshes leave the current dashboard visible.
+
 ## Finding review
 
 Use the review link inside a program or job. Review queues never combine findings

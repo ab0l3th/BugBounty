@@ -1233,11 +1233,12 @@ def index():
             <span id="upload-status" role="status" aria-live="polite"></span>
           </form>
         </section>
+        <div id="dashboard-manual-review">
         {% if pending_manual_programs %}
           <section class="upload-area" id="manual-scope-review">
             <h2>Manual scope review</h2>
             {% for item in pending_manual_programs %}
-              <div class="manual-review-entry">
+              <div class="manual-review-entry" data-state-key="review-{{ item.slug }}">
               <p><strong>{{ item.name }}</strong> — {{ 'Nine manual steps queued below existing programs.' if item.workflow_queued else 'No scans queued.' }}
                 {% for asset_type, count in item.eligible_asset_types.items() %}
                   <span>{{ asset_type }}: {{ count }}</span>{% if not loop.last %}, {% endif %}
@@ -1256,6 +1257,7 @@ def index():
             {% endfor %}
           </section>
         {% endif %}
+        </div>
         <div class="card" style="margin-bottom:20px;">
           <h2 style="margin-top:0; margin-bottom:12px;">Workflow order</h2>
           <div style="display:flex; flex-wrap:wrap; gap:10px;">
@@ -1267,7 +1269,7 @@ def index():
             {% endfor %}
           </div>
         </div>
-        <div class="summary-row">
+        <div class="summary-row" id="dashboard-summary">
           <div class="pill">
             <div>Total jobs</div>
             <strong>{{ summary.total }}</strong>
@@ -1285,10 +1287,11 @@ def index():
             <strong>{{ summary.completed }}</strong>
           </div>
         </div>
+        <div id="dashboard-workflows">
         {% if jobs %}
           {% for program_name, program_jobs in grouped_jobs.items() %}
             {% set program_summary = summarize_program_jobs(program_jobs) %}
-            <details class="program-group" data-state-key="program-{{ program_name }}" open>
+            <details class="program-group" id="manual-workflow-{{ program_name }}" data-state-key="program-{{ program_name }}" open>
               <summary class="program-header">{{ program_label(program_name) }} <span class="program-count">({{ program_summary.jobs }} jobs)</span></summary>
               <p><a href="{{ url_for('review_queue', program=program_name) }}">Review {{ program_label(program_name) }} findings</a></p>
               {% if program_name in generated_programs %}
@@ -1451,6 +1454,7 @@ def index():
             <p>Run the worker and a result file will appear in <code>results/</code>.</p>{% endif %}
           </div>
         {% endif %}
+        </div>
       </div>
       <script>
         const TOKEN_KEY = 'bugbounty-dashboard-token';
@@ -1473,7 +1477,11 @@ def index():
         const guidelinesFile = document.getElementById('guidelines-file');
         const guidelinesText = document.getElementById('guidelines-text');
         const uploadStatus = document.getElementById('upload-status');
-        document.querySelectorAll('.manual-analysis').forEach(panel => {
+        const boundManualPanels = new WeakSet();
+        function bindManualReviews() {
+          document.querySelectorAll('.manual-analysis').forEach(panel => {
+          if (boundManualPanels.has(panel)) return;
+          boundManualPanels.add(panel);
           const analyzeButton = panel.querySelector('.analyze-manual-program');
           const rulesButton = panel.querySelector('.review-manual-guidelines');
           const guidelinesPre = panel.querySelector('.manual-guidelines');
@@ -1657,22 +1665,13 @@ def index():
                 queuedLink.textContent = ' Go to queued steps';
                 status.append(queuedLink);
               }
-              const workflowResponse = await fetch('/');
-              if (!workflowResponse.ok) throw new Error('Queue refresh unavailable');
-              const documentCopy = new DOMParser().parseFromString(await workflowResponse.text(), 'text/html');
+              await refreshDashboard(true);
               const key = 'program-' + panel.dataset.program;
-              const queued = documentCopy.querySelector('[data-state-key="' + key + '"]');
+              const queued = document.querySelector('[data-state-key="' + key + '"]');
               if (queued) {
-                queued.id = 'manual-workflow-' + panel.dataset.program;
-                const existing = document.querySelector('[data-state-key="' + key + '"]');
-                if (existing) existing.replaceWith(queued);
-                else document.querySelector('.wrap').append(queued);
                 if (approvedState) {
                   queued.open = true;
                   queued.scrollIntoView({behavior: 'smooth', block: 'start'});
-                  const reviewSection = panel.closest('#manual-scope-review');
-                  panel.closest('.manual-review-entry').remove();
-                  if (!reviewSection.querySelector('.manual-review-entry')) reviewSection.remove();
                 }
               }
             } catch (error) {
@@ -1705,7 +1704,9 @@ def index():
               startButton.disabled = false;
             }
           });
-        });
+          });
+        }
+        bindManualReviews();
         let uploadInProgress = false;
         let uploadComplete = false;
         function uploadDraftPending() {
@@ -1732,6 +1733,10 @@ def index():
             return;
           }
           const button = uploadForm.querySelector('button');
+          const submittedDraft = {
+            name: programName.value, scope: scopeFile.files[0],
+            guidelines: guidelinesFile.files[0], text: guidelinesText.value,
+          };
           button.disabled = true;
           uploadInProgress = true;
           uploadStatus.textContent = 'Uploading...';
@@ -1746,17 +1751,23 @@ def index():
             }
             uploadStatus.textContent = result.message || (result.program + ' awaiting rules review');
             uploadComplete = true;
-            saveViewState();
-            window.location.reload();
+            if (programName.value === submittedDraft.name && scopeFile.files[0] === submittedDraft.scope &&
+              guidelinesFile.files[0] === submittedDraft.guidelines && guidelinesText.value === submittedDraft.text) uploadForm.reset();
+            await refreshDashboard(true);
           } catch (error) {
             uploadStatus.textContent = 'Upload failed';
           } finally {
             uploadInProgress = false;
+            uploadComplete = false;
             button.disabled = false;
           }
         });
 
-        document.querySelectorAll('.program-rules').forEach(panel => {
+        const boundRulePanels = new WeakSet();
+        function bindProgramRules() {
+          document.querySelectorAll('.program-rules').forEach(panel => {
+          if (boundRulePanels.has(panel)) return;
+          boundRulePanels.add(panel);
           const slug = panel.dataset.program;
           const message = panel.querySelector('.rules-message');
           const documentView = panel.querySelector('pre');
@@ -1806,12 +1817,7 @@ def index():
                 message.textContent = result.message || 'Decision not saved';
                 return;
               }
-              if (uploadDraftPending()) {
-                uploadStatus.textContent = 'Refresh paused while an upload is staged';
-                return;
-              }
-              saveViewState();
-              window.location.reload();
+              await refreshDashboard(true);
             } catch (error) {
               message.textContent = 'Decision not saved';
             } finally {
@@ -1821,7 +1827,9 @@ def index():
           }
           approve.addEventListener('click', () => setApproval(true));
           revoke.addEventListener('click', () => setApproval(false));
-        });
+          });
+        }
+        bindProgramRules();
 
         async function rerunJob(jobName, button) {
           const token = getToken(false);
@@ -1829,6 +1837,7 @@ def index():
             return;
           }
           const original = button ? button.textContent : '';
+          let refreshed = false;
           if (button) {
             button.disabled = true;
             button.textContent = 'Queuing…';
@@ -1849,15 +1858,12 @@ def index():
               alert('Re-run failed: ' + (detail.message || resp.status));
               return;
             }
-            if (uploadDraftPending()) {
-              uploadStatus.textContent = 'Refresh paused while an upload is staged';
-              return;
-            }
-            window.location.reload();
+            await refreshDashboard(true);
+            refreshed = true;
           } catch (err) {
             alert('Re-run request error: ' + err);
           } finally {
-            if (button) {
+            if (button && !refreshed) {
               button.disabled = false;
               button.textContent = original;
             }
@@ -1891,34 +1897,81 @@ def index():
           setLastRefreshed();
         }
 
-        const viewStateKey = 'bugbounty-dashboard-view-state';
-        function saveViewState() {
-          const open = {};
-          document.querySelectorAll('details[data-state-key]').forEach((element) => {
-            open[element.dataset.stateKey] = element.open;
-          });
-          sessionStorage.setItem(viewStateKey, JSON.stringify({ open, scrollY: window.scrollY }));
+        function dashboardNodeKey(node) {
+          if (node.nodeType !== Node.ELEMENT_NODE) return null;
+          const key = node.getAttribute('data-state-key') || node.id || node.getAttribute('data-program');
+          return key ? node.tagName + ':' + key : null;
         }
 
-        function restoreViewState() {
-          try {
-            const state = JSON.parse(sessionStorage.getItem(viewStateKey) || '{}');
-            const open = state.open || {};
-            document.querySelectorAll('details[data-state-key]').forEach((element) => {
-              if (Object.prototype.hasOwnProperty.call(open, element.dataset.stateKey)) {
-                element.open = Boolean(open[element.dataset.stateKey]);
-              }
-            });
-            if (Number.isFinite(state.scrollY)) {
-              requestAnimationFrame(() => window.scrollTo(0, state.scrollY));
+        function reconcileDashboardNode(current, incoming) {
+          if (current.nodeType !== Node.ELEMENT_NODE) {
+            if (current.nodeValue !== incoming.nodeValue) current.nodeValue = incoming.nodeValue;
+            return;
+          }
+          if (current.matches('.manual-review-entry, input, textarea, select, [aria-busy="true"]')) return;
+          if (current.matches('.program-rules')) {
+            current.querySelector('.approval-status').textContent = incoming.querySelector('.approval-status').textContent;
+            return;
+          }
+          const open = current.tagName === 'DETAILS' ? current.open : null;
+          for (const attribute of Array.from(current.attributes)) {
+            if (attribute.name === 'open' && open !== null) continue;
+            if (!incoming.hasAttribute(attribute.name)) current.removeAttribute(attribute.name);
+          }
+          for (const attribute of Array.from(incoming.attributes)) {
+            if (attribute.name === 'open' && open !== null) continue;
+            if (current.getAttribute(attribute.name) !== attribute.value) current.setAttribute(attribute.name, attribute.value);
+          }
+          const keyed = new Map(Array.from(current.childNodes).map(node => [dashboardNodeKey(node), node]).filter(([key]) => key));
+          let cursor = current.firstChild;
+          for (const next of incoming.childNodes) {
+            const key = dashboardNodeKey(next);
+            let match = key ? keyed.get(key) : cursor;
+            if (!match || dashboardNodeKey(match) !== key || match.nodeType !== next.nodeType || match.nodeName !== next.nodeName) {
+              match = next.cloneNode(true);
+              current.insertBefore(match, cursor);
+            } else {
+              if (match !== cursor) current.insertBefore(match, cursor);
+              reconcileDashboardNode(match, next);
             }
-          } catch (err) {
-            sessionStorage.removeItem(viewStateKey);
+            cursor = match.nextSibling;
+          }
+          while (cursor) {
+            const stale = cursor;
+            cursor = cursor.nextSibling;
+            stale.remove();
           }
         }
 
-        restoreViewState();
-        window.addEventListener('beforeunload', saveViewState);
+        let dashboardRefresh = null;
+        async function refreshDashboard(force = false) {
+          if (dashboardRefresh) return dashboardRefresh;
+          if (!force && document.querySelector('[aria-busy="true"]')) return;
+          dashboardRefresh = (async () => {
+            const response = await fetch('/', {cache: 'no-store'});
+            if (!response.ok) throw new Error('Dashboard refresh failed (' + response.status + ')');
+            const incoming = new DOMParser().parseFromString(await response.text(), 'text/html');
+            const sections = ['dashboard-summary', 'dashboard-workflows', 'dashboard-manual-review'];
+            if (sections.some(id => !incoming.getElementById(id))) throw new Error('Incomplete dashboard response');
+            const anchor = document.elementFromPoint(window.innerWidth / 2, Math.min(120, window.innerHeight / 2))?.closest('[data-state-key]');
+            const anchorTop = anchor?.getBoundingClientRect().top;
+            const scrollX = window.scrollX;
+            const scrollY = window.scrollY;
+            for (const id of sections) reconcileDashboardNode(document.getElementById(id), incoming.getElementById(id));
+            bindManualReviews();
+            bindProgramRules();
+            if (anchor?.isConnected) window.scrollBy(0, anchor.getBoundingClientRect().top - anchorTop);
+            else window.scrollTo(scrollX, scrollY);
+            setLastRefreshed();
+            refreshButton.removeAttribute('title');
+          })();
+          try {
+            return await dashboardRefresh;
+          } finally {
+            dashboardRefresh = null;
+          }
+        }
+
         window.addEventListener('beforeunload', event => {
           if (!uploadDraftPending()) return;
           event.preventDefault();
@@ -1935,9 +1988,7 @@ def index():
           }
           if (value > 0) {
             refreshTimer = setInterval(() => {
-              if (uploadDraftPending()) return;
-              saveViewState();
-              window.location.reload();
+              refreshDashboard().catch(error => refreshButton.title = error.message);
             }, value * 1000);
           }
         }
@@ -1947,13 +1998,7 @@ def index():
         }
         if (refreshButton) {
           refreshButton.addEventListener('click', () => {
-            if (uploadDraftPending()) {
-              uploadStatus.textContent = 'Refresh paused while an upload is staged';
-              return;
-            }
-            saveViewState();
-            setLastRefreshed();
-            window.location.reload();
+            refreshDashboard(true).catch(error => refreshButton.title = error.message);
           });
         }
         applyRefreshInterval();
