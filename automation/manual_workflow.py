@@ -65,9 +65,16 @@ def stage_block_reason(slug: str, stage_id: str, *, root: Path = ROOT) -> str | 
     }
     if stage_id in bans and re.search(bans[stage_id], rules, re.IGNORECASE):
         return 'The program guidelines prohibit this step'
+    reverse_terms = {
+        'vhost-discovery': r'(?:vhost|virtual.host)[- ](?:discovery|testing|scanning)',
+        'directory-enumeration': r'(?:directory[- ](?:enumeration|scanning)|fuzzing|brute[- ]force)',
+        'application-testing': r'(?:application[- ]testing|automated vulnerability scanning)',
+        'api-testing': r'(?:api[- ]testing|introspection|automated vulnerability scanning)',
+        'port-scan': r'(?:port|network)[- ]scann?(?:ing|s)?',
+    }
+    if stage_id in reverse_terms and re.search(reverse_terms[stage_id] + r'\s+(?:(?:is|are)\s+)?(?:prohibited|forbidden|not allowed)', rules, re.IGNORECASE):
+        return 'The program guidelines prohibit this step'
     if stage_id == 'port-scan':
-        if not re.search(r'(?:allow|permit)[^.!?\n]{0,40}port.scan|port.scann?[^.!?\n]{0,20}(?:allow|permit)', rules, re.IGNORECASE):
-            return 'TCP port scanning requires explicit permission in the program guidelines'
         if not any(asset['scope_kind'] == 'exact_host' for asset in analysis['assets']):
             return 'URL-only scope does not authorize TCP port scanning'
     for dependency in STAGE_BY_ID[stage_id]['depends_on']:
@@ -93,7 +100,7 @@ def run_manual_stage(slug: str, stage_id: str, *, root: Path = ROOT, client=None
     analysis = load_manual_analysis(slug, root=root)
     _, digest = read_guidelines(slug, root=root)
     scope_assets = [asset for asset in analysis['assets'] if not asset['query_present']]
-    if stage_id not in {'passive-web-discovery', 'passive-dns-discovery', 'confirm-live-web-assets'}:
+    if stage_id not in {'passive-web-discovery', 'passive-dns-discovery', 'confirm-live-web-assets', 'port-scan'}:
         live_path = root / 'results' / f'{job_name_for(slug, "confirm-live-web-assets")}.json'
         live_hosts = set(json.loads(live_path.read_text(encoding='utf-8')).get('discovered', []))
         scope_assets = [asset for asset in scope_assets if asset['host'] in live_hosts]
@@ -111,14 +118,15 @@ def run_manual_stage(slug: str, stage_id: str, *, root: Path = ROOT, client=None
         _save(output, result)
 
     def fetch(url, *, extra_headers=None, method='GET', data=None, **kwargs):
-        if method not in {'GET', 'HEAD'} or data is not None:
-            raise URLError('Manual workflow permits GET and HEAD only')
+        introspection = method == 'POST' and data == worker._GRAPHQL_INTROSPECTION
+        if not introspection and (method not in {'GET', 'HEAD'} or data is not None):
+            raise URLError('Only GET/HEAD and read-only GraphQL introspection are permitted')
         parsed = urlsplit(url)
         if not client.allows(url) and (parsed.path or '/') == '/':
             exact = next((asset for asset in scope_assets if asset['host'] == parsed.hostname), None)
             if exact:
                 url = _asset_url(exact)
-        response = client.request(url, method=method, headers=extra_headers, read_body=method == 'GET')
+        response = client.request(url, method=method, headers=extra_headers, read_body=method in {'GET', 'POST'}, data=data)
         if response.get('error') or response.get('redirect_stop') or response['status'] is None or response['status'] >= 400:
             raise URLError(response.get('error') or response.get('redirect_stop') or 'No response')
         headers = dict(response['headers'])
@@ -138,18 +146,26 @@ def run_manual_stage(slug: str, stage_id: str, *, root: Path = ROOT, client=None
                                              'source': 'exact-host DNS', 'findings': []})
                     progress({'assets': result['assets']})
                 result['discovered'] = hosts
-            elif stage_id in {'confirm-live-web-assets', 'service-enumeration', 'vhost-discovery'}:
-                if stage_id == 'vhost-discovery':
-                    dns_path = root / 'results' / f'{job_name_for(slug, "passive-dns-discovery")}.json'
-                    dns_assets = json.loads(dns_path.read_text(encoding='utf-8')).get('assets', [])
-                    by_address = {}
-                    for record in dns_assets:
-                        if record['domain'] in hosts:
-                            for address in record.get('ips', []):
-                                by_address.setdefault(address, set()).add(record['domain'])
-                    shared = {host for group in by_address.values() if len(group) > 1 for host in group}
-                    scope_assets = [asset for asset in scope_assets if asset['host'] in shared]
-                    result['shared_infrastructure'] = {address: sorted(group) for address, group in by_address.items() if len(group) > 1}
+            elif stage_id == 'vhost-discovery':
+                full_hosts = sorted({asset['host'] for asset in scope_assets if asset['scope_kind'] == 'exact_host'})
+
+                def scoped_resolve(host):
+                    client.wait()
+                    addresses = worker._resolve_host_ips(host)
+                    for address in addresses:
+                        client.ip_owners.setdefault(address, set()).add(host)
+                    return addresses
+
+                def scoped_probe(address, host_header, scheme='https'):
+                    authority = f'[{address}]' if ':' in address else address
+                    response = client.request(f'{scheme}://{authority}/', method='GET', headers={'Host': host_header}, read_body=True)
+                    return {'host_header': host_header, 'ip': address, 'status_code': response['status'],
+                            'url': f'{scheme}://{host_header}/', 'source': f"{host_header} -> {response['status']} via {address}",
+                            'length': len(response['body']), 'ok': bool(response['status'] and response['status'] < 400 and not response.get('redirect_stop'))}
+
+                result.update(worker._run_vhost_discovery([{'domain': host} for host in full_hosts], allowed_scope=full_hosts,
+                                                          probe=scoped_probe, resolver=scoped_resolve, workers=1, progress=progress))
+            elif stage_id in {'confirm-live-web-assets', 'service-enumeration'}:
                 for asset in scope_assets:
                     response = client.request(_asset_url(asset))
                     record = {'domain': asset['host'], 'status': 'live' if response['status'] and response['status'] < 400 and not response.get('redirect_stop') else 'no_response',
@@ -161,18 +177,22 @@ def run_manual_stage(slug: str, stage_id: str, *, root: Path = ROOT, client=None
                     result['assets'].append(record)
                     result['discovered'] = sorted({item['domain'] for item in result['assets'] if item['status'] == 'live'})
                     progress({'assets': result['assets'], 'discovered': result['discovered']})
-                if stage_id == 'vhost-discovery':
-                    result['note'] = 'Only uploaded hostnames are checked; no IP-targeted or fabricated Host-header probes'
             elif stage_id == 'directory-enumeration':
                 for asset in scope_assets:
-                    paths = worker.DEFAULT_CONTENT_WORDLIST if asset['scope_kind'] == 'exact_host' else [asset['path']]
+                    paths = worker._discovery_wordlist('directories') if asset['scope_kind'] == 'exact_host' else [asset['path']]
                     found = []
-                    for path in paths:
+                    record = {'domain': asset['host'], 'paths': found, 'findings': [], 'source': 'scoped directory enumeration',
+                              'checked_paths': 0, 'total_paths': len(paths)}
+                    result['assets'].append(record)
+                    for checked, path in enumerate(paths, 1):
                         target = _asset_url({**asset, 'path': path})
                         response = client.request(target)
+                        record['checked_paths'] = checked
                         if response['status'] in {200, 401, 403} and not response.get('redirect_stop'):
                             found.append({'path': path, 'url': target, 'status_code': response['status']})
-                    result['assets'].append({'domain': asset['host'], 'paths': found, 'findings': [], 'source': 'bounded exact-scope directory check'})
+                        if checked % 100 == 0 or response['status'] in {200, 401, 403}:
+                            progress({'assets': result['assets'], 'checked_paths': sum(row.get('checked_paths', 0) for row in result['assets']),
+                                      'total_paths': sum(row.get('total_paths', 0) for row in result['assets'])})
                     progress({'assets': result['assets']})
                 result['discovered'] = sorted({item['domain'] for item in result['assets'] if item['paths']})
             elif stage_id == 'application-testing':
@@ -188,21 +208,17 @@ def run_manual_stage(slug: str, stage_id: str, *, root: Path = ROOT, client=None
                 result.update(worker._api_endpoint_tests(hosts, fetch=fetch, workers=1, progress=progress))
             elif stage_id == 'port-scan':
                 exact_hosts = sorted({asset['host'] for asset in scope_assets if asset['scope_kind'] == 'exact_host'})
-                for host in exact_hosts:
-                    findings = []
-                    for address in sorted(worker._resolve_host_ips(host)):
-                        for port, (service, severity) in sorted(worker._UNEXPECTED_PORTS.items()):
-                            client.wait()
-                            if worker._tcp_port_open(address, port):
-                                findings.append({'type': 'open_port', 'ip': address, 'port': port, 'service': service, 'severity': severity})
-                    result['assets'].append({'domain': host, 'findings': findings, 'source': 'explicitly permitted paced TCP checks'})
-                    progress({'assets': result['assets']})
-                result['discovered'] = [item['domain'] for item in result['assets'] if item['findings']]
+                def paced_probe(address, port):
+                    client.wait()
+                    return worker._tcp_port_open(address, port)
+
+                result.update(worker._port_scan_tests(exact_hosts, ports=worker._full_tcp_ports(), probe=paced_probe,
+                                                      progress=progress, workers=1))
             client.check_approval()
         _, current_digest = read_guidelines(slug, root=root)
         if current_digest != digest or not active_approved(slug, root=root):
             raise PermissionError('Approval revoked or guidelines changed')
-        result['source_count'] = sum(len(item.get('findings', [])) for item in result['assets'])
+        result['source_count'] = sum(len(item.get('findings', [])) or len(item.get('paths', [])) or item.get('source_count', 0) for item in result['assets'])
         result['status'] = 'ok'
         result['job_state'] = 'completed'
     except Exception as exc:

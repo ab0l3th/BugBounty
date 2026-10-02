@@ -43,8 +43,9 @@ class ApprovedScopeClient:
         self.monotonic = monotonic_fn
         self.last_request = None
         self.lock = threading.Lock()
+        self.ip_owners = {}
 
-    def allows(self, url):
+    def allows(self, url, host_header=None):
         try:
             parsed = urlsplit(url)
             port = parsed.port
@@ -52,10 +53,17 @@ class ApprovedScopeClient:
             return False
         if parsed.scheme not in {'http', 'https'} or parsed.username or parsed.password or parsed.query or parsed.fragment:
             return False
+        if port is not None and not 1 <= port <= 65535:
+            return False
+        hostname = parsed.hostname
+        if host_header:
+            if hostname != host_header and hostname not in self.ip_owners:
+                return False
+            hostname = host_header
         for asset in self.analysis['assets']:
-            if asset['query_present'] or parsed.hostname != asset['host']:
+            if asset['query_present'] or hostname != asset['host']:
                 continue
-            if asset['scope_kind'] == 'exact_host' and port in {None, 80, 443}:
+            if asset['scope_kind'] == 'exact_host':
                 return True
             expected_port = asset['port'] or (443 if asset['scheme'] == 'https' else 80)
             if (parsed.scheme == asset['scheme'] and (port or (443 if parsed.scheme == 'https' else 80)) == expected_port
@@ -76,17 +84,19 @@ class ApprovedScopeClient:
         self.check_approval()
         self.last_request = self.monotonic()
 
-    def request(self, url, *, method='HEAD', headers=None, read_body=False):
+    def request(self, url, *, method='HEAD', headers=None, read_body=False, data=None):
         with self.lock:
             visited = set()
             redirects = []
             target = url
+            target_headers = dict(headers or {'User-Agent': 'BugBountyScopeCheck/1.0'})
             while True:
-                if not self.allows(target):
+                if not self.allows(target, target_headers.get('Host')):
                     return {'status': None, 'error': 'OutsideExactScope', 'headers': {}, 'body': '', 'final_url': url, 'redirects': redirects}
                 self.wait()
                 visited.add(target)
-                request = urllib.request.Request(target, headers=headers or {'User-Agent': 'BugBountyScopeCheck/1.0'}, method=method)
+                body_data = data.encode('utf-8') if isinstance(data, str) else data
+                request = urllib.request.Request(target, headers=target_headers, method=method, data=body_data)
                 try:
                     response = self.open_request(request, timeout=8)
                 except urllib.error.HTTPError as exc:
@@ -114,15 +124,19 @@ class ApprovedScopeClient:
                     result['redirect_stop'] = 'invalid_redirect'
                     return result
                 redirects.append(safe)
+                redirect_headers = dict(target_headers)
+                if parsed.hostname != urlsplit(target).hostname:
+                    redirect_headers.pop('Host', None)
                 auth = re.search(r'(?:^|[./_-])(?:login|log-in|signin|sign-in|sso|oauth|authorize|auth|accounts?)(?:[./_-]|$)',
                                  (parsed.hostname or '') + (parsed.path or '/'), re.IGNORECASE)
-                reason = ('login_redirect' if auth else 'outside_scope' if not self.allows(destination)
+                reason = ('login_redirect' if auth else 'outside_scope' if not self.allows(destination, redirect_headers.get('Host'))
                           else 'https_downgrade' if urlsplit(target).scheme == 'https' and parsed.scheme == 'http'
                           else 'redirect_loop' if destination in visited else 'redirect_limit' if len(redirects) > 3 else None)
                 if reason:
                     result['redirect_stop'] = reason
                     return result
                 target = destination
+                target_headers = redirect_headers
 
 
 def _safe_location(value: str) -> dict:

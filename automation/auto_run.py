@@ -54,6 +54,8 @@ class AutoRunGuard:
                     raise error.URLError('HTTPS downgrade redirect skipped')
                 redirected = super().redirect_request(req, response, code, message, headers, destination)
                 if redirected is not None:
+                    if parsed.hostname != urlsplit(req.full_url).hostname:
+                        redirected.remove_header('Host')
                     redirected._auto_redirect_count = count
                     guard.before_http(redirected)
                 return redirected
@@ -85,7 +87,8 @@ class AutoRunGuard:
         header_host = req.get_header('Host')
         allowed = is_in_scope(host, self.scope)
         if header_host:
-            allowed = is_in_scope(header_host, self.scope) and (host == header_host or header_host in self.ip_owners.get(host, set()))
+            allowed = is_in_scope(header_host, self.scope) and (host == header_host or header_host in self.ip_owners.get(host, set())
+                                                               or self.stage == 'vhost-discovery' and bool(self.ip_owners.get(host)))
         if self.stage not in ACTIVE_STAGES and host in PUBLIC_DISCOVERY_HOSTS and (not header_host or header_host == host):
             allowed = True
         if not allowed:

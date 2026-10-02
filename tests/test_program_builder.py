@@ -384,6 +384,8 @@ class ProgramBuilderTest(unittest.TestCase):
             self.assertIn(b'reconcileDashboardNode', page.data)
             self.assertNotIn(b'window.location.reload()', page.data)
             self.assertNotIn(b'restoreViewState()', page.data)
+            self.assertNotIn(b'data-state-key="program-demo" open', page.data)
+            self.assertNotIn(b'queued.open = true', page.data)
             self.assertIn(b'uploadComplete = true;', page.data)
             self.assertIn(b'Review required', page.data)
             self.assertIn(b'class="rules-acknowledged"', page.data)
@@ -703,7 +705,7 @@ class ProgramBuilderTest(unittest.TestCase):
                 self.assertLess(page.data.index(b'data-state-key="program-zz-existing"'),
                                 page.data.index(b'data-state-key="program-aa-manual"'))
                 self.assertEqual(page.data.count(b'Start step manually'), 9)
-                self.assertIn(b'TCP port scanning requires explicit permission', page.data)
+                self.assertNotIn(b'TCP port scanning requires explicit permission', page.data)
                 blocked = client.post('/jobs/aa-manual-passive-dns-discovery/rerun', headers=headers)
                 self.assertEqual(blocked.status_code, 409)
                 self.assertIn('Complete passive-web-discovery', blocked.get_json()['message'])

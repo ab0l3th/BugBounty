@@ -1310,7 +1310,7 @@ def index():
         {% if jobs %}
           {% for program_name, program_jobs in grouped_jobs.items() %}
             {% set program_summary = summarize_program_jobs(program_jobs) %}
-            <details class="program-group" id="manual-workflow-{{ program_name }}" data-state-key="program-{{ program_name }}" open>
+            <details class="program-group" id="manual-workflow-{{ program_name }}" data-state-key="program-{{ program_name }}">
               <summary class="program-header">{{ program_label(program_name) }} <span class="program-count">({{ program_summary.jobs }} jobs)</span></summary>
               {% if program_name in auto_programs %}
                 <p class="meta">Auto-run: {{ 'approved' if program_name in approved_programs else 'paused pending current guideline approval' }}; {{ auto_programs[program_name].requests_per_second }} request/second; {{ auto_programs[program_name].max_workers }} workers maximum</p>
@@ -1356,9 +1356,23 @@ def index():
                     {% if job.raw.reason %}<p class="meta">{{ job.raw.reason }}</p>{% endif %}
                     <p><strong>Source count:</strong> {{ job.source_count }}</p>
                     <p><strong>Targets:</strong> {{ job.targets|length }}</p>
+                    {% if job.raw.checked_paths is defined %}<p><strong>Path checks:</strong> {{ job.raw.checked_paths }} / {{ job.raw.total_paths }}</p>{% endif %}
+                    {% if job.raw.checked_ports is defined %}<p><strong>TCP port/address checks:</strong> {{ job.raw.checked_ports }} / {{ job.raw.total_ports }}</p>{% endif %}
+                    {% if job.raw.checked_vhosts is defined %}<p><strong>Vhost candidates checked:</strong> {{ job.raw.checked_vhosts }} / {{ job.raw.total_vhosts }}</p>{% endif %}
                     {% if job.raw.total_candidates is defined %}<p><strong>Coverage:</strong> {{ job.raw.processed_count or 0 }} / {{ job.raw.total_candidates }} hosts checked, {{ job.raw.remaining_count or 0 }} remaining</p>{% endif %}
                     <p><strong>Discovered:</strong> {{ job.discovered|length }}</p>
 
+                    {% set path_assets = job.assets|selectattr('paths')|list %}
+                    {% if path_assets %}
+                      <details class="collapsible-list" data-state-key="discovered-paths-{{ job.name }}">
+                        <summary>Discovered paths</summary>
+                        {% for asset in path_assets[:asset_render_cap] %}
+                          <p><code>{{ asset.domain }}</code> ({{ asset.paths|length }} paths)</p>
+                          <ul>{% for path in asset.paths[:evidence_render_cap] %}<li><code>{{ path.path }}</code> {{ path.status_code }}</li>{% endfor %}</ul>
+                          {% if asset.paths|length > evidence_render_cap %}<p class="meta">{{ asset.paths|length - evidence_render_cap }} additional paths in results</p>{% endif %}
+                        {% endfor %}
+                      </details>
+                    {% endif %}
                     {% set probe_log = (job.raw.probe_log if job.raw else []) %}
                     {% set thread_status = (job.raw.thread_status if job.raw else []) %}
                     {% set login_redirects = probe_log|selectattr('status', 'equalto', 'login_redirect')|list %}
@@ -1690,14 +1704,6 @@ def index():
                 status.append(queuedLink);
               }
               await refreshDashboard(true);
-              const key = 'program-' + panel.dataset.program;
-              const queued = document.querySelector('[data-state-key="' + key + '"]');
-              if (queued) {
-                if (approvedState) {
-                  queued.open = true;
-                  queued.scrollIntoView({behavior: 'smooth', block: 'start'});
-                }
-              }
             } catch (error) {
               guidelinesAck.checked = approvedState;
               status.textContent = decisionSaved ? 'Approval decision saved; reload the dashboard to refresh queued steps' : error.message || 'Approval failed';

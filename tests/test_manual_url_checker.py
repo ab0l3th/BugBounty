@@ -204,7 +204,7 @@ class ManualUrlCheckerTest(unittest.TestCase):
             self.assertFalse((root / 'jobs/generated').exists())
             self.assertTrue(all(json.loads((root / 'results' / f'{name}.json').read_text())['job_state'] == 'queued' for name in names))
             self.assertIn('Complete passive-web-discovery', stage_block_reason('sample', 'passive-dns-discovery', root=root))
-            self.assertIn('explicit permission', stage_block_reason('sample', 'port-scan', root=root))
+            self.assertIn('URL-only scope', stage_block_reason('sample', 'port-scan', root=root))
             run_manual_stage('sample', 'passive-web-discovery', root=root)
             self.assertIsNone(stage_block_reason('sample', 'passive-dns-discovery', root=root))
             _, digest = read_guidelines('sample', root=root)
@@ -220,10 +220,15 @@ class ManualUrlCheckerTest(unittest.TestCase):
             set_active_approval('sample', True, digest, root=root)
             queue_manual_workflow('sample', root=root)
             calls = []
+            post_bodies = []
+            host_routes = []
             now = [0.0]
 
             def fake_open(request, timeout=8):
                 calls.append((request.full_url, request.get_method(), now[0]))
+                host_routes.append((request.full_url, request.get_header('Host')))
+                if request.get_method() == 'POST':
+                    post_bodies.append(request.data)
                 headers = Message()
                 headers['Content-Type'] = 'application/json'
                 headers['Server'] = 'mock-edge'
@@ -236,17 +241,69 @@ class ManualUrlCheckerTest(unittest.TestCase):
                                          sleep_fn=fake_sleep, monotonic_fn=lambda: now[0])
             with patch('worker._resolve_host_ips', return_value={'203.0.113.9'}), \
                  patch('worker._tcp_port_open', return_value=False), \
-                 patch('worker.DEFAULT_CONTENT_WORDLIST', ['/public']), \
+                 patch('worker._discovery_wordlist', return_value=['/public']), \
+                 patch('worker._full_tcp_ports', return_value=[22, 6379]), \
                  patch('worker.subprocess.run') as external:
                 for stage in STAGES:
                     result = run_manual_stage('sample', stage['stage'], root=root, client=client)
                     self.assertEqual(result['job_state'], 'completed', result.get('error'))
                 external.assert_not_called()
             self.assertTrue(calls)
-            self.assertTrue(all(url.startswith('https://app.example.com') for url, _, _ in calls))
-            self.assertTrue(all(method in {'HEAD', 'GET'} for _, method, _ in calls))
+            self.assertTrue(all(url.startswith('https://app.example.com') or url == 'https://203.0.113.9/' for url, _, _ in calls))
+            self.assertTrue(all(header == 'app.example.com' for url, header in host_routes if url == 'https://203.0.113.9/'))
+            self.assertTrue(all(method in {'HEAD', 'GET', 'POST'} for _, method, _ in calls))
+            self.assertTrue(all(url.endswith('/graphql') for url, method, _ in calls if method == 'POST'))
+            self.assertEqual(post_bodies, [b'{"query":"{__schema{types{name}}}"}'])
             self.assertTrue(all(later[2] - earlier[2] >= 1 for earlier, later in zip(calls, calls[1:])))
             self.assertEqual(len(list((root / 'results').glob('*.json'))), 9)
+
+    def test_full_host_scope_allows_alt_web_ports_but_not_new_domains(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_manual_program('sample', 'identifier,asset_type,in_scope\napp.example.com,URL,true\n',
+                                  'Maximum 3 requests per second.', {'manual_only': True}, root=root)
+            _, digest = read_guidelines('sample', root=root)
+            set_active_approval('sample', True, digest, root=root)
+            client = ApprovedScopeClient('sample', root=root)
+            self.assertTrue(client.allows('https://app.example.com:9443/nested/api/resource'))
+            self.assertFalse(client.allows('https://app.example.com:0/'))
+            self.assertFalse(client.allows('https://new.app.example.com/'))
+            self.assertFalse(client.allows('https://203.0.113.9/', 'app.example.com'))
+            client.ip_owners['203.0.113.9'] = {'app.example.com'}
+            self.assertTrue(client.allows('https://203.0.113.9/', 'app.example.com'))
+            self.assertFalse(client.allows('https://203.0.113.9/', 'outside.example.org'))
+
+    def test_vhost_relative_redirect_preserves_authorized_host_header(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_manual_program('sample', 'identifier,asset_type,in_scope\napp.example.com,URL,true\n',
+                                  'Maximum 3 requests per second.', {'manual_only': True}, root=root)
+            _, digest = read_guidelines('sample', root=root)
+            set_active_approval('sample', True, digest, root=root)
+            calls = []
+
+            def fake_open(request, timeout=8):
+                calls.append((request.full_url, request.get_header('Host')))
+                headers = Message()
+                if len(calls) == 1:
+                    headers['Location'] = '/public'
+                return HTTPError(request.full_url, 302 if len(calls) == 1 else 200, 'mock', headers, io.BytesIO(b'public'))
+
+            client = ApprovedScopeClient('sample', root=root, open_request=fake_open, sleep_fn=lambda delay: None, monotonic_fn=lambda: 0)
+            client.ip_owners['203.0.113.9'] = {'app.example.com'}
+            response = client.request('https://203.0.113.9/', headers={'Host': 'app.example.com'})
+            self.assertEqual(response['status'], 200)
+            self.assertEqual(calls, [('https://203.0.113.9/', 'app.example.com'), ('https://203.0.113.9/public', 'app.example.com')])
+
+    def test_explicit_port_ban_still_blocks_full_host_scan(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_manual_program('sample', 'identifier,asset_type,in_scope\napp.example.com,URL,true\n',
+                                  'Maximum 3 requests per second. Port scanning is prohibited.', {'manual_only': True}, root=root)
+            _, digest = read_guidelines('sample', root=root)
+            set_active_approval('sample', True, digest, root=root)
+            queue_manual_workflow('sample', root=root)
+            self.assertIn('prohibit', stage_block_reason('sample', 'port-scan', root=root))
 
     def test_revocation_or_guideline_change_during_wait_stops_the_next_request(self):
         for change_rules in (False, True):

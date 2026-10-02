@@ -1120,6 +1120,99 @@ class DashboardJobMetadataTest(unittest.TestCase):
             self.assertIn('attachment', download.headers['Content-Disposition'])
             self.assertEqual(client.get(f'/programs/beta/findings/{finding_id}/writeup').status_code, 404)
 
+    def test_packaged_wordlists_are_full_and_can_be_replaced_without_count_caps(self):
+        import worker
+        from tempfile import TemporaryDirectory
+        with patch.dict('os.environ', {'BUGBOUNTY_DIRECTORIES_WORDLIST': '', 'BUGBOUNTY_VHOSTS_WORDLIST': ''}):
+            self.assertGreater(len(worker._discovery_wordlist('directories')), 4500)
+            self.assertGreaterEqual(len(worker._discovery_wordlist('vhosts')), 4900)
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / 'paths.txt'
+            path.write_text('\n'.join(f'/custom/path-{index}' for index in range(6000)), encoding='utf-8')
+            with patch.dict('os.environ', {'BUGBOUNTY_DIRECTORIES_WORDLIST': str(path)}):
+                paths = worker._discovery_wordlist('directories')
+            self.assertIn('/custom/path-5999', paths)
+            self.assertGreaterEqual(len(paths), 6000)
+
+    def test_vhost_wordlist_expands_only_authorized_wildcards(self):
+        import worker
+        inputs = [{'domain': 'app.example.com'}, {'domain': 'outside.example.org'}]
+        calls = []
+
+        def probe(address, hostname, **kwargs):
+            calls.append((address, hostname))
+            return {'ok': True, 'status_code': 200, 'length': len(hostname), 'host_header': hostname}
+
+        worker._run_vhost_discovery(inputs, allowed_scope=['app.example.com'], resolver=lambda host: {'203.0.113.9'},
+                                    probe=probe, wordlist=['admin', 'ops'], workers=1)
+        self.assertEqual(calls, [('203.0.113.9', 'app.example.com')])
+        calls.clear()
+        labels = [f'candidate{index}' for index in range(5001)]
+        worker._run_vhost_discovery(inputs, allowed_scope=['*.example.com'], resolver=lambda host: {'203.0.113.9'},
+                                    probe=probe, wordlist=labels, workers=1)
+        self.assertIn(('203.0.113.9', 'candidate5000.example.com'), calls)
+        self.assertEqual(len(calls), 5002)
+        self.assertTrue(all(hostname.endswith('.example.com') for _, hostname in calls))
+
+    def test_full_tcp_scan_checks_every_port_and_records_nonstandard_services(self):
+        import worker
+        calls = []
+        progress = []
+
+        def probe(address, port):
+            calls.append(port)
+            return port in {12345, 65000}
+
+        result = worker._port_scan_tests(['app.example.com'], ports=worker._full_tcp_ports(), probe=probe,
+                                         resolver=lambda host: {'203.0.113.9'}, workers=1,
+                                         progress=lambda snapshot: progress.append(sum(asset['checked_ports'] for asset in snapshot.get('assets', []))))
+        self.assertEqual(set(calls), set(range(1, 65536)))
+        self.assertEqual(len(calls), 65535)
+        self.assertEqual(result['assets'][0]['checked_ports'], 65535)
+        self.assertEqual(result['assets'][0]['ports'], [12345, 65000])
+        self.assertTrue(all(finding['severity'] == 'info' for finding in result['assets'][0]['findings']))
+        self.assertTrue(any(0 < checked < 65535 for checked in progress))
+
+    def test_api_enumerates_all_documented_paths_and_keeps_public_data_as_observation(self):
+        import worker
+        import json
+        from urllib.parse import urlsplit
+        calls = []
+        spec = {'security': [{'apiKey': []}], 'paths': {f'/api/item-{index}': {'get': {}} for index in range(40)}}
+        spec['paths']['/api/public'] = {'get': {'security': []}}
+
+        def fetch(url, **kwargs):
+            path = urlsplit(url).path
+            calls.append(path)
+            if path == '/openapi.json':
+                return 200, {'content-type': 'application/json'}, json.dumps(spec)
+            if path.startswith('/api/item-') or path == '/api/public':
+                return 200, {'content-type': 'application/json'}, '{"sample":true}'
+            return 404, {}, ''
+
+        result = worker._api_endpoint_tests(['app.example.com'], fetch=fetch, wordlist=[], workers=1)
+        self.assertIn('/api/item-39', calls)
+        findings = result['assets'][0]['findings']
+        self.assertEqual(len([finding for finding in findings if finding['type'] == 'unauthenticated_endpoint']), 40)
+        self.assertFalse(any(finding.get('path') == '/api/public' for finding in findings))
+        self.assertTrue(any(path['path'] == '/api/public' for path in result['assets'][0]['paths']))
+
+    def test_service_enumeration_keeps_all_scoped_hosts_without_count_truncation(self):
+        import worker
+        import json
+        from tempfile import TemporaryDirectory
+        hosts = [f'host{index}.example.com' for index in range(750)]
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            root.joinpath('results').mkdir()
+            (root / 'results/complete-confirm-live-web-assets.json').write_text(json.dumps({'discovered': [*hosts, 'outside.example.org']}))
+            with patch.object(worker, 'ROOT', root), patch.object(worker, 'RESULTS_DIR', root / 'results'), \
+                 patch.object(worker, 'MAX_HOSTS_PER_RUN', 2), \
+                 patch.object(worker, '_enumerate_live_services', return_value={'assets': [], 'discovered': []}) as enumerate_services:
+                worker.run_passive_job({'name': 'complete-service-enumeration', 'stage': 'service-enumeration',
+                                        'program': 'complete', 'type': 'active'}, ['*.example.com'])
+            self.assertEqual(set(enumerate_services.call_args.args[0]), set(hosts))
+
     def test_rerun_launches_only_the_requested_job(self):
         with patch('dashboard_app.subprocess.Popen', return_value=type('Proc', (), {'pid': 4321})()) as mock_popen, \
              patch.dict('os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token'}):
