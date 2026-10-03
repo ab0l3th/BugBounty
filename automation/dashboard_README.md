@@ -46,7 +46,47 @@ nodes, open/closed states, scroll position, focus, file selections, and in-progr
 upload or guideline inputs remain intact. Approval, upload, and job-start actions
 also refresh in place. Failed refreshes leave the current dashboard visible.
 
-## Finding review
+## Phone Alerts With ntfy
+
+The independent `bugbounty-ntfy.service` watches saved results every 10 seconds
+and sends new HIGH/CRITICAL scanner signals. It reads the owner-only server file
+`/home/ab0l3th/.ssh/ntfy_sh` without evaluating shell code. Keep that file mode
+0600 and outside Git. Required assignments:
+
+```ini
+BUGBOUNTY_NTFY_URL=https://ntfy.sh
+BUGBOUNTY_NTFY_TOPIC=your-topic
+BUGBOUNTY_NTFY_TOKEN=your-private-access-token
+BUGBOUNTY_DASHBOARD_URL=http://192.168.1.16:8001
+```
+
+First enablement baselines existing findings without alerting. A private SQLite
+ledger under `results/.notifications/ntfy.sqlite3` deduplicates later findings
+across restart/rescans and retries delivery failures. Alerts are grouped by bounty
+and cooled down for 60 seconds per bounty; scanning is never blocked by delivery.
+
+A token alone does not make a public topic private. The notifier verifies topic
+reservation and denial of public reads through ntfy's account API. Unverified or
+public topics receive only generic severity/count alerts, with no bounty, asset,
+job, evidence, or dashboard link. Detailed metadata and the program review link
+are enabled only for verified private topics. Response bodies, credentials,
+query values, and sensitive evidence are never sent. Every signal is unverified
+and still requires manual confirmation. The private dashboard link needs LAN/VPN.
+
+Subscribe to the configured topic in the ntfy app and allow phone notifications.
+To send a non-sensitive connection test directly on the server:
+
+```bash
+cd /home/ab0l3th/BugBounty
+.venv/bin/python3 automation/ntfy_notifier.py --test
+```
+
+Install the supplied systemd unit as `bugbounty-ntfy.service`, enable it at boot,
+and restart only that notifier service when changing its unit. The credential
+file is reread automatically; topic privacy is rechecked at least every 5 minutes.
+Do not restart scan services merely to enable alerts.
+
+## Finding Review
 
 Use the review link inside a program or job. Review queues never combine findings
 from different programs. Columns can be sorted, and the severity filter can show

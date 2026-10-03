@@ -1,0 +1,19 @@
+[Unit]
+Description=BugBounty HIGH and CRITICAL ntfy alerts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ab0l3th
+WorkingDirectory=/home/ab0l3th/BugBounty
+Environment=PYTHONUNBUFFERED=1
+Environment=BUGBOUNTY_NTFY_CONFIG=/home/ab0l3th/.ssh/ntfy_sh
+ExecStart=/home/ab0l3th/BugBounty/.venv/bin/python3 /home/ab0l3th/BugBounty/automation/ntfy_notifier.py
+Restart=on-failure
+RestartSec=15
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
