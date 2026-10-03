@@ -253,7 +253,8 @@ class ManualUrlCheckerTest(unittest.TestCase):
             self.assertTrue(all(header == 'app.example.com' for url, header in host_routes if url == 'https://203.0.113.9/'))
             self.assertTrue(all(method in {'HEAD', 'GET', 'POST'} for _, method, _ in calls))
             self.assertTrue(all(url.endswith('/graphql') for url, method, _ in calls if method == 'POST'))
-            self.assertEqual(post_bodies, [b'{"query":"{__schema{types{name}}}"}'])
+            self.assertTrue(post_bodies)
+            self.assertTrue(all(body == b'{"query":"{__schema{types{name}}}"}' for body in post_bodies))
             self.assertTrue(all(later[2] - earlier[2] >= 1 for earlier, later in zip(calls, calls[1:])))
             self.assertEqual(len(list((root / 'results').glob('*.json'))), 9)
 

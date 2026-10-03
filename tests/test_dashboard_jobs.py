@@ -1213,6 +1213,53 @@ class DashboardJobMetadataTest(unittest.TestCase):
                                         'program': 'complete', 'type': 'active'}, ['*.example.com'])
             self.assertEqual(set(enumerate_services.call_args.args[0]), set(hosts))
 
+    def test_api_lists_include_spring_boot_and_prefix_combinations_without_duplicates(self):
+        import worker
+        paths, debug_paths = worker._api_discovery_paths()
+        self.assertIn('/actuator/configprops', paths)
+        self.assertIn('/backend/actuator/configprops', paths)
+        self.assertIn('/service/actuator/env', paths)
+        self.assertIn('/api/v1/actuator/health', paths)
+        self.assertIn('/backend/actuator/env', debug_paths)
+        self.assertEqual(len(paths), len(set(paths)))
+
+    def test_api_custom_full_paths_are_not_removed_by_prefix_filter(self):
+        import worker
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            full = Path(directory) / 'full.txt'
+            full.write_text('/customapp/special-resource\n')
+            prefixes = Path(directory) / 'prefixes.txt'
+            prefixes.write_text('/tenant\n/tenant\n')
+            with patch.dict('os.environ', {'BUGBOUNTY_DIRECTORIES_WORDLIST': str(full), 'BUGBOUNTY_API_PREFIXES_WORDLIST': str(prefixes)}):
+                paths, _ = worker._api_discovery_paths()
+            self.assertIn('/customapp/special-resource', paths)
+            self.assertIn('/tenant/actuator/env', paths)
+            self.assertEqual(len(paths), len(set(paths)))
+
+    def test_prefixed_api_documentation_uses_declared_or_inferred_same_host_bases(self):
+        import worker
+        import json
+        from urllib.parse import urlsplit
+        calls = []
+
+        def fetch(url, **kwargs):
+            path = urlsplit(url).path
+            calls.append(path)
+            if path == '/backend/openapi.json':
+                return 200, {'content-type': 'application/json'}, json.dumps({'paths': {'/inferred': {'get': {}}}})
+            if path == '/backend/swagger.json':
+                return 200, {'content-type': 'application/json'}, json.dumps({'basePath': '/declared', 'paths': {'/item': {'get': {}}}})
+            if path == '/backend/v3/api-docs':
+                return 200, {'content-type': 'application/json'}, json.dumps({'servers': [{'url': 'https://app.example.com/service'}, {'url': 'https://outside.example.org/never'}], 'paths': {'/resource': {'get': {}}}})
+            return 404, {}, ''
+
+        worker._api_endpoint_tests(['app.example.com'], fetch=fetch, wordlist=[], prefixes=['/backend'], workers=1)
+        self.assertIn('/backend/inferred', calls)
+        self.assertIn('/declared/item', calls)
+        self.assertIn('/service/resource', calls)
+        self.assertFalse(any('/never' in path for path in calls))
+
     def test_rerun_launches_only_the_requested_job(self):
         with patch('dashboard_app.subprocess.Popen', return_value=type('Proc', (), {'pid': 4321})()) as mock_popen, \
              patch.dict('os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token'}):

@@ -22,7 +22,7 @@ AUTOMATION_DIR = Path(__file__).resolve().parent
 if str(AUTOMATION_DIR) not in sys.path:
   sys.path.insert(0, str(AUTOMATION_DIR))
 
-from program_builder import active_approved, auto_run_policy, configure_auto_run, create_manual_program, create_program, csv_scope_inventory, load_manual_analysis, parse_scope, read_guidelines, set_active_approval, slug_from_program_name
+from program_builder import active_approved, auto_run_policy, configure_auto_run, create_manual_program, create_program, csv_scope_inventory, delete_uploaded_program, load_manual_analysis, parse_scope, program_identity, read_guidelines, set_active_approval, slug_from_program_name
 from stages import ACTIVE_STAGES, STAGE_BY_ID, STAGES, job_name_for, stage_for_job_name
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -208,6 +208,7 @@ def review_candidates(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     candidates = []
     seen: set[str] = set()
     for job in jobs:
+        generation = program_identity(job.get('program', 'unknown'), root=ROOT)
         for asset in job.get('assets', []) or []:
             if not isinstance(asset, dict) or not asset.get('domain'):
                 continue
@@ -215,7 +216,10 @@ def review_candidates(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 if not isinstance(finding, dict) or not finding.get('type'):
                     continue
                 evidence = {key: finding[key] for key in ('type', 'path', 'ip', 'port', 'service', 'severity') if key in finding}
-                identity = json.dumps([job['name'], asset['domain'], evidence], sort_keys=True)
+                identity_parts = [job['name'], asset['domain'], evidence]
+                if generation:
+                  identity_parts.insert(0, generation)
+                identity = json.dumps(identity_parts, sort_keys=True)
                 if identity in seen:
                     continue
                 seen.add(identity)
@@ -239,6 +243,7 @@ def review_candidates(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 candidates.append({
                     'id': hashlib.sha256(identity.encode('utf-8')).hexdigest(),
                   'program': job.get('program', 'unknown'),
+                    'program_generation': generation,
                     'job': job['name'],
                     'host': asset['domain'],
                     'target_url': target_url,
@@ -417,8 +422,12 @@ def update_review(finding_id: str):
     REVIEW_LOCK.parent.mkdir(parents=True, exist_ok=True)
     with REVIEW_LOCK.open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        candidate = next((item for item in review_candidates(list_jobs()) if item['id'] == finding_id), None)
+        if candidate is None:
+            return jsonify({'status': 'error', 'message': 'finding no longer exists'}), 404
         reviews = read_reviews()
-        reviews[finding_id] = {'status': data['status'], 'scope': data['scope'], 'reviewed_at': int(time.time())}
+        reviews[finding_id] = {'status': data['status'], 'scope': data['scope'], 'reviewed_at': int(time.time()),
+                               'program': candidate['program'], 'job': candidate['job'], 'program_generation': candidate['program_generation']}
         write_reviews(reviews)
     return jsonify(reviews[finding_id])
 
@@ -1127,6 +1136,7 @@ def index():
       if path.is_file():
         auto_programs[program] = read_result_file(path)
     pending_manual_programs = [item for item in manual_programs if not (item['approved'] and item['workflow_queued'])]
+    deletable_programs = generated_programs | {item['slug'] for item in manual_programs}
     return render_template_string('''
     <!doctype html>
     <html lang="en">
@@ -1264,6 +1274,7 @@ def index():
                 {% endfor %}
               </p>
               <div class="manual-analysis" data-program="{{ item.slug }}" data-approved="{{ 'true' if item.approved else 'false' }}">
+                <button type="button" class="delete-program" data-program="{{ item.slug }}">Delete bounty</button>
                 <button type="button" class="analyze-manual-program">Start {{ item.name }} scope analysis</button>
                 <button type="button" class="review-manual-guidelines">Review guidelines</button>
                 <pre class="manual-guidelines" hidden></pre>
@@ -1312,6 +1323,9 @@ def index():
             {% set program_summary = summarize_program_jobs(program_jobs) %}
             <details class="program-group" id="manual-workflow-{{ program_name }}" data-state-key="program-{{ program_name }}">
               <summary class="program-header">{{ program_label(program_name) }} <span class="program-count">({{ program_summary.jobs }} jobs)</span></summary>
+              {% if program_name in deletable_programs %}
+                <p><button type="button" class="delete-program" data-program="{{ program_name }}">Delete bounty</button><span class="delete-program-status" role="status"></span></p>
+              {% endif %}
               {% if program_name in auto_programs %}
                 <p class="meta">Auto-run: {{ 'approved' if program_name in approved_programs else 'paused pending current guideline approval' }}; {{ auto_programs[program_name].requests_per_second }} request/second; {{ auto_programs[program_name].max_workers }} workers maximum</p>
               {% endif %}
@@ -1515,6 +1529,35 @@ def index():
         const guidelinesText = document.getElementById('guidelines-text');
         const autoRun = document.getElementById('auto-run');
         const uploadStatus = document.getElementById('upload-status');
+        document.addEventListener('click', async event => {
+          const button = event.target.closest('.delete-program');
+          if (!button) return;
+          const slug = button.dataset.program;
+          const confirmation = window.prompt('Permanently delete ' + slug + ' and its scope, jobs, results, and reports? Type ' + slug + ' to confirm:', '');
+          if (confirmation !== slug) return;
+          const token = getToken(false);
+          if (!token) return;
+          const status = button.closest('.manual-analysis')?.querySelector('.manual-analysis-status') || button.parentElement.querySelector('.delete-program-status');
+          let deleted = false;
+          button.disabled = true;
+          button.setAttribute('aria-busy', 'true');
+          try {
+            const response = await fetch('/programs/' + encodeURIComponent(slug), {
+              method: 'DELETE', headers: {'Content-Type': 'application/json', 'X-BugBounty-Token': token},
+              body: JSON.stringify({confirmation}),
+            });
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.message || 'Deletion failed');
+            deleted = true;
+            if (dashboardRefresh) await dashboardRefresh.catch(() => {});
+            await refreshDashboard(true);
+          } catch (error) {
+            if (status) status.textContent = deleted ? 'Bounty deleted; use Refresh data to update the view' : error.message || 'Deletion failed';
+          } finally {
+            button.disabled = false;
+            button.removeAttribute('aria-busy');
+          }
+        });
         const boundManualPanels = new WeakSet();
         function bindManualReviews() {
           document.querySelectorAll('.manual-analysis').forEach(panel => {
@@ -2036,7 +2079,7 @@ def index():
       </script>
     </body>
     </html>
-    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, manual_programs=manual_programs, pending_manual_programs=pending_manual_programs, generated_programs=generated_programs, approved_programs=approved_programs, auto_programs=auto_programs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs, workflow_order=workflow_order, highest_severity=highest_severity, asset_render_cap=ASSET_RENDER_CAP, evidence_render_cap=EVIDENCE_RENDER_CAP, thread_render_cap=THREAD_RENDER_CAP)
+    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, manual_programs=manual_programs, pending_manual_programs=pending_manual_programs, generated_programs=generated_programs, approved_programs=approved_programs, auto_programs=auto_programs, deletable_programs=deletable_programs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs, workflow_order=workflow_order, highest_severity=highest_severity, asset_render_cap=ASSET_RENDER_CAP, evidence_render_cap=EVIDENCE_RENDER_CAP, thread_render_cap=THREAD_RENDER_CAP)
 
 
 @app.route('/jobs/<job_name>/rerun', methods=['POST'])
@@ -2125,6 +2168,33 @@ def upload_program():
               'blocked_stages': policy['blocked_stages'],
               'message': f"{request.form['program_name'].strip()} auto-run started: {policy['requests_per_second']:g} request/second, {policy['max_workers']} workers maximum"})
     return jsonify(payload), 202
+
+
+@app.route('/programs/<slug>', methods=['DELETE'])
+def delete_bounty(slug: str):
+  if not _authorized_for_state_change():
+    return jsonify({'status': 'error', 'message': 'unauthorized'}), 401
+  data = request.get_json(silent=True) or {}
+  if data.get('confirmation') != slug:
+    return jsonify({'status': 'error', 'message': 'Type the exact bounty slug to confirm deletion'}), 400
+  REVIEW_LOCK.parent.mkdir(parents=True, exist_ok=True)
+  try:
+    with REVIEW_LOCK.open('a') as lock:
+      fcntl.flock(lock, fcntl.LOCK_EX)
+      finding_ids = {item['id'] for item in review_candidates(list_jobs()) if item['program'] == slug}
+      deleted = delete_uploaded_program(slug, root=ROOT, lock_is_active=_lock_is_active)
+      reviews = read_reviews()
+      retained = {key: decision for key, decision in reviews.items()
+            if key not in finding_ids and (not isinstance(decision, dict) or decision.get('program') != slug)}
+      if retained != reviews:
+        write_reviews(retained)
+  except FileNotFoundError as exc:
+    return jsonify({'status': 'error', 'message': str(exc)}), 404
+  except ValueError as exc:
+    return jsonify({'status': 'error', 'message': str(exc)}), 400
+  except (PermissionError, OSError) as exc:
+    return jsonify({'status': 'error', 'message': str(exc)}), 409
+  return jsonify({'status': 'deleted', **deleted, 'removed_reviews': len(reviews) - len(retained)})
 
 
 @app.route('/programs/<slug>/guidelines')

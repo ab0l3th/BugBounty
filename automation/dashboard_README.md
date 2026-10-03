@@ -136,3 +136,32 @@ testing bans remain enforced for exact and wildcard scope alike. Wildcards expan
 eligible hostname coverage, not traffic rates, excluded assets, or permissions.
 Large lists and full TCP enumeration can take many hours at low permitted rates;
 progress counters and partial observations remain available during execution.
+
+## API Lists and Prefixes
+
+API discovery includes the pinned SecLists Java-Spring-Boot list in
+`automation/wordlists/api-endpoints.txt` and the project-maintained
+`automation/wordlists/api-prefixes.txt`. Every endpoint is combined with every
+prefix (including root) and deduplicated. Examples include
+`/backend/actuator/env`, `/service/actuator/health`, and `/api/v1/v3/api-docs`.
+Complete custom directory paths are also retained without an API-name filter.
+
+Use `BUGBOUNTY_API_ENDPOINTS_WORDLIST` and `BUGBOUNTY_API_PREFIXES_WORDLIST` to
+replace either list. Prefixed GraphQL locations use only the existing read-only
+introspection query. Swagger/OpenAPI base paths and same-host server paths are
+honored; external documentation servers are not followed automatically. All
+generated requests still pass the program scope, approval, and rate guards.
+
+## Delete and Reupload
+
+Uploaded bounties have a **Delete bounty** action in their workflow or pending
+manual-review entry. Type the exact program slug to confirm. The authenticated
+DELETE action refuses live job locks and matching/global worker processes, then
+removes only that bounty's scope/configuration, generated jobs, results, reports,
+progress, and owned review decisions. Repository-owned built-in jobs and unsafe
+symlinked paths are protected. Other programs and the upload draft remain intact.
+
+After successful deletion, the same program name can be uploaded again. A fresh
+upload identity prevents any old unmatched review records from applying to the
+replacement bounty. Deletion refreshes the dashboard in place and never launches
+or stops a scan implicitly.

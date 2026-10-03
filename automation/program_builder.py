@@ -7,6 +7,10 @@ import io
 import json
 import re
 import time
+import uuid
+import shutil
+import subprocess
+import shlex
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -151,6 +155,7 @@ def create_manual_program(slug: str, scope_content: str, guidelines: str, invent
     if program_dir.exists() or any((root / 'jobs' / 'generated').glob(f'{slug}-*.yaml')):
         raise FileExistsError(f'Program already exists: {slug}')
     program_dir.mkdir(parents=True)
+    (program_dir / '.program-id').write_text(uuid.uuid4().hex, encoding='utf-8')
     (program_dir / 'scope.md').write_text(
         f'# {slug} scope\n\n## Manual review required\nNo automated targets. Source CSV is preserved separately.\n', encoding='utf-8')
     source = program_dir / 'scope-source.csv'
@@ -319,6 +324,7 @@ def configure_auto_run(slug: str, *, root: Path = ROOT) -> dict:
         raise ValueError('URL/app scope requires the manual workflow; auto-run supports domain/wildcard scope only')
     policy = auto_run_policy(rules)
     policy['guidelines_sha256'] = digest
+    policy['program_id'] = program_identity(slug, root=root)
     policy['scope_sha256'] = hashlib.sha256((root / 'programs' / slug / 'scope.md').read_bytes()).hexdigest()
     path = root / 'programs' / slug / '.auto-run.json'
     temporary = path.with_name('.auto-run.json.tmp')
@@ -340,6 +346,7 @@ def create_program(slug: str, targets: list[str], *, root: Path = ROOT, guidelin
     if program_dir.exists() or any((jobs_dir / f'{name}.yaml').exists() for name in job_names):
         raise FileExistsError(f'Program already exists: {slug}')
     program_dir.mkdir(parents=True)
+    (program_dir / '.program-id').write_text(uuid.uuid4().hex, encoding='utf-8')
     jobs_dir.mkdir(parents=True, exist_ok=True)
     (program_dir / 'scope.md').write_text(
         f'# {slug} scope\n\n## In-scope targets\n' + ''.join(f'- {target}\n' for target in targets), encoding='utf-8')
@@ -355,3 +362,97 @@ def create_program(slug: str, targets: list[str], *, root: Path = ROOT, guidelin
         ])
         (jobs_dir / f'{name}.yaml').write_text(job_yaml, encoding='utf-8')
     return job_names
+
+
+def program_identity(slug: str, *, root: Path = ROOT) -> str:
+    if not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', slug):
+        return ''
+    try:
+        return (root / 'programs' / slug / '.program-id').read_text(encoding='utf-8').strip()
+    except OSError:
+        return ''
+
+
+def delete_uploaded_program(slug: str, *, root: Path = ROOT, lock_is_active=None) -> dict:
+    if not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', slug):
+        raise ValueError('Invalid program name')
+    program_dir = root / 'programs' / slug
+    generated = root / 'jobs' / 'generated'
+    results = root / 'results'
+    job_names = {job_name_for(slug, stage['stage']) for stage in STAGES}
+    if not program_dir.is_dir():
+        raise FileNotFoundError('Uploaded bounty not found')
+    if not (program_dir / 'scope-inventory.json').is_file() and not any((generated / f'{name}.yaml').is_file() for name in job_names):
+        raise PermissionError('Repository-owned bounty jobs cannot be deleted through the dashboard')
+    for name in job_names:
+        job_path = generated / f'{name}.yaml'
+        if job_path.exists():
+            if job_path.is_symlink() or not any(line.strip() == f'program: {slug}' for line in job_path.read_text(encoding='utf-8').splitlines()):
+                raise PermissionError('Generated job ownership is ambiguous; deletion refused')
+        result_path = results / f'{name}.json'
+        if result_path.exists():
+            try:
+                payload = json.loads(result_path.read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                payload = {}
+            if isinstance(payload, dict) and payload.get('program') not in {None, slug}:
+                raise PermissionError('Result ownership is ambiguous; deletion refused')
+    paths = [program_dir]
+    for path in generated.glob('*.yaml'):
+        if any(line.strip() == f'program: {slug}' for line in path.read_text(encoding='utf-8').splitlines()):
+            job_names.add(path.stem)
+            paths.append(path)
+    for path in results.glob('*.json'):
+        if path.name.startswith('.'):
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            payload = {}
+        if isinstance(payload, dict) and payload.get('program') == slug:
+            job_names.add(path.stem)
+            paths.append(path)
+    lock_names = [*job_names, f'auto-program-{slug}', f'manual-program-{slug}', f'manual-url-check-{slug}']
+    if lock_is_active and any(lock_is_active(name) for name in lock_names):
+        raise PermissionError('This bounty has a running job; finish or stop it before deletion')
+    try:
+        processes = subprocess.run(['ps', '-eo', 'args='], capture_output=True, text=True, timeout=5, check=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise PermissionError('Could not verify running workers; deletion refused') from exc
+    for line in processes.stdout.splitlines():
+        try:
+            arguments = shlex.split(line)
+        except ValueError:
+            continue
+        for index, argument in enumerate(arguments):
+            script = Path(argument).name
+            if script not in {'worker.py', 'manual_workflow.py', 'manual_url_checker.py'}:
+                continue
+            if script == 'worker.py':
+                if '--program' in arguments and arguments[arguments.index('--program') + 1:arguments.index('--program') + 2] == [slug]:
+                    raise PermissionError('This bounty worker is running; deletion refused')
+                if '--job' in arguments and arguments[arguments.index('--job') + 1:arguments.index('--job') + 2] and arguments[arguments.index('--job') + 1] in job_names:
+                    raise PermissionError('This bounty job is running; deletion refused')
+                if '--program' not in arguments and '--job' not in arguments:
+                    raise PermissionError('A global worker is running; wait until it finishes before deletion')
+            elif arguments[index + 1:index + 2] == [slug]:
+                raise PermissionError('This bounty worker is running; deletion refused')
+    for name in job_names:
+        paths.extend([results / f'{name}.json', results / 'reports' / name,
+                      results / '.scan-progress' / f'{name}.json', results / '.running' / f'{name}.lock',
+                      results / '.state' / f'{name}.json'])
+    paths.extend(results / '.running' / f'{name}.lock' for name in lock_names)
+    paths.append(results / f'manual-url-check-{slug}.json')
+    paths = list(dict.fromkeys(path for path in paths if path.exists() or path.is_symlink()))
+    allowed_roots = [(root / 'programs').resolve(), generated.resolve(), results.resolve()]
+    for path in paths:
+        if path.is_symlink() or not any(path.resolve().is_relative_to(parent) for parent in allowed_roots):
+            raise PermissionError('Unsafe bounty file path; deletion refused')
+    removed = 0
+    for path in paths:
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        removed += 1
+    return {'program': slug, 'removed_paths': removed, 'jobs': sorted(job_names)}

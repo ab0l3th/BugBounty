@@ -810,6 +810,87 @@ class ProgramBuilderTest(unittest.TestCase):
                         self.assertFalse((Path(directory) / 'programs/rejected').exists())
                 launch.assert_not_called()
 
+    def test_delete_uploaded_bounty_removes_owned_data_and_allows_clean_reupload(self):
+        from dashboard_app import review_candidates
+        with TemporaryDirectory() as directory, \
+             patch('dashboard_app.ROOT', Path(directory)), \
+             patch('dashboard_app.JOBS_DIR', Path(directory) / 'jobs'), \
+             patch('dashboard_app.RESULTS_DIR', Path(directory) / 'results'), \
+             patch('dashboard_app.RUNNING_DIR', Path(directory) / 'results/.running'), \
+             patch('dashboard_app.REVIEW_FILE', Path(directory) / 'results/reviews.json'), \
+             patch('dashboard_app.REVIEW_LOCK', Path(directory) / 'results/reviews.lock'), \
+             patch('dashboard_app.subprocess.Popen'), \
+             patch('program_builder.subprocess.run', return_value=subprocess.CompletedProcess(['ps'], 0, stdout='')), \
+             patch.dict('dashboard_app.os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token'}):
+            root = Path(directory)
+            headers = {'X-BugBounty-Token': 'test-token'}
+            create_program('other', ['other.example.com'], root=root, guidelines='Authorized testing.')
+            with app.test_client() as client:
+                def upload():
+                    return client.post('/programs/upload', headers=headers, data={
+                        'program_name': 'Delete Test', 'guidelines_text': 'Authorized testing.',
+                        'scope_file': (io.BytesIO(b'identifier,asset_type,in_scope\napp.example.com,DOMAIN,true\n'), 'scope.csv')})
+                self.assertEqual(upload().status_code, 202)
+                generation = (root / 'programs/delete-test/.program-id').read_text()
+                results = root / 'results'
+                results.mkdir(exist_ok=True)
+                payload = {'job': 'delete-test-application-testing', 'program': 'delete-test', 'type': 'active', 'status': 'ok',
+                           'assets': [{'domain': 'app.example.com', 'findings': [{'type': 'error_disclosure', 'severity': 'medium'}]}]}
+                (results / 'delete-test-application-testing.json').write_text(json.dumps(payload))
+                (results / 'other-passive-web-discovery.json').write_text(json.dumps({'job': 'other-passive-web-discovery', 'program': 'other', 'status': 'ok'}))
+                report = results / 'reports/delete-test-application-testing'
+                report.mkdir(parents=True)
+                (report / 'app.example.com.html').write_text('owned report')
+                progress = results / '.scan-progress'
+                progress.mkdir()
+                (progress / 'delete-test-confirm-live-web-assets.json').write_text('{}')
+                finding_id = review_candidates(list_jobs())[0]['id']
+                saved = client.post('/review/' + finding_id, headers=headers, json={'status': 'confirmed', 'scope': 'in_scope'})
+                self.assertEqual(saved.status_code, 200)
+                self.assertEqual(client.delete('/programs/delete-test', json={'confirmation': 'delete-test'}).status_code, 401)
+                self.assertEqual(client.delete('/programs/delete-test', headers=headers, json={'confirmation': 'wrong'}).status_code, 400)
+                deleted = client.delete('/programs/delete-test', headers=headers, json={'confirmation': 'delete-test'})
+                self.assertEqual(deleted.status_code, 200)
+                self.assertEqual(deleted.get_json()['removed_reviews'], 1)
+                self.assertFalse((root / 'programs/delete-test').exists())
+                self.assertFalse(report.exists())
+                self.assertFalse((progress / 'delete-test-confirm-live-web-assets.json').exists())
+                self.assertFalse(list((root / 'jobs/generated').glob('delete-test-*.yaml')))
+                self.assertTrue((root / 'programs/other').exists())
+                self.assertTrue((results / 'other-passive-web-discovery.json').exists())
+                self.assertEqual(upload().status_code, 202)
+                self.assertNotEqual((root / 'programs/delete-test/.program-id').read_text(), generation)
+                (results / 'delete-test-application-testing.json').write_text(json.dumps(payload))
+                self.assertNotEqual(review_candidates(list_jobs())[0]['id'], finding_id)
+                self.assertIn(b'value="needs_review" selected', client.get('/review?program=delete-test').data)
+
+    def test_delete_bounty_refuses_locks_pending_workers_and_unsafe_paths(self):
+        from program_builder import delete_uploaded_program
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_manual_program('manual', 'identifier,asset_type,in_scope\napp.example.com,URL,true\n',
+                                  'Maximum 3 requests per second.', {'manual_only': True}, root=root)
+            with self.assertRaises(PermissionError):
+                delete_uploaded_program('manual', root=root, lock_is_active=lambda name: name == 'manual-program-manual')
+            with patch('program_builder.subprocess.run', return_value=subprocess.CompletedProcess(['ps'], 0,
+                       stdout='python /path/automation/manual_workflow.py manual directory-enumeration\n')):
+                with self.assertRaises(PermissionError):
+                    delete_uploaded_program('manual', root=root, lock_is_active=lambda name: False)
+            self.assertTrue((root / 'programs/manual').exists())
+            with self.assertRaises(ValueError):
+                delete_uploaded_program('../manual', root=root)
+            target = root / 'programs/manual'
+            (root / 'programs/linked').symlink_to(target, target_is_directory=True)
+            with patch('program_builder.subprocess.run', return_value=subprocess.CompletedProcess(['ps'], 0, stdout='')):
+                with self.assertRaises(PermissionError):
+                    delete_uploaded_program('linked', root=root, lock_is_active=lambda name: False)
+            self.assertTrue(target.exists())
+            owned = root / 'programs/legacy'
+            owned.mkdir()
+            (owned / 'scope.md').write_text('# Repository-owned scope')
+            with self.assertRaises(PermissionError):
+                delete_uploaded_program('legacy', root=root)
+
     def test_manual_review_keeps_pending_programs_and_incomplete_workflows(self):
         from manual_workflow import queue_manual_workflow
         with TemporaryDirectory() as directory, \

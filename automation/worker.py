@@ -853,7 +853,7 @@ _INTERESTING_STATUS = {200, 201, 204, 301, 302, 307, 308, 401, 403, 405}
 
 
 def _discovery_wordlist(kind: str) -> list[str]:
-    filename = os.environ.get(f'BUGBOUNTY_{kind.upper()}_WORDLIST', '').strip()
+    filename = os.environ.get(f'BUGBOUNTY_{kind.upper().replace("-", "_")}_WORDLIST', '').strip()
     path = Path(filename).expanduser() if filename else Path(__file__).resolve().parent / 'wordlists' / f'{kind}.txt'
     lines = path.read_text(encoding='utf-8').splitlines()
     values = []
@@ -1290,7 +1290,20 @@ def _is_login_redirect(requested_url: str, final_url: str, body: str) -> bool:
     return (redirected and url_login) or body_login
 
 
-def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False, progress=None, fetch=None, workers: int | None = None, wordlist=None) -> dict:
+def _api_discovery_paths(wordlist=None, prefixes=None) -> tuple[list[str], set[str]]:
+    prefix_paths = _discovery_wordlist('api-prefixes') if prefixes is None else prefixes
+    prefix_paths = list(dict.fromkeys(['', *(path.rstrip('/') for path in prefix_paths)]))
+    spring_paths = _discovery_wordlist('api-endpoints') if wordlist is None else wordlist
+    directory_paths = _discovery_wordlist('directories') if wordlist is None else []
+    if not os.environ.get('BUGBOUNTY_DIRECTORIES_WORDLIST', '').strip():
+        directory_paths = [path for path in directory_paths if path.startswith(('/api', '/rest', '/v1', '/v2', '/v3', '/swagger', '/openapi'))]
+    endpoints = list(dict.fromkeys([*_API_DEBUG_PATHS, *spring_paths]))
+    combinations = [prefix + '/' + endpoint.lstrip('/') for prefix in prefix_paths for endpoint in endpoints]
+    debug_paths = {prefix + endpoint for prefix in prefix_paths for endpoint in _API_DEBUG_PATHS}
+    return list(dict.fromkeys([*combinations, *directory_paths])), debug_paths
+
+
+def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False, progress=None, fetch=None, workers: int | None = None, wordlist=None, prefixes=None) -> dict:
     fetch = fetch or _fetch_headers_body
     deduped_hosts = sorted(set(hosts))
     assets: list[dict] = []
@@ -1298,9 +1311,7 @@ def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False, p
     login_seen: set[str] = set()
     thread_status: list[dict] = []
     max_workers = workers or _bounded_workers(len(deduped_hosts))
-    extra_paths = wordlist if wordlist is not None else [path for path in _discovery_wordlist('directories')
-                                                       if path.startswith(('/api', '/rest', '/v1', '/v2', '/v3', '/swagger', '/openapi'))]
-    paths = list(dict.fromkeys([*_API_DEBUG_PATHS, *extra_paths]))
+    paths, debug_paths = _api_discovery_paths(wordlist=wordlist, prefixes=prefixes)
 
     def test_host(host: str) -> dict:
         thread_name = threading.current_thread().name
@@ -1308,7 +1319,16 @@ def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False, p
         openapi_paths: list[str] = []
         documented_security = {}
         observed_paths: list[dict] = []
-        for path in paths:
+        record = {'domain': host, 'status': 'checking', 'kind': 'api-test', 'ports': [], 'paths': observed_paths,
+                  'findings': findings, 'source': 'api-test', 'sources': ['api-test'], 'source_count': 0,
+                  'evidence': [], 'checked_paths': 0, 'total_paths': len(paths)}
+        assets.append(record)
+        for checked, path in enumerate(paths, 1):
+            record['checked_paths'] = checked
+            if checked % 100 == 0:
+                _emit_progress(progress, {'assets': list(assets), 'discovered': [row['domain'] for row in assets if row.get('paths')],
+                                         'checked_paths': sum(row.get('checked_paths', 0) for row in assets),
+                                         'total_paths': sum(row.get('total_paths', 0) for row in assets), 'threads': max_workers})
             url = f'https://{host}{path}'
             try:
                 code, hdrs, body = fetch(url)
@@ -1323,30 +1343,50 @@ def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False, p
                     _record_login_redirect(probe_log, login_seen, thread_name=thread_name, host=host, requested_url=url, final_url=hdrs.get('x-final-url', url), body=body, path=path)
                     continue
                 observed_paths.append({'path': path, 'status_code': code, 'exposes_data': bool(exposes)})
-                if path in _API_DEBUG_PATHS:
+                if path in debug_paths:
                     findings.append({'type': 'debug_endpoint', 'path': path, 'status_code': code, 'exposes_data': bool(exposes), 'severity': 'high' if exposes else 'medium'})
                 probe_log.append({'thread_id': thread_name, 'host': host, 'path': path, 'status_code': code, 'status': 'found', 'timestamp': time.time()})
-                if path in ('/v2/api-docs', '/v3/api-docs', '/openapi.json', '/swagger.json') and exposes:
+                if path.endswith(('/api-docs', '/openapi.json', '/swagger.json')) and exposes:
                     try:
                         spec = json.loads(body)
                         if isinstance(spec, dict) and isinstance(spec.get('paths'), dict):
-                            openapi_paths = list(dict.fromkeys(openapi_paths + list(spec['paths'].keys())))
+                            declared_bases = []
+                            if isinstance(spec.get('basePath'), str):
+                                declared_bases.append(spec['basePath'])
+                            for server in spec.get('servers', []) if isinstance(spec.get('servers', []), list) else []:
+                                if not isinstance(server, dict) or not isinstance(server.get('url'), str):
+                                    continue
+                                parsed_server = urlsplit(server['url'])
+                                if not parsed_server.netloc or parsed_server.hostname == host and parsed_server.scheme == 'https' and parsed_server.port in {None, 443}:
+                                    declared_bases.append(parsed_server.path)
+                            if not declared_bases:
+                                declared_bases = [path[:-len(suffix)] for suffix in ('/v2/api-docs', '/v3/api-docs', '/openapi.json', '/swagger.json') if path.endswith(suffix)] or ['']
+                            declared_bases = [base.rstrip('/') for base in declared_bases if not base or base.startswith('/') and not base.startswith('//') and '?' not in base and '#' not in base]
                             for documented_path, operation in spec['paths'].items():
+                                if not isinstance(documented_path, str) or not documented_path.startswith('/') or documented_path.startswith('//'):
+                                    continue
                                 get_operation = operation.get('get', {}) if isinstance(operation, dict) else {}
-                                documented_security[documented_path] = bool(get_operation.get('security', spec.get('security', [])))
+                                for base in declared_bases:
+                                    full_path = base + documented_path
+                                    if full_path not in openapi_paths:
+                                        openapi_paths.append(full_path)
+                                    documented_security[full_path] = bool(get_operation.get('security', spec.get('security', [])))
                     except Exception:
                         pass
 
         # GraphQL introspection (read-only query).
-        try:
-            code, hdrs, body = fetch(f'https://{host}/graphql', extra_headers={'Content-Type': 'application/json'}, method='POST', data=_GRAPHQL_INTROSPECTION)
-            if code == 200 and '__schema' in body:
-                findings.append({'type': 'graphql_introspection', 'detail': 'introspection enabled', 'severity': 'medium'})
-        except Exception:
-            pass
+        for graphql_path in (path for path in paths if path.endswith('/graphql')):
+            try:
+                code, hdrs, body = fetch(f'https://{host}{graphql_path}', extra_headers={'Content-Type': 'application/json'}, method='POST', data=_GRAPHQL_INTROSPECTION)
+                if code == 200 and '__schema' in body:
+                    findings.append({'type': 'graphql_introspection', 'path': graphql_path, 'detail': 'introspection enabled', 'severity': 'medium'})
+            except Exception:
+                pass
 
         # Unauthenticated access to documented API endpoints (bounded, read-only GET).
+        record['total_paths'] += len(openapi_paths)
         for doc_path in openapi_paths:
+            record['checked_paths'] += 1
             if not isinstance(doc_path, str) or not doc_path.startswith('/') or '{' in doc_path:
                 continue
             url = f'https://{host}{doc_path}'
@@ -1361,7 +1401,7 @@ def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False, p
                 if documented_security.get(doc_path):
                     findings.append({'type': 'unauthenticated_endpoint', 'path': doc_path, 'status_code': code, 'severity': 'high'})
 
-        record = {
+        record.update({
             'domain': host,
             'status': 'findings' if findings else 'no_findings',
             'kind': 'api-test',
@@ -1372,8 +1412,7 @@ def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False, p
             'sources': ['api-test'],
             'source_count': len(findings),
             'evidence': [{'source': 'api-test', 'url': f'https://{host}{f.get("path", "")}', 'detail': f.get('type')} for f in findings],
-        }
-        assets.append(record)
+        })
         thread_status.append({'thread_id': thread_name, 'host': host, 'status': record['status'], 'findings': len(findings), 'timestamp': time.time()})
         _emit_progress(progress, {'targets': list(deduped_hosts), 'assets': list(assets), 'discovered': [row['domain'] for row in assets if row.get('findings')], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
         return record
