@@ -63,6 +63,85 @@ def csv_scope_inventory(content: str) -> dict:
     return {'eligible_asset_types': counts, 'total_rows': rows, 'manual_only': manual_only}
 
 
+def partition_csv_scope(content: str) -> dict:
+    csv_scope_inventory(content)
+    partitions = {'automatic': [], 'manual': [], 'excluded': []}
+    truth = {'true', 'yes', '1'}
+    falsehood = {'false', 'no', '0'}
+    for raw in csv.DictReader(io.StringIO(content.lstrip('\ufeff'))):
+        row = {(key or '').strip().lower().replace(' ', '_'): (value or '').strip() for key, value in raw.items()}
+        flags = {key: row[key].lower() for key in ('in_scope', 'eligible_for_submission', 'eligible_for_bounty') if row.get(key)}
+        if any(value not in truth | falsehood for value in flags.values()):
+            raise ValueError('Ambiguous scope eligibility flag')
+        identifier = next((row[key] for key in ('identifier', 'target', 'asset_identifier', 'asset') if row.get(key)), '')
+        kind = (row.get('asset_type') or row.get('type') or '').upper()
+        record = {'identifier': identifier, 'asset_type': kind,
+                  'id': hashlib.sha256(json.dumps([identifier, kind], sort_keys=True).encode()).hexdigest()}
+        record['display_identifier'] = identifier
+        if '://' in identifier:
+            try:
+                displayed = urlsplit(identifier)
+                port = f':{displayed.port}' if displayed.port else ''
+                record['display_identifier'] = f'{displayed.scheme}://{displayed.hostname or "invalid-host"}{port}{displayed.path or "/"}' + ('?query-redacted' if displayed.query else '')
+            except ValueError:
+                record['display_identifier'] = 'Invalid URL identifier; manual validation required'
+        confirmed_scope = flags.get('in_scope') in truth or ('in_scope' not in flags and any(value in truth for value in flags.values()))
+        if flags.get('in_scope') in falsehood or not confirmed_scope:
+            record['reason'] = 'Out of scope or no explicit positive scope eligibility'
+            partitions['excluded'].append(record)
+            continue
+        automatic = all(value in truth for value in flags.values())
+        web_asset = False
+        pattern = parse_scope_pattern(identifier)
+        if kind in {'DOMAIN', 'WILDCARD'} and pattern:
+            record.update({'scope_kind': 'host_pattern', 'pattern': pattern})
+            web_asset = True
+        elif kind in {'URL', 'WEBSITE'}:
+            if pattern and '*' not in pattern:
+                record.update({'scope_kind': 'exact_host', 'pattern': pattern})
+                web_asset = True
+            else:
+                try:
+                    parsed = urlsplit(identifier)
+                    port = parsed.port
+                    if parsed.scheme in {'http', 'https'} and parsed.hostname and parse_scope_pattern(parsed.hostname) and not parsed.username and not parsed.password and '*' not in parsed.hostname:
+                        record.update({'scope_kind': 'exact_url', 'scheme': parsed.scheme, 'host': parsed.hostname,
+                                       'port': port, 'path': parsed.path or '/', 'query_present': bool(parsed.query), 'fragment_present': bool(parsed.fragment)})
+                        web_asset = not parsed.query and not parsed.fragment
+                except ValueError:
+                    pass
+        if automatic and web_asset:
+            record['reason'] = 'Eligible supported web asset'
+            partitions['automatic'].append(record)
+        else:
+            record['reason'] = 'In-scope eligibility requires operator review' if web_asset else 'Unsupported/app/query-bearing asset requires manual verification'
+            partitions['manual'].append(record)
+    if not partitions['automatic'] and not partitions['manual']:
+        raise ValueError('No explicitly in-scope assets found')
+    return partitions
+
+
+def partition_scope_csv(partitions: dict, queue: str) -> str:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['identifier', 'asset_type', 'in_scope'])
+    for asset in partitions.get(queue, []):
+        kind = asset['asset_type']
+        if kind in {'DOMAIN', 'WEBSITE'} or kind == 'WILDCARD' and not asset['identifier'].startswith('*.'):
+            kind = 'URL'
+        writer.writerow([asset['identifier'], kind, 'true'])
+    return output.getvalue()
+
+
+def load_scope_partitions(slug: str, *, root: Path = ROOT) -> dict | None:
+    if not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', slug):
+        raise ValueError('Invalid program name')
+    path = root / 'programs' / slug / '.scope-partitions.json'
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
 def analyze_url_scope(content: str, guidelines: str) -> dict:
     inventory = csv_scope_inventory(content)
     assets: list[dict] = []
@@ -136,10 +215,23 @@ def analyze_url_scope(content: str, guidelines: str) -> dict:
             'policy': policy, 'assets': assets}
 
 
-def load_manual_analysis(slug: str, *, root: Path = ROOT) -> dict:
+def load_manual_analysis(slug: str, *, root: Path = ROOT, queue: str = 'manual') -> dict:
     if not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', slug):
         raise ValueError('Invalid program name')
     program_dir = root / 'programs' / slug
+    partitions = load_scope_partitions(slug, root=root)
+    if partitions is not None:
+        records = partitions.get(queue, [])
+        supported = [asset for asset in records if asset.get('scope_kind') in {'exact_host', 'exact_url', 'host_pattern'}]
+        if not supported:
+            return {'assets': [], 'app_assets': [], 'app_ids': len(records), 'eligible_urls': 0, 'invalid_urls': 0,
+                    'categories': {}, 'policy': {'automated_requests': 'blocked', 'reason': 'No executable web targets in this queue'}}
+        content = partition_scope_csv({queue: supported}, queue)
+        analysis = analyze_url_scope(content, (program_dir / 'rules.md').read_text(encoding='utf-8'))
+        policy = auto_run_policy((program_dir / 'rules.md').read_text(encoding='utf-8'))
+        analysis['policy'].update({'automated_requests': 'manual_approval_required', 'stated_max_requests_per_second': policy['requests_per_second'],
+                                  'max_requests_per_second': policy['requests_per_second']})
+        return analysis
     if not (program_dir / 'scope-inventory.json').is_file():
         raise FileNotFoundError('Manual program inventory not found')
     return analyze_url_scope((program_dir / 'scope-source.csv').read_text(encoding='utf-8'),
@@ -320,12 +412,15 @@ def configure_auto_run(slug: str, *, root: Path = ROOT) -> dict:
     rules, digest = read_guidelines(slug, root=root)
     if not active_approved(slug, root=root):
         raise PermissionError('Current program guidelines must be approved for auto-run')
-    if (root / 'programs' / slug / 'scope-inventory.json').exists():
+    partitions = load_scope_partitions(slug, root=root)
+    if (root / 'programs' / slug / 'scope-inventory.json').exists() and partitions is None:
         raise ValueError('URL/app scope requires the manual workflow; auto-run supports domain/wildcard scope only')
     policy = auto_run_policy(rules)
     policy['guidelines_sha256'] = digest
     policy['program_id'] = program_identity(slug, root=root)
     policy['scope_sha256'] = hashlib.sha256((root / 'programs' / slug / 'scope.md').read_bytes()).hexdigest()
+    if partitions is not None:
+        policy['partitions_sha256'] = hashlib.sha256((root / 'programs' / slug / '.scope-partitions.json').read_bytes()).hexdigest()
     path = root / 'programs' / slug / '.auto-run.json'
     temporary = path.with_name('.auto-run.json.tmp')
     temporary.write_text(json.dumps(policy, indent=2), encoding='utf-8')
@@ -333,7 +428,7 @@ def configure_auto_run(slug: str, *, root: Path = ROOT) -> dict:
     return policy
 
 
-def create_program(slug: str, targets: list[str], *, root: Path = ROOT, guidelines: str | None = None) -> list[str]:
+def create_program(slug: str, targets: list[str], *, root: Path = ROOT, guidelines: str | None = None, scope_partitions=None) -> list[str]:
     if not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', slug):
         raise ValueError('Invalid program name')
     if not targets or any(parse_scope_pattern(target) != target for target in targets):
@@ -348,6 +443,10 @@ def create_program(slug: str, targets: list[str], *, root: Path = ROOT, guidelin
     program_dir.mkdir(parents=True)
     (program_dir / '.program-id').write_text(uuid.uuid4().hex, encoding='utf-8')
     jobs_dir.mkdir(parents=True, exist_ok=True)
+    if scope_partitions is not None:
+        path = program_dir / '.scope-partitions.json'
+        path.write_text(json.dumps(scope_partitions, indent=2), encoding='utf-8')
+        path.chmod(0o600)
     (program_dir / 'scope.md').write_text(
         f'# {slug} scope\n\n## In-scope targets\n' + ''.join(f'- {target}\n' for target in targets), encoding='utf-8')
     if guidelines is not None:
@@ -362,6 +461,42 @@ def create_program(slug: str, targets: list[str], *, root: Path = ROOT, guidelin
         ])
         (jobs_dir / f'{name}.yaml').write_text(job_yaml, encoding='utf-8')
     return job_names
+
+
+def partition_job_name(slug: str, stage: str, queue: str = 'automatic') -> str:
+    return job_name_for(slug + '--manual' if queue == 'manual' else slug, stage)
+
+
+def create_partitioned_program(slug: str, content: str, guidelines: str, partitions: dict, *, root: Path = ROOT) -> list[str]:
+    targets = sorted({asset.get('pattern') or asset.get('host') for queue in ('automatic', 'manual')
+                      for asset in partitions[queue] if asset.get('pattern') or asset.get('host')})
+    if targets:
+        names = create_program(slug, targets, root=root, guidelines=guidelines, scope_partitions=partitions)
+    else:
+        create_manual_program(slug, content, guidelines, csv_scope_inventory(content), root=root)
+        names = []
+    program_dir = root / 'programs' / slug
+    for filename, value in (('scope-source.csv', content), ('.scope-partitions.json', json.dumps(partitions, indent=2))):
+        path = program_dir / filename
+        path.write_text(value, encoding='utf-8')
+        path.chmod(0o600)
+    for queue in ('automatic', 'manual'):
+        if not partitions[queue]:
+            continue
+        queue_targets = sorted({asset.get('pattern') or asset.get('host') for asset in partitions[queue] if asset.get('pattern') or asset.get('host')})
+        for stage in STAGES:
+            name = partition_job_name(slug, stage['stage'], queue)
+            payload = {'job': name, 'program': slug, 'stage': stage['stage'], 'type': stage['type'], 'execution_queue': queue,
+                       'manual_only': queue == 'manual', 'auto_run': queue == 'automatic', 'status': 'queued', 'job_state': 'queued',
+                       'targets': queue_targets, 'queued': queue_targets, 'assets': [], 'discovered': [], 'source_count': 0,
+                       'queue_asset_count': len(partitions[queue])}
+            output = root / 'results' / f'{name}.json'
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+        if queue == 'manual':
+            (program_dir / '.manual-workflow.json').write_text(json.dumps({'manual_only': True, 'split_queue': True,
+                                                                          'guidelines_sha256': read_guidelines(slug, root=root)[1]}), encoding='utf-8')
+    return names
 
 
 def program_identity(slug: str, *, root: Path = ROOT) -> str:

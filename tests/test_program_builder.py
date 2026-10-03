@@ -20,6 +20,134 @@ from dashboard_app import app, group_jobs_by_program, job_workflow_metadata, lis
 
 
 class ProgramBuilderTest(unittest.TestCase):
+    def test_csv_partitions_eligible_urls_manual_assets_and_out_of_scope_rows(self):
+        from program_builder import partition_csv_scope
+        content = ('identifier,asset_type,in_scope,eligible_for_bounty\n'
+                   'https://api.example.com/allowed,URL,true,true\n'
+                   'app.example.com,URL,true,true\n'
+                   '*.example.com,WILDCARD,true,true\n'
+                   'https://api.example.com/review,URL,true,false\n'
+                   'com.example.app,GOOGLE_PLAY_APP_ID,true,true\n'
+                   'https://api.example.com/query?token=private,URL,true,true\n'
+                   'outside.example.org,DOMAIN,false,true\n')
+        partitions = partition_csv_scope(content)
+        self.assertEqual(len(partitions['automatic']), 3)
+        self.assertEqual(len(partitions['manual']), 3)
+        self.assertEqual(len(partitions['excluded']), 1)
+        self.assertEqual(partitions['automatic'][0]['path'], '/allowed')
+        self.assertEqual(partitions['automatic'][1]['scope_kind'], 'exact_host')
+        self.assertEqual(partitions['automatic'][2]['pattern'], '*.example.com')
+        self.assertEqual(partitions['excluded'][0]['identifier'], 'outside.example.org')
+
+    def test_partitioned_program_has_separate_manual_jobs_and_private_scope_source(self):
+        from program_builder import create_partitioned_program, partition_csv_scope, configure_auto_run
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            content = ('identifier,asset_type,in_scope,eligible_for_bounty\n'
+                       'https://api.example.com/allowed,URL,true,true\n'
+                       'https://api.example.com/review,URL,true,false\n'
+                       'outside.example.org,DOMAIN,false,true\n')
+            partitions = partition_csv_scope(content)
+            names = create_partitioned_program('split', content, 'Automated checks allowed.', partitions, root=root)
+            self.assertEqual(len(names), 9)
+            self.assertTrue((root / 'results/split-confirm-live-web-assets.json').exists())
+            self.assertTrue((root / 'results/split--manual-confirm-live-web-assets.json').exists())
+            self.assertFalse((root / 'jobs/generated/split--manual-confirm-live-web-assets.yaml').exists())
+            create_program('split-manual', ['other.example.com'], root=root, guidelines='Authorized testing.')
+            self.assertTrue((root / 'jobs/generated/split-manual-confirm-live-web-assets.yaml').exists())
+            self.assertEqual((root / 'programs/split/scope-source.csv').stat().st_mode & 0o777, 0o600)
+            _, digest = read_guidelines('split', root=root)
+            set_active_approval('split', True, digest, root=root)
+            self.assertTrue(configure_auto_run('split', root=root)['partitions_sha256'])
+
+    def test_split_guard_allows_only_selected_exact_urls_and_preserves_exclusions(self):
+        from auto_run import AutoRunGuard
+        from program_builder import partition_csv_scope, create_partitioned_program, configure_auto_run
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            content = ('identifier,asset_type,in_scope,eligible_for_bounty\n'
+                       '*.example.com,WILDCARD,true,true\n'
+                       'https://api.example.com/allowed,URL,true,true\n'
+                       'https://api.example.com/review,URL,true,false\n'
+                       'manual.example.com,DOMAIN,true,false\n'
+                       'excluded.example.com,URL,false,false\n'
+                       'https://api.example.com/private,URL,false,false\n')
+            partitions = partition_csv_scope(content)
+            create_partitioned_program('split', content, 'Automation permitted.', partitions, root=root)
+            _, digest = read_guidelines('split', root=root)
+            set_active_approval('split', True, digest, root=root)
+            configure_auto_run('split', root=root)
+            automatic = AutoRunGuard('split', root=root)
+            self.assertTrue(automatic.permits_url('https://api.example.com/allowed'))
+            self.assertTrue(automatic.permits_url('https://other.example.com/public'))
+            self.assertFalse(automatic.permits_url('https://api.example.com/review'))
+            self.assertFalse(automatic.permits_url('https://api.example.com/private/child'))
+            self.assertFalse(automatic.permits_url('https://manual.example.com/'))
+            self.assertFalse(automatic.permits_url('https://excluded.example.com/'))
+            manual = AutoRunGuard('split', root=root, queue='manual')
+            self.assertTrue(manual.permits_url('https://api.example.com/review'))
+            self.assertFalse(manual.permits_url('https://api.example.com/allowed'))
+            self.assertFalse(manual.permits_url('https://outside.example.org/'))
+
+    def test_exact_url_auto_pipeline_never_requests_manual_or_outside_paths(self):
+        from auto_run import run_auto_pipeline
+        from program_builder import create_partitioned_program, partition_csv_scope, configure_auto_run
+        from urllib.parse import urlsplit
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            content = ('identifier,asset_type,in_scope,eligible_for_bounty\n'
+                       'https://api.example.com/allowed,URL,true,true\n'
+                       'https://api.example.com/review,URL,true,false\n'
+                       'https://api.example.com/excluded,URL,false,false\n')
+            partitions = partition_csv_scope(content)
+            create_partitioned_program('split', content, 'Automated checks permitted.', partitions, root=root)
+            _, digest = read_guidelines('split', root=root)
+            set_active_approval('split', True, digest, root=root)
+            configure_auto_run('split', root=root)
+            calls = []
+            now = [0.0]
+
+            class Response:
+                headers = {'Content-Type': 'application/json'}
+                def __init__(self, url): self.url = url
+                def __enter__(self): return self
+                def __exit__(self, *args): return False
+                def getcode(self): return 200
+                def geturl(self): return self.url
+                def read(self, *args): return b'{"public":true}'
+
+            def fake_open(req, **kwargs):
+                calls.append((req.full_url, now[0]))
+                return Response(req.full_url)
+
+            def fake_sleep(delay):
+                now[0] += delay
+
+            with patch.object(worker, 'ROOT', root), patch.object(worker, 'RESULTS_DIR', root / 'results'), \
+                 patch.object(worker, 'RUNNING_DIR', root / 'results/.running'), \
+                 patch.object(worker, '_resolve_host_ips', return_value={'203.0.113.9'}):
+                automatic = run_auto_pipeline('split', root=root, open_request=fake_open,
+                                              sleep_fn=fake_sleep, monotonic_fn=lambda: now[0])
+                self.assertEqual(len(automatic), 9)
+                self.assertTrue(all(result['job_state'] == 'completed' for result in automatic))
+                self.assertTrue(calls)
+                self.assertEqual({url for url, _ in calls}, {'https://api.example.com/allowed'})
+                manual_pending = json.loads((root / 'results/split--manual-passive-web-discovery.json').read_text())
+                self.assertEqual(manual_pending['job_state'], 'queued')
+                calls.clear()
+                first = run_auto_pipeline('split', root=root, queue='manual', job_name='split--manual-passive-web-discovery',
+                                          force=True, open_request=fake_open, sleep_fn=fake_sleep, monotonic_fn=lambda: now[0])
+                self.assertEqual(first[0]['job_state'], 'completed')
+                self.assertEqual(calls, [])
+                run_auto_pipeline('split', root=root, queue='manual', job_name='split--manual-passive-dns-discovery',
+                                  force=True, open_request=fake_open, sleep_fn=fake_sleep, monotonic_fn=lambda: now[0])
+                checked = run_auto_pipeline('split', root=root, queue='manual', job_name='split--manual-confirm-live-web-assets',
+                                            force=True, open_request=fake_open, sleep_fn=fake_sleep, monotonic_fn=lambda: now[0])
+                self.assertEqual(checked[0]['job_state'], 'completed')
+                self.assertEqual({url for url, _ in calls}, {'https://api.example.com/review'})
+                with self.assertRaises(PermissionError):
+                    run_auto_pipeline('split', root=root, queue='manual')
+
     def test_auto_run_policy_defaults_and_testing_restrictions(self):
         from program_builder import auto_run_policy
         policy = auto_run_policy('Automated testing is permitted. Respect scope exclusions.')
@@ -794,12 +922,12 @@ class ProgramBuilderTest(unittest.TestCase):
             self.assertEqual(results[0]['assets'][0]['evidence'], ['partial observation'])
             self.assertFalse((root / 'results/.running/auto-program-automatic.lock').exists())
 
-    def test_auto_run_upload_rejects_bans_or_manual_scope_without_creating_program(self):
+    def test_auto_run_upload_rejects_automation_bans_without_creating_program(self):
         with TemporaryDirectory() as directory, patch('dashboard_app.ROOT', Path(directory)), \
              patch('dashboard_app.subprocess.Popen') as launch, \
              patch.dict('dashboard_app.os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token'}):
             with app.test_client() as client:
-                for kind, rules in [('WILDCARD', 'No automated scans.'), ('URL', 'Automation allowed.')]:
+                for kind, rules in [('WILDCARD', 'No automated scans.'), ('URL', 'No automated testing.')]:
                     with self.subTest(kind=kind):
                         response = client.post('/programs/upload', headers={'X-BugBounty-Token': 'test-token'}, data={
                             'program_name': 'Rejected', 'auto_run': 'true',
@@ -808,6 +936,62 @@ class ProgramBuilderTest(unittest.TestCase):
                         })
                         self.assertEqual(response.status_code, 400)
                         self.assertFalse((Path(directory) / 'programs/rejected').exists())
+                launch.assert_not_called()
+
+    def test_upload_splits_url_assets_and_starts_only_automatic_queue(self):
+        with TemporaryDirectory() as directory, patch('dashboard_app.ROOT', Path(directory)), \
+             patch('dashboard_app.JOBS_DIR', Path(directory) / 'jobs'), \
+             patch('dashboard_app.RESULTS_DIR', Path(directory) / 'results'), \
+             patch('dashboard_app.RUNNING_DIR', Path(directory) / 'results/.running'), \
+             patch('dashboard_app.subprocess.Popen') as launch, \
+             patch.dict('dashboard_app.os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token'}):
+            launch.return_value.pid = 9876
+            headers = {'X-BugBounty-Token': 'test-token'}
+            content = ('identifier,asset_type,in_scope,eligible_for_bounty\n'
+                       'https://api.example.com/allowed,URL,true,true\n'
+                       'https://api.example.com/review,URL,true,false\n'
+                       'com.example.app,GOOGLE_PLAY_APP_ID,true,true\n'
+                       'https://api.example.com/private,URL,false,false\n')
+            with app.test_client() as client:
+                response = client.post('/programs/upload', headers=headers, data={'program_name': 'Split', 'auto_run': 'true',
+                    'guidelines_text': 'Automated testing permitted.', 'scope_file': (io.BytesIO(content.encode()), 'scope.csv')})
+                self.assertEqual(response.status_code, 202)
+                self.assertEqual(response.get_json()['asset_queues'], {'automatic': 1, 'manual': 2, 'excluded': 1})
+                launch.assert_called_once()
+                self.assertEqual(launch.call_args.args[0][-3:], ['--program', 'split', '--auto-run'])
+                root = Path(directory)
+                self.assertTrue((root / 'results/split--manual-passive-web-discovery.json').exists())
+                page = client.get('/')
+                self.assertIn(b'Automatic assets: 1', page.data)
+                self.assertIn(b'Manual asset queue', page.data)
+                launch.reset_mock()
+                requested = client.post('/jobs/split--manual-passive-web-discovery/rerun', headers=headers)
+                self.assertEqual(requested.status_code, 202)
+                self.assertIn('--queue', launch.call_args.args[0])
+                self.assertIn('manual', launch.call_args.args[0])
+                launch.reset_mock()
+                with patch('dashboard_app._lock_is_active', return_value=True):
+                    self.assertEqual(client.post('/jobs/split--manual-passive-web-discovery/rerun', headers=headers).status_code, 409)
+                launch.assert_not_called()
+                with patch('program_builder.subprocess.run', return_value=subprocess.CompletedProcess(['ps'], 0, stdout='')):
+                    deleted = client.delete('/programs/split', headers=headers, json={'confirmation': 'split'})
+                self.assertEqual(deleted.status_code, 200)
+                self.assertFalse((root / 'programs/split').exists())
+                self.assertFalse(list((root / 'results').glob('split-*.json')))
+
+    def test_app_only_opt_in_creates_manual_inventory_without_launching_worker(self):
+        with TemporaryDirectory() as directory, patch('dashboard_app.ROOT', Path(directory)), \
+             patch('dashboard_app.JOBS_DIR', Path(directory) / 'jobs'), \
+             patch('dashboard_app.RESULTS_DIR', Path(directory) / 'results'), \
+             patch('dashboard_app.subprocess.Popen') as launch, \
+             patch.dict('dashboard_app.os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token'}):
+            with app.test_client() as client:
+                response = client.post('/programs/upload', headers={'X-BugBounty-Token': 'test-token'}, data={
+                    'program_name': 'Apps', 'auto_run': 'true', 'guidelines_text': 'Automated testing permitted.',
+                    'scope_file': (io.BytesIO(b'identifier,asset_type,in_scope\ncom.example.app,GOOGLE_PLAY_APP_ID,true\n'), 'scope.csv')})
+                self.assertEqual(response.status_code, 202)
+                self.assertEqual(response.get_json()['status'], 'pending_manual')
+                self.assertEqual(response.get_json()['asset_queues']['automatic'], 0)
                 launch.assert_not_called()
 
     def test_delete_uploaded_bounty_removes_owned_data_and_allows_clean_reupload(self):

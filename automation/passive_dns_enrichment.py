@@ -177,8 +177,8 @@ def provider_status(domain: str) -> List[Dict[str, object]]:
     return statuses
 
 
-def passive_dns_enrichment(program_name: str) -> Dict[str, object]:
-    patterns = load_allowed_patterns(program_name)
+def passive_dns_enrichment(program_name: str, allowed_patterns=None) -> Dict[str, object]:
+    patterns = load_allowed_patterns(program_name) if allowed_patterns is None else allowed_patterns
     if not patterns:
         return {
             'job': f'{program_name}-passive-dns',

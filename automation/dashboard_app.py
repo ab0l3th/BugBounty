@@ -22,7 +22,7 @@ AUTOMATION_DIR = Path(__file__).resolve().parent
 if str(AUTOMATION_DIR) not in sys.path:
   sys.path.insert(0, str(AUTOMATION_DIR))
 
-from program_builder import active_approved, auto_run_policy, configure_auto_run, create_manual_program, create_program, csv_scope_inventory, delete_uploaded_program, load_manual_analysis, parse_scope, program_identity, read_guidelines, set_active_approval, slug_from_program_name
+from program_builder import active_approved, auto_run_policy, configure_auto_run, create_manual_program, create_partitioned_program, create_program, csv_scope_inventory, delete_uploaded_program, load_manual_analysis, load_scope_partitions, parse_scope, partition_csv_scope, program_identity, read_guidelines, set_active_approval, slug_from_program_name
 from stages import ACTIVE_STAGES, STAGE_BY_ID, STAGES, job_name_for, stage_for_job_name
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -849,6 +849,16 @@ def rerun_job(job_name: str) -> Dict[str, Any]:
       if stage_id not in guard.policy['allowed_stages']:
         raise PermissionError(guard.policy['blocked_stages'].get(stage_id, 'Stage not permitted for auto-run'))
     if match.get('raw', {}).get('manual_only'):
+      if load_scope_partitions(program, root=ROOT) is not None:
+        from manual_workflow import stage_block_reason
+        reason = stage_block_reason(program, stage_for_job_name(job_name), root=ROOT)
+        if reason:
+          raise PermissionError(reason)
+        process = subprocess.Popen([sys.executable, str(ROOT / 'automation' / 'worker.py'), '--program', program,
+                      '--auto-run', '--queue', 'manual', '--job', job_name, '--force'],
+                       cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, start_new_session=True)
+        return {'status': 'queued', 'job': job_name, 'program': program, 'pid': process.pid}
       from manual_workflow import stage_block_reason
       stage_id = stage_for_job_name(job_name)
       reason = stage_block_reason(program, stage_id, root=ROOT)
@@ -1115,6 +1125,7 @@ def index():
           manual_programs.append({'slug': inventory_path.parent.name,
                       'name': inventory.get('display_name', inventory_path.parent.name),
                       'approved': active_approved(inventory_path.parent.name, root=ROOT),
+                      'split_queue': load_scope_partitions(inventory_path.parent.name, root=ROOT) is not None,
                         'workflow_queued': (inventory_path.parent / '.manual-workflow.json').exists() and all(
                           job_name_for(inventory_path.parent.name, stage['stage']) in manual_job_names for stage in STAGES),
                       'eligible_asset_types': inventory['eligible_asset_types']})
@@ -1131,11 +1142,17 @@ def index():
                 (JOBS_DIR / 'generated' / f"{job['program']}-passive-web-discovery.yaml").exists()}
     approved_programs = {program for program in generated_programs if active_approved(program, root=ROOT)}
     auto_programs = {}
-    for program in generated_programs:
+    for program in grouped_jobs:
       path = ROOT / 'programs' / program / '.auto-run.json'
       if path.is_file():
         auto_programs[program] = read_result_file(path)
-    pending_manual_programs = [item for item in manual_programs if not (item['approved'] and item['workflow_queued'])]
+    asset_queues = {}
+    for program in grouped_jobs:
+      partitions = load_scope_partitions(program, root=ROOT)
+      if partitions is not None:
+            asset_queues[program] = {'counts': {queue: len(partitions[queue]) for queue in ('automatic', 'manual', 'excluded')},
+                                     'manual': partitions['manual'], 'excluded': partitions['excluded']}
+    pending_manual_programs = [item for item in manual_programs if not item.get('split_queue') and not (item['approved'] and item['workflow_queued'])]
     deletable_programs = generated_programs | {item['slug'] for item in manual_programs}
     return render_template_string('''
     <!doctype html>
@@ -1323,6 +1340,14 @@ def index():
             {% set program_summary = summarize_program_jobs(program_jobs) %}
             <details class="program-group" id="manual-workflow-{{ program_name }}" data-state-key="program-{{ program_name }}">
               <summary class="program-header">{{ program_label(program_name) }} <span class="program-count">({{ program_summary.jobs }} jobs)</span></summary>
+              {% if program_name in asset_queues %}
+                <p class="meta">Automatic assets: {{ asset_queues[program_name].counts.automatic }}; operator-started/manual verification: {{ asset_queues[program_name].counts.manual }}; excluded: {{ asset_queues[program_name].counts.excluded }}</p>
+                <details data-state-key="asset-partitions-{{ program_name }}"><summary>Manual and excluded asset inventory</summary>
+                  {% for queue in ['manual', 'excluded'] %}{% for asset in asset_queues[program_name][queue] %}
+                    <p><strong>{{ queue|capitalize }}</strong> <code>{{ asset.display_identifier }}</code> ({{ asset.asset_type }}): {{ asset.reason }}</p>
+                  {% endfor %}{% endfor %}
+                </details>
+              {% endif %}
               {% if program_name in deletable_programs %}
                 <p><button type="button" class="delete-program" data-program="{{ program_name }}">Delete bounty</button><span class="delete-program-status" role="status"></span></p>
               {% endif %}
@@ -1353,6 +1378,7 @@ def index():
                     <div class="job-header">
                       <div class="job-title-wrap">
                         <h3 class="job-name">{{ job_title_label(job.name) }}</h3>
+                        {% if job.raw.execution_queue %}<span class="meta">{{ 'Manual asset queue' if job.raw.execution_queue == 'manual' else 'Automatic asset queue' }} ({{ job.raw.queue_asset_count }} assets)</span>{% endif %}
                         <div class="job-summary"><strong>Targets:</strong> {{ job.targets|length }} &nbsp; <strong>Discovered:</strong> {{ job.discovered|length }}{% if job.raw.total_candidates is defined %} &nbsp; <strong>Checked:</strong> {{ job.raw.processed_count or 0 }} / {{ job.raw.total_candidates }}{% endif %} &nbsp; <strong>Status:</strong> {{ job.job_state }}</div>
                       </div>
                       <div class="status {{ 'ok' if job.job_state == 'completed' else 'warn' if job.job_state == 'running' else 'bad' }}">{{ job.job_state }}</div>
@@ -2079,7 +2105,7 @@ def index():
       </script>
     </body>
     </html>
-    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, manual_programs=manual_programs, pending_manual_programs=pending_manual_programs, generated_programs=generated_programs, approved_programs=approved_programs, auto_programs=auto_programs, deletable_programs=deletable_programs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs, workflow_order=workflow_order, highest_severity=highest_severity, asset_render_cap=ASSET_RENDER_CAP, evidence_render_cap=EVIDENCE_RENDER_CAP, thread_render_cap=THREAD_RENDER_CAP)
+    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, manual_programs=manual_programs, pending_manual_programs=pending_manual_programs, generated_programs=generated_programs, approved_programs=approved_programs, auto_programs=auto_programs, asset_queues=asset_queues, deletable_programs=deletable_programs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs, workflow_order=workflow_order, highest_severity=highest_severity, asset_render_cap=ASSET_RENDER_CAP, evidence_render_cap=EVIDENCE_RENDER_CAP, thread_render_cap=THREAD_RENDER_CAP)
 
 
 @app.route('/jobs/<job_name>/rerun', methods=['POST'])
@@ -2128,21 +2154,26 @@ def upload_program():
     if automatic not in {'', 'false', '0', 'true', '1', 'on'}:
       return jsonify({'status': 'error', 'message': 'Invalid auto-run acknowledgment'}), 400
     automatic = automatic in {'true', '1', 'on'}
+    partitions = None
     try:
         if automatic:
             auto_run_policy(guidelines)
         scope_content = contents.decode('utf-8-sig')
         if Path(uploaded.filename).suffix.lower() == '.csv':
-          inventory = dict(csv_scope_inventory(scope_content), display_name=request.form['program_name'].strip())
-          if inventory['manual_only']:
-              if automatic:
-                raise ValueError('URL/app scope is manual-only; uncheck auto-run and approve its manual workflow')
+          if automatic:
+            partitions = partition_csv_scope(scope_content)
+            jobs = create_partitioned_program(slug, scope_content, guidelines, partitions, root=ROOT)
+            targets = [asset.get('pattern') or asset.get('host') for asset in partitions['automatic']]
+          else:
+            inventory = dict(csv_scope_inventory(scope_content), display_name=request.form['program_name'].strip())
+            if inventory['manual_only']:
               create_manual_program(slug, scope_content, guidelines, inventory, root=ROOT)
               return jsonify({'status': 'manual_review', 'program': slug, 'jobs': [],
-                                'eligible_assets': sum(inventory['eligible_asset_types'].values()),
-                                'message': 'Manual-only inventory created; no scans queued'}), 202
-        _, targets = parse_scope(uploaded.filename, scope_content)
-        jobs = create_program(slug, targets, root=ROOT, guidelines=guidelines)
+                      'eligible_assets': sum(inventory['eligible_asset_types'].values()),
+                      'message': 'Manual-only inventory created; no scans queued'}), 202
+        if partitions is None:
+          _, targets = parse_scope(uploaded.filename, scope_content)
+          jobs = create_program(slug, targets, root=ROOT, guidelines=guidelines)
         policy = None
         if automatic:
           _, digest = read_guidelines(slug, root=ROOT)
@@ -2157,8 +2188,9 @@ def upload_program():
     if automatic:
       command.append('--auto-run')
     try:
-      subprocess.Popen(command, cwd=str(ROOT), stdin=subprocess.DEVNULL,
-               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+      if partitions is None or partitions['automatic']:
+        subprocess.Popen(command, cwd=str(ROOT), stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError:
       return jsonify({'status': 'error', 'program': slug, 'message': 'Program saved but worker could not start; retry through its workflow'}), 500
     payload = {'status': 'auto_running' if automatic else 'pending_review', 'program': slug,
@@ -2167,6 +2199,10 @@ def upload_program():
       payload.update({'requests_per_second': policy['requests_per_second'], 'max_workers': policy['max_workers'],
               'blocked_stages': policy['blocked_stages'],
               'message': f"{request.form['program_name'].strip()} auto-run started: {policy['requests_per_second']:g} request/second, {policy['max_workers']} workers maximum"})
+    if partitions is not None:
+        counts = {queue: len(partitions[queue]) for queue in ('automatic', 'manual', 'excluded')}
+        payload.update({'asset_queues': counts, 'status': 'auto_running' if counts['automatic'] else 'pending_manual',
+                        'message': f"{counts['automatic']} automatic assets, {counts['manual']} manual assets, {counts['excluded']} excluded; manual work starts only when requested"})
     return jsonify(payload), 202
 
 
@@ -2252,7 +2288,7 @@ def approve_program_active(slug: str):
     started = False
     manual_program = (ROOT / 'programs' / slug / 'scope-inventory.json').is_file()
     manual_jobs = []
-    if data['approved'] and manual_program:
+    if data['approved'] and manual_program and load_scope_partitions(slug, root=ROOT) is None:
       from manual_workflow import queue_manual_workflow
       manual_jobs = queue_manual_workflow(slug, root=ROOT)
     if data['approved'] and automatic and not _lock_is_active(f'auto-program-{slug}'):

@@ -64,7 +64,18 @@ For a new domain/wildcard bounty, select **Auto-run permitted stages** when
 uploading scope and guidelines. This checkbox explicitly acknowledges the supplied
 guidelines and starts a program-scoped pipeline without a second approval click.
 Leave it unchecked to keep the existing passive discovery and approval workflow.
-URL/app-only scope remains manual-only and cannot opt in through this checkbox.
+For opted-in CSV scope, eligible URL/endpoints, domains, and wildcards are
+partitioned per asset. The automatic subset starts immediately; in-scope assets
+needing operator review remain in a separate manual queue under the same bounty.
+App IDs, unsupported assets, and URLs carrying query/fragment data remain manual
+verification inventory. Explicitly out-of-scope or unconfirmed rows are excluded,
+never converted into scan targets. Bounty eligibility alone is not testing permission.
+
+The automatic and manual jobs have separate result/dependency names. Manual work
+requires an explicit individual stage start, and both queues share the program
+run lock and traffic policy. Automatic requests cannot reach a manual/excluded
+host or path through a broader wildcard. Full URLs retain their exact scheme,
+host, port, and path; they do not silently become domain-wide scope.
 
 Auto-run advances the canonical stages in dependency order. Recognized testing
 bans mark stages blocked; stages requiring their results remain waiting. Defaults

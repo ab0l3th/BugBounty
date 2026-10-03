@@ -9,7 +9,7 @@ from urllib.error import URLError
 from urllib.parse import urlsplit
 
 from manual_url_checker import ApprovedScopeClient
-from program_builder import ROOT, active_approved, load_manual_analysis, read_guidelines
+from program_builder import ROOT, active_approved, load_manual_analysis, load_scope_partitions, partition_job_name, read_guidelines
 from stages import STAGES, STAGE_BY_ID, job_name_for
 import worker
 
@@ -53,6 +53,26 @@ def stage_block_reason(slug: str, stage_id: str, *, root: Path = ROOT) -> str | 
         return 'Approve the manual workflow before starting a step'
     if workflow.get('guidelines_sha256') != digest:
         return 'Guidelines changed; approve the current manual workflow again'
+    partitions = load_scope_partitions(slug, root=root)
+    if partitions is not None:
+        from auto_run import AutoRunGuard
+        try:
+            guard = AutoRunGuard(slug, root=root, queue='manual')
+        except (OSError, ValueError, PermissionError) as exc:
+            return str(exc)
+        if not guard.domain_scope and not guard.url_assets:
+            return 'Manual assets need independent verification; no executable web targets in this queue'
+        if stage_id not in guard.policy['allowed_stages']:
+            return guard.policy['blocked_stages'].get(stage_id, 'Guidelines prohibit this step')
+        for dependency in STAGE_BY_ID[stage_id]['depends_on']:
+            path = root / 'results' / f'{partition_job_name(slug, dependency, "manual")}.json'
+            try:
+                result = json.loads(path.read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                return f'Complete manual {dependency} first'
+            if result.get('job_state') != 'completed' or result.get('guidelines_sha256') != digest:
+                return f'Complete manual {dependency} under current guidelines first'
+        return None
     analysis = load_manual_analysis(slug, root=root)
     if stage_id != 'passive-web-discovery' and analysis['policy']['automated_requests'] != 'manual_approval_required':
         return analysis['policy']['reason']
