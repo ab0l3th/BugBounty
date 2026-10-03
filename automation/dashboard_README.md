@@ -148,6 +148,16 @@ eligible hostname coverage, not traffic rates, excluded assets, or permissions.
 Large lists and full TCP enumeration can take many hours at low permitted rates;
 progress counters and partial observations remain available during execution.
 
+## Vhost Transport
+
+Vhost requests use the candidate hostname for URL, Host, and TLS SNI while
+connecting to the already scoped/resolved origin IP. TLS certificate verification
+is not disabled. Unsupported proxy pinning is reported rather than bypassed.
+EdgeSuite/Akamai "Invalid URL" pages and login redirects are rejected probe
+observations, not confirmed vhosts; repeated edge errors are grouped by origin.
+Known edge rejections are not retried over HTTP. Running jobs retain their loaded
+code until they finish or are explicitly restarted.
+
 ## API Lists and Prefixes
 
 API discovery includes the pinned SecLists Java-Spring-Boot list in

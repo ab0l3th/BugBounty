@@ -177,11 +177,13 @@ def run_manual_stage(slug: str, stage_id: str, *, root: Path = ROOT, client=None
                     return addresses
 
                 def scoped_probe(address, host_header, scheme='https'):
-                    authority = f'[{address}]' if ':' in address else address
-                    response = client.request(f'{scheme}://{authority}/', method='GET', headers={'Host': host_header}, read_body=True)
-                    return {'host_header': host_header, 'ip': address, 'status_code': response['status'],
-                            'url': f'{scheme}://{host_header}/', 'source': f"{host_header} -> {response['status']} via {address}",
-                            'length': len(response['body']), 'ok': bool(response['status'] and response['status'] < 400 and not response.get('redirect_stop'))}
+                    target = f'{scheme}://{host_header}/'
+                    response = client.request(target, method='GET', headers={'Host': host_header}, read_body=True, connect_ip=address)
+                    signature = worker._vhost_response_signature(target, response['final_url'], response['status'] or 0,
+                                                                  response['headers'], response['body'].encode(), host_header, address)
+                    if response.get('redirect_stop'):
+                        signature.update({'ok': False, 'status': response['redirect_stop']})
+                    return signature
 
                 result.update(worker._run_vhost_discovery([{'domain': host} for host in full_hosts], allowed_scope=full_hosts,
                                                           probe=scoped_probe, resolver=scoped_resolve, workers=1, progress=progress))

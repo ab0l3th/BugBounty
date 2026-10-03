@@ -296,6 +296,14 @@ class ManualUrlCheckerTest(unittest.TestCase):
             self.assertEqual(response['status'], 200)
             self.assertEqual(calls, [('https://203.0.113.9/', 'app.example.com'), ('https://203.0.113.9/public', 'app.example.com')])
 
+    def test_manual_vhost_pinning_requires_a_resolved_approved_origin(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._make_approved_program(root)
+            client = ApprovedScopeClient('sample', root=root, open_request=lambda *args, **kwargs: self.fail('Unapproved origin must not be contacted'))
+            response = client.request('https://app.example.com/login', method='GET', headers={'Host': 'app.example.com'}, connect_ip='203.0.113.9')
+            self.assertEqual(response['error'], 'UnapprovedVhostOrigin')
+
     def test_explicit_port_ban_still_blocks_full_host_scan(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)

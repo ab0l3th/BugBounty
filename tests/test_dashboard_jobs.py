@@ -1260,6 +1260,69 @@ class DashboardJobMetadataTest(unittest.TestCase):
         self.assertIn('/service/resource', calls)
         self.assertFalse(any('/never' in path for path in calls))
 
+    def test_edgesuite_invalid_url_response_is_never_vhost_evidence(self):
+        import worker
+        body = b'# Invalid URL\nThe requested URL "[no URL]", is invalid.Reference #9.92f8da17.1790993854.1f437cdb\nhttps://errors.edgesuite.net/9.92f8da17.1790993854.1f437cdb'
+        for code in (200, 400, 403):
+            with self.subTest(code=code):
+                result = worker._vhost_response_signature('https://203.0.113.9/', 'https://203.0.113.9/', code,
+                                                          {'Server': 'AkamaiGHost'}, body, 'app.example.com', '203.0.113.9')
+                self.assertFalse(result['ok'])
+                self.assertEqual(result['status'], 'cdn_rejected')
+        result = worker._run_vhost_discovery([{'domain': 'app.example.com'}], allowed_scope=['app.example.com'],
+                                             resolver=lambda host: {'203.0.113.9'}, workers=1,
+                                             probe=lambda *args, **kwargs: {'ok': False, 'status': 'cdn_rejected', 'length': 123})
+        self.assertEqual(result['assets'][0]['status'], 'no_valid_vhost_response')
+        self.assertEqual(result['discovered'], [])
+
+    def test_pinned_vhost_tls_connects_origin_ip_but_uses_hostname_sni(self):
+        import ssl
+        from unittest.mock import MagicMock
+        from vhost_transport import PinnedHTTPSConnection, vhost_request
+        context = MagicMock()
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+        with patch('http.client.socket.create_connection', return_value=MagicMock()) as connect:
+            connection = PinnedHTTPSConnection('app.example.com', connect_ip='2001:db8::9', context=context, timeout=8)
+            connection.connect()
+        self.assertEqual(connect.call_args.args[0], ('2001:db8::9', 443))
+        self.assertEqual(context.wrap_socket.call_args.kwargs['server_hostname'], 'app.example.com')
+        self.assertTrue(context.check_hostname)
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        req = vhost_request('app.example.com', '2001:db8::9')
+        self.assertEqual(req.full_url, 'https://app.example.com/')
+        self.assertEqual(req.get_header('Host'), 'app.example.com')
+        self.assertEqual(req._vhost_connect_ip, '2001:db8::9')
+
+    def test_legacy_vhost_redirect_preserves_sni_origin_and_stays_on_host(self):
+        from vhost_transport import VhostRedirectHandler, vhost_request
+        from urllib.error import URLError
+        from email.message import Message
+        req = vhost_request('app.example.com', '203.0.113.9')
+        handler = VhostRedirectHandler()
+        same = handler.redirect_request(req, None, 302, 'redirect', Message(), 'https://app.example.com/public')
+        self.assertEqual(same._vhost_connect_ip, '203.0.113.9')
+        self.assertEqual(same.get_header('Host'), 'app.example.com')
+        for target in ('https://outside.example.org/', 'https://app.example.com/login', 'http://app.example.com/'):
+            with self.subTest(target=target), self.assertRaises(URLError):
+                handler.redirect_request(req, None, 302, 'redirect', Message(), target)
+
+    def test_repeated_cdn_rejections_are_grouped_and_not_retried_over_http(self):
+        import worker
+        calls = []
+
+        def probe(address, host, **kwargs):
+            calls.append((address, host, kwargs))
+            return {'ok': False, 'status': 'cdn_rejected', 'status_code': 403, 'host_header': host, 'length': 150}
+
+        result = worker._run_vhost_discovery([{'domain': 'app.example.com'}], allowed_scope=['*.example.com'],
+                                             resolver=lambda host: {'203.0.113.9'}, probe=probe, wordlist=['api', 'admin'], workers=1)
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(not options for _, _, options in calls))
+        self.assertEqual(len(result['assets'][0]['evidence']), 1)
+        self.assertEqual(result['assets'][0]['rejected_probes'], 3)
+        self.assertEqual(result['discovered'], [])
+
     def test_rerun_launches_only_the_requested_job(self):
         with patch('dashboard_app.subprocess.Popen', return_value=type('Proc', (), {'pid': 4321})()) as mock_popen, \
              patch.dict('os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token'}):

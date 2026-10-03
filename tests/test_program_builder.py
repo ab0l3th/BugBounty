@@ -165,6 +165,35 @@ class ProgramBuilderTest(unittest.TestCase):
             with self.subTest(rules=rules), self.assertRaises(ValueError):
                 auto_run_policy(rules)
 
+    def test_auto_vhost_guard_requires_scoped_origin_and_retains_pinning_on_relative_redirect(self):
+        from auto_run import AutoRunGuard
+        from program_builder import configure_auto_run
+        from vhost_transport import vhost_request
+        from urllib.request import HTTPRedirectHandler
+        from urllib.error import URLError
+        from email.message import Message
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_program('automatic', ['*.example.com'], root=root, guidelines='Automated checks permitted.')
+            _, digest = read_guidelines('automatic', root=root)
+            set_active_approval('automatic', True, digest, root=root)
+            configure_auto_run('automatic', root=root)
+            guard = AutoRunGuard('automatic', root=root, sleep_fn=lambda delay: None, monotonic_fn=lambda: 0)
+            guard.scope = ['*.example.com']
+            guard.stage = 'vhost-discovery'
+            req = vhost_request('app.example.com', '203.0.113.9')
+            with self.assertRaises(URLError):
+                guard.before_http(req)
+            guard.ip_owners['203.0.113.9'] = {'origin.example.com'}
+            guard.before_http(req)
+            redirect = next(handler for handler in guard.open_request.__self__.handlers if isinstance(handler, HTTPRedirectHandler))
+            same = redirect.redirect_request(req, None, 302, 'redirect', Message(), 'https://app.example.com/public')
+            self.assertEqual(same._vhost_connect_ip, '203.0.113.9')
+            other = redirect.redirect_request(req, None, 302, 'redirect', Message(), 'https://other.example.com/public')
+            self.assertFalse(hasattr(other, '_vhost_connect_ip'))
+            with self.assertRaises(URLError):
+                guard.before_http(vhost_request('outside.example.org', '203.0.113.9'))
+
     def test_auto_run_configuration_requires_current_approval_and_domain_scope(self):
         from program_builder import configure_auto_run
         with TemporaryDirectory() as directory:

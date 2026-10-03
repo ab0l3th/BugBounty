@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 from program_builder import ROOT, active_approved, auto_run_policy, load_scope_partitions, partition_job_name, read_guidelines
 from scope_validator import is_in_scope, parse_scope_pattern
 from stages import STAGES, ACTIVE_STAGES, job_name_for
+from vhost_transport import vhost_opener
 
 
 PUBLIC_DISCOVERY_HOSTS = {'api.certspotter.com', 'api.hackertarget.com', 'crt.sh', 'dns.google'}
@@ -61,11 +62,13 @@ class AutoRunGuard:
                 if redirected is not None:
                     if parsed.hostname != urlsplit(req.full_url).hostname:
                         redirected.remove_header('Host')
+                    elif getattr(req, '_vhost_connect_ip', None):
+                        redirected._vhost_connect_ip = req._vhost_connect_ip
                     redirected._auto_redirect_count = count
                     guard.before_http(redirected)
                 return redirected
 
-        self.open_request = open_request or request.build_opener(ScopedRedirect()).open
+        self.open_request = open_request or vhost_opener(ScopedRedirect()).open
 
     def check_approval(self):
         _, digest = read_guidelines(self.slug, root=self.root)
@@ -134,6 +137,9 @@ class AutoRunGuard:
         host = parsed.hostname
         header_host = req.get_header('Host')
         allowed = self.permits_url(req.full_url)
+        pinned_origin = getattr(req, '_vhost_connect_ip', None)
+        if pinned_origin and not (self.stage == 'vhost-discovery' and self.ip_owners.get(pinned_origin)):
+            raise error.URLError('Vhost origin was not resolved from approved program scope')
         if header_host:
             virtual_url = parsed._replace(netloc=header_host + (f':{parsed.port}' if parsed.port else '')).geturl()
             allowed = self.permits_url(virtual_url) and is_in_scope(header_host, self.domain_scope if self.partitions is not None else self.scope) and (host == header_host or header_host in self.ip_owners.get(host, set())

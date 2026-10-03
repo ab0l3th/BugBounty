@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
 from program_builder import active_approved, load_manual_analysis, read_guidelines
+from vhost_transport import vhost_opener
 
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = ROOT / 'results'
@@ -38,7 +39,7 @@ class ApprovedScopeClient:
         if policy['automated_requests'] != 'manual_approval_required':
             raise PermissionError(policy['reason'])
         self.rate = min(MAX_REQUESTS_PER_SECOND, policy['stated_max_requests_per_second'])
-        self.open_request = open_request or urllib.request.build_opener(NoRedirect()).open
+        self.open_request = open_request or vhost_opener(NoRedirect()).open
         self.sleep = sleep_fn
         self.monotonic = monotonic_fn
         self.last_request = None
@@ -84,7 +85,7 @@ class ApprovedScopeClient:
         self.check_approval()
         self.last_request = self.monotonic()
 
-    def request(self, url, *, method='HEAD', headers=None, read_body=False, data=None):
+    def request(self, url, *, method='HEAD', headers=None, read_body=False, data=None, connect_ip=None):
         with self.lock:
             visited = set()
             redirects = []
@@ -97,6 +98,10 @@ class ApprovedScopeClient:
                 visited.add(target)
                 body_data = data.encode('utf-8') if isinstance(data, str) else data
                 request = urllib.request.Request(target, headers=target_headers, method=method, data=body_data)
+                if connect_ip and urlsplit(target).hostname == urlsplit(url).hostname:
+                    if connect_ip not in self.ip_owners:
+                        return {'status': None, 'error': 'UnapprovedVhostOrigin', 'headers': {}, 'body': '', 'final_url': target, 'redirects': redirects}
+                    request._vhost_connect_ip = connect_ip
                 try:
                     response = self.open_request(request, timeout=8)
                 except urllib.error.HTTPError as exc:

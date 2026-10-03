@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import http.client
+import hashlib
 import json
 import os
 import re
@@ -21,6 +22,7 @@ from urllib.parse import quote, urlsplit
 from scope_validator import is_in_scope, parse_scope_pattern
 from stages import ACTIVE_STAGES, LEGACY_NAME_TO_STAGE, STAGE_BY_ID, job_name_for, stage_for_job_name
 from program_builder import active_approved, parse_scope
+from vhost_transport import vhost_opener, vhost_request
 
 ROOT = Path(__file__).resolve().parent.parent
 JOBS_DIR = ROOT / 'jobs'
@@ -28,6 +30,7 @@ RESULTS_DIR = ROOT / 'results'
 RUNNING_DIR = RESULTS_DIR / '.running'
 REPORTS_DIR = RESULTS_DIR / 'reports'
 DEFAULT_PROGRAM = 'american-airlines'
+_ORIGINAL_URLOPEN = urllib_request.urlopen
 WORKFLOW_SEQUENCE = {
     'aa-passive-discovery': {'step': 1, 'depends_on': []},
     'american-airlines-passive-dns': {'step': 2, 'depends_on': ['aa-passive-discovery']},
@@ -715,33 +718,46 @@ def _select_vhost_candidates(service_assets: list[dict]) -> list[dict]:
     return candidates
 
 
+def _vhost_response_signature(url: str, final_url: str, code: int, headers: dict, body: bytes, host_header: str, ip: str) -> dict:
+    text = body.decode('utf-8', 'replace')
+    lowered = text.lower()
+    result = {'host_header': host_header, 'ip': ip, 'status_code': code, 'length': len(body),
+              'server': str(headers.get('Server', headers.get('server', ''))), 'url': url, 'ok': False}
+    if 'invalid url' in lowered and ('[no url]' in lowered or 'errors.edgesuite.net' in lowered or 'requested url' in lowered):
+        result.update({'status': 'cdn_rejected', 'source': f'{host_header} (CDN rejected request)',
+                       'reason': 'Edge Invalid URL response is not vhost evidence'})
+    elif _is_login_redirect(url, final_url, text):
+        result.update({'status': 'login_redirect', 'source': f'{host_header} (login redirect)',
+                       'login': _login_page_fingerprint(url, final_url, text)})
+    elif code not in {200, 201, 202, 204, 301, 302, 303, 307, 308, 401, 403}:
+        result.update({'status': 'no_vhost_response', 'source': f'{host_header} ({code}; no vhost evidence)'})
+    else:
+        result.update({'ok': True, 'status': 'response', 'source': f'{host_header} -> {code}',
+                       'fingerprint': hashlib.sha256(body).hexdigest()})
+    return result
+
+
 def _probe_vhost(ip: str, host_header: str, scheme: str = 'https') -> dict:
     """Request an IP with a specific Host header and return a small response signature."""
-    # IPv6 literals must be bracketed to form a valid URL authority.
-    authority = f'[{ip}]' if ':' in ip and not ip.startswith('[') else ip
-    url = f'{scheme}://{authority}'
-    req = urllib_request.Request(url, headers={'User-Agent': 'BugBountyPassiveRecon/1.0', 'Host': host_header}, method='GET')
+    req = vhost_request(host_header, ip, scheme=scheme)
+    url = req.full_url
     try:
-        with urllib_request.urlopen(req, timeout=8) as resp:
+        open_request = urllib_request.urlopen
+        if open_request is _ORIGINAL_URLOPEN:
+            open_request = vhost_opener().open
+        with open_request(req, timeout=8) as resp:
             code = getattr(resp, 'status', resp.getcode())
             body = resp.read(4096)
             headers = getattr(resp, 'headers', {})
             server = headers.get('Server', '') if hasattr(headers, 'get') else ''
             final_url = _response_final_url(resp, url)
-            body_text = body.decode('utf-8', 'replace') if isinstance(body, (bytes, bytearray)) else str(body)
-            if _is_login_redirect(url, final_url, body_text):
-                return {'host_header': host_header, 'ip': ip, 'source': f'{host_header} (login redirect)', 'url': url, 'ok': False, 'status': 'login_redirect', 'login': _login_page_fingerprint(url, final_url, body_text)}
-            return {
-                'host_header': host_header,
-                'ip': ip,
-                'status_code': code,
-                'length': len(body),
-                'server': str(server),
-                'source': f'{host_header} → {code}',
-                'url': url,
-                'ok': True,
-            }
-    except (urllib_error.HTTPError, urllib_error.URLError, ValueError, OSError, http.client.HTTPException) as exc:
+            return _vhost_response_signature(url, final_url, code, headers, body, host_header, ip)
+    except urllib_error.HTTPError as exc:
+        try:
+            return _vhost_response_signature(url, exc.geturl() or url, exc.code, dict(exc.headers or {}), exc.read(4096), host_header, ip)
+        finally:
+            exc.close()
+    except (urllib_error.URLError, ValueError, OSError, http.client.HTTPException) as exc:
         return {'host_header': host_header, 'ip': ip, 'source': f'{host_header} (no response)', 'url': url, 'ok': False, 'error': str(exc)}
 
 
@@ -770,6 +786,7 @@ def _run_vhost_discovery(service_assets: list[dict], *, progress=None, allowed_s
         host = candidate['domain']
         ip = candidate.get('shared_ip')
         evidence: list[dict] = []
+        rejections = {}
         # For shared-IP candidates, confirm name-based virtual hosting using only in-scope co-hosted names.
         addresses = [ip] if ip else sorted(resolver(host)) if allowed_scope is not None else []
         headers = list(dict.fromkeys([host, *candidate.get('co_hosted', []), *known_hosts]))
@@ -791,21 +808,34 @@ def _run_vhost_discovery(service_assets: list[dict], *, progress=None, allowed_s
                         continue
                     attempted.add((address, header_host))
                 sig = probe(address, header_host)
-                if not sig.get('ok'):
+                if not sig.get('ok') and sig.get('status') not in {'cdn_rejected', 'login_redirect'}:
                     sig = probe(address, header_host, scheme='http')
-                evidence.append(sig)
-                probe_log.append({'thread_id': thread_name, 'host': host, 'ip': address, 'host_header': header_host, 'status': 'checked', 'timestamp': time.time()})
-                if len(evidence) % 100 == 0:
+                if sig.get('status') == 'cdn_rejected':
+                    rejection_key = (address, sig.get('status_code'))
+                    if rejection_key not in rejections:
+                        sig['occurrences'] = 0
+                        rejections[rejection_key] = sig
+                        evidence.append(sig)
+                    rejections[rejection_key]['occurrences'] += 1
+                else:
+                    evidence.append(sig)
+                probe_log.append({'thread_id': thread_name, 'host': host, 'ip': address, 'host_header': header_host,
+                                  'status': sig.get('status', 'checked'), 'timestamp': time.time()})
+                if len(probe_log) > MAX_LOG_ENTRIES:
+                    del probe_log[:-MAX_LOG_ENTRIES]
+                if len(attempted) % 100 == 0:
                     _emit_progress(progress, {'assets': list(assets), 'checked_vhosts': len(attempted),
                                              'total_vhosts': len(observed_addresses) * len(observed_headers),
                                              'probe_log': _cap_log(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
-        distinct = len({(row.get('status_code'), row.get('length')) for row in evidence if row.get('ok')})
+        valid = [row for row in evidence if row.get('ok')]
+        distinct = len({(row.get('status_code'), row.get('fingerprint', row.get('length'))) for row in valid})
         record.update({
             'domain': host,
-            'status': 'vhost_confirmed' if distinct > 1 else 'vhost_candidate',
+            'status': 'vhost_confirmed' if distinct > 1 else 'vhost_candidate' if valid or allowed_scope is None else 'no_valid_vhost_response',
             'kind': candidate['reason'],
             'shared_ip': ip,
             'co_hosted': candidate.get('co_hosted', []),
+            'rejected_probes': sum(row['occurrences'] for row in rejections.values()),
             'source': 'vhost',
             'sources': ['vhost'],
             'source_count': 1,
@@ -828,7 +858,7 @@ def _run_vhost_discovery(service_assets: list[dict], *, progress=None, allowed_s
                 probe_log.append({'status': 'error', 'error': str(exc), 'timestamp': time.time()})
 
     return {
-        'discovered': sorted(row['domain'] for row in assets),
+        'discovered': sorted(row['domain'] for row in assets if row['status'] != 'no_valid_vhost_response'),
         'assets': sorted(assets, key=lambda r: r['domain']),
         'probe_log': probe_log,
         'thread_status': thread_status,
