@@ -148,6 +148,73 @@ class ProgramBuilderTest(unittest.TestCase):
                 with self.assertRaises(PermissionError):
                     run_auto_pipeline('split', root=root, queue='manual')
 
+    def test_job_stop_endpoint_preserves_data_blocks_scheduler_and_explicit_restart_clears_stop(self):
+        from job_control import is_stopped
+        with TemporaryDirectory() as directory, patch('dashboard_app.ROOT', Path(directory)), \
+             patch('dashboard_app.JOBS_DIR', Path(directory) / 'jobs'), \
+             patch('dashboard_app.RESULTS_DIR', Path(directory) / 'results'), \
+             patch('dashboard_app.RUNNING_DIR', Path(directory) / 'results/.running'), \
+             patch('dashboard_app.subprocess.Popen') as launch, \
+             patch.dict('dashboard_app.os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token'}):
+            root = Path(directory)
+            launch.return_value.pid = 9876
+            create_program('sample', ['app.example.com'], root=root, guidelines='Authorized checks.')
+            name = 'sample-passive-web-discovery'
+            path = root / 'results' / f'{name}.json'
+            path.parent.mkdir()
+            path.write_text(json.dumps({'job': name, 'program': 'sample', 'type': 'passive', 'status': 'queued',
+                                        'assets': [{'domain': 'app.example.com', 'evidence': ['saved observation']}]}))
+            headers = {'X-BugBounty-Token': 'test-token'}
+            with app.test_client() as client:
+                self.assertEqual(client.post(f'/jobs/{name}/stop').status_code, 401)
+                self.assertFalse(is_stopped(root, name))
+                self.assertEqual(client.post('/jobs/unknown/stop', headers=headers).status_code, 404)
+                stopped = client.post(f'/jobs/{name}/stop', headers=headers)
+                self.assertEqual(stopped.status_code, 202)
+                self.assertTrue(is_stopped(root, name))
+                self.assertEqual(json.loads(path.read_text())['assets'][0]['evidence'], ['saved observation'])
+                launch.assert_not_called()
+                page = client.get('/')
+                self.assertIn(b'Restart job', page.data)
+                with patch.object(worker, 'ROOT', root), patch.object(worker, 'RESULTS_DIR', root / 'results'):
+                    self.assertFalse(worker.should_run_job(root / 'jobs/generated' / f'{name}.yaml', force=True))
+                restarted = client.post(f'/jobs/{name}/rerun', headers=headers)
+                self.assertEqual(restarted.status_code, 202)
+                self.assertFalse(is_stopped(root, name))
+                launch.assert_called_once()
+                archived = json.loads((root / 'results/.stopped-results' / f'{name}.json').read_text())
+                self.assertEqual(archived['assets'][0]['evidence'], ['saved observation'])
+
+    def test_auto_pipeline_stop_marker_preserves_progress_and_holds_stage_for_restart(self):
+        from auto_run import run_auto_pipeline
+        from job_control import request_stop, is_stopped
+        from program_builder import configure_auto_run
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_program('automatic', ['*.example.com'], root=root, guidelines='Automated checks permitted.')
+            _, digest = read_guidelines('automatic', root=root)
+            set_active_approval('automatic', True, digest, root=root)
+            configure_auto_run('automatic', root=root)
+            name = 'automatic-passive-web-discovery'
+
+            def stopped_stage(job, scope, **kwargs):
+                kwargs['progress']({'assets': [{'domain': 'app.example.com', 'evidence': ['partial']}], 'discovered': []})
+                request_stop(root, name, 'automatic')
+                return {'status': 'ok', 'assets': []}
+
+            with patch.object(worker, 'ROOT', root), patch.object(worker, 'RESULTS_DIR', root / 'results'), \
+                 patch.object(worker, 'RUNNING_DIR', root / 'results/.running'), \
+                 patch.object(worker, 'run_passive_job', side_effect=stopped_stage) as run:
+                results = run_auto_pipeline('automatic', root=root)
+                self.assertEqual(results[0]['job_state'], 'stopped')
+                self.assertEqual(results[0]['assets'][0]['evidence'], ['partial'])
+                run.assert_called_once()
+                self.assertTrue(is_stopped(root, name))
+                run.reset_mock()
+                run_auto_pipeline('automatic', root=root)
+                run.assert_not_called()
+            self.assertFalse((root / 'results/.running/auto-program-automatic.lock').exists())
+
     def test_auto_run_policy_defaults_and_testing_restrictions(self):
         from program_builder import auto_run_policy
         policy = auto_run_policy('Automated testing is permitted. Respect scope exclusions.')

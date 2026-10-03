@@ -23,6 +23,7 @@ from scope_validator import is_in_scope, parse_scope_pattern
 from stages import ACTIVE_STAGES, LEGACY_NAME_TO_STAGE, STAGE_BY_ID, job_name_for, stage_for_job_name
 from program_builder import active_approved, parse_scope
 from vhost_transport import vhost_opener, vhost_request
+from job_control import JobStopped, check_stop, is_stopped, job_execution, mark_stopped_result
 
 ROOT = Path(__file__).resolve().parent.parent
 JOBS_DIR = ROOT / 'jobs'
@@ -291,6 +292,8 @@ def _remove_lock(lock_path: Path) -> None:
 
 
 def should_run_job(job_path: Path, *, force: bool = False) -> bool:
+    if is_stopped(ROOT, job_path.stem):
+        return False
     if force:
         return True
     result_path = RESULTS_DIR / f'{job_path.stem}.json'
@@ -2123,6 +2126,8 @@ def main() -> None:
             and not (ROOT / 'programs' / load_job(path).get('program', '') / '.scope-partitions.json').exists()]
     for job_path in jobs:
         job = load_job(job_path)
+        if is_stopped(ROOT, job_path.stem):
+            continue
         job['stage'] = job.get('stage') or stage_for_job_name(job.get('name', ''))
         if job.get('stage') in ACTIVE_STAGES and not allow_active:
             print(json.dumps({'job': job.get('name'), 'status': 'skipped_active', 'reason': 'requires --allow-active'}, indent=2), file=sys.stderr)
@@ -2201,6 +2206,7 @@ def main() -> None:
         _atomic_write_json(out_path, running_payload)
 
         def checkpoint(snapshot: dict) -> None:
+            check_stop(ROOT, job_path.stem)
             assets = snapshot.get('assets', []) or []
             payload = dict(running_payload)
             targets = snapshot.get('targets', running_payload['targets']) or running_payload['targets']
@@ -2222,7 +2228,8 @@ def main() -> None:
 
         try:
             allowed_scope = read_scope_file(job.get('program', DEFAULT_PROGRAM))
-            result = run_passive_job(job, allowed_scope, use_external_tools=args.external_probes, progress=checkpoint, scan_progress=scan_progress)
+            with job_execution(ROOT, job_path.stem, job.get('program', DEFAULT_PROGRAM), worker=__import__(__name__)):
+                result = run_passive_job(job, allowed_scope, use_external_tools=args.external_probes, progress=checkpoint, scan_progress=scan_progress)
             if not RESULTS_DIR.exists():
                 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
             previous = None
@@ -2242,6 +2249,8 @@ def main() -> None:
                     'completed': merged_result.get('job_state') == 'completed',
                 })
             all_results.append(merged_result)
+        except JobStopped:
+            mark_stopped_result(ROOT, job_path.stem)
         finally:
             if lock_path.exists():
                 lock_path.unlink()

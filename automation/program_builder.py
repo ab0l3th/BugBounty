@@ -575,6 +575,8 @@ def delete_uploaded_program(slug: str, *, root: Path = ROOT, lock_is_active=None
     for name in job_names:
         paths.extend([results / f'{name}.json', results / 'reports' / name,
                       results / '.scan-progress' / f'{name}.json', results / '.running' / f'{name}.lock',
+                      results / '.stopped' / f'{name}.json', results / '.running' / '.owners' / f'{name}.json',
+                      results / '.stopped-results' / f'{name}.json',
                       results / '.state' / f'{name}.json'])
     paths.extend(results / '.running' / f'{name}.lock' for name in lock_names)
     paths.append(results / f'manual-url-check-{slug}.json')

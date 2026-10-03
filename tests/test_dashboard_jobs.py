@@ -1323,6 +1323,68 @@ class DashboardJobMetadataTest(unittest.TestCase):
         self.assertEqual(result['assets'][0]['rejected_probes'], 3)
         self.assertEqual(result['discovered'], [])
 
+    def test_job_stop_marker_preserves_results_and_refuses_future_requests(self):
+        import json
+        import worker
+        from tempfile import TemporaryDirectory
+        from job_control import JobStopped, check_stop, clear_stop, job_execution, request_stop
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            results = root / 'results'
+            results.mkdir()
+            path = results / 'sample-job.json'
+            path.write_text(json.dumps({'job': 'sample-job', 'program': 'sample', 'assets': [{'domain': 'app.example.com'}], 'status': 'running'}))
+            stopped = request_stop(root, 'sample-job', 'sample')
+            self.assertFalse(stopped['signaled'])
+            self.assertEqual(json.loads(path.read_text())['assets'][0]['domain'], 'app.example.com')
+            with self.assertRaises(JobStopped):
+                check_stop(root, 'sample-job')
+            clear_stop(root, 'sample-job')
+            with patch('urllib.request.urlopen') as open_request:
+                with self.assertRaises(JobStopped):
+                    with job_execution(root, 'sample-job', 'sample', worker=worker):
+                        request_stop(root, 'sample-job', 'sample')
+                        worker.urllib_request.urlopen('https://app.example.com/')
+                open_request.assert_not_called()
+
+    def test_job_stop_signals_only_verified_worker_and_not_reused_pid(self):
+        from job_control import request_stop
+        from tempfile import TemporaryDirectory
+        import time
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            locks = root / 'results/.running'
+            locks.mkdir(parents=True)
+            (locks / 'sample-job.lock').write_text('777')
+            identity = {'pid': 777, 'start_ticks': '1234', 'boot_id': 'boot', 'started_at': time.time() - 30,
+                        'arguments': ['python', str(root / 'automation/worker.py'), '--program', 'sample', '--job', 'sample-job']}
+            with patch('job_control.process_identity', return_value=identity), patch('job_control.os.kill') as kill:
+                result = request_stop(root, 'sample-job', 'sample', candidate_pid=777)
+                self.assertTrue(result['signaled'])
+                kill.assert_called_once()
+            other = {**identity, 'arguments': ['python', str(root / 'automation/worker.py'), '--program', 'other']}
+            with patch('job_control.process_identity', return_value=other), patch('job_control.os.kill') as kill:
+                self.assertFalse(request_stop(root, 'sample-job', 'sample', candidate_pid=777)['signaled'])
+                kill.assert_not_called()
+            changed = {**identity, 'start_ticks': 'changed'}
+            with patch('job_control.process_identity', side_effect=[identity, changed]), patch('job_control.os.kill') as kill:
+                self.assertFalse(request_stop(root, 'sample-job', 'sample', candidate_pid=777)['signaled'])
+                kill.assert_not_called()
+
+    def test_job_execution_keeps_pinned_vhost_transport(self):
+        from job_control import job_execution
+        from vhost_transport import vhost_request
+        from tempfile import TemporaryDirectory
+        import worker
+        from unittest.mock import MagicMock
+        with TemporaryDirectory() as directory:
+            opener = MagicMock()
+            with patch('job_control.vhost_opener', return_value=opener):
+                with job_execution(Path(directory), 'sample-job', 'sample', worker=worker):
+                    req = vhost_request('app.example.com', '203.0.113.9')
+                    worker.urllib_request.urlopen(req, timeout=8)
+            opener.open.assert_called_once_with(req, timeout=8)
+
     def test_rerun_launches_only_the_requested_job(self):
         with patch('dashboard_app.subprocess.Popen', return_value=type('Proc', (), {'pid': 4321})()) as mock_popen, \
              patch.dict('os.environ', {'BUGBOUNTY_DASHBOARD_TOKEN': 'test-token'}):

@@ -173,6 +173,24 @@ introspection query. Swagger/OpenAPI base paths and same-host server paths are
 honored; external documentation servers are not followed automatically. All
 generated requests still pass the program scope, approval, and rate guards.
 
+## Stop and Restart Jobs
+
+Queued and running jobs have a **Stop job** control. Stopping saves a durable
+per-job hold marker, retains partial observations and checkpoints, and prevents
+the scheduled worker from immediately picking up that job again. New workers
+check for cancellation before network requests and checkpoints; an in-flight
+request may finish or time out first. Older workers can be terminated only after
+their scoped process identity and job locks are verified; unrelated processes
+and reused PIDs are never intentionally signaled.
+
+The UI shows **Stopping...** while an in-flight worker exits, then **Restart job**.
+Restart explicitly clears the hold after the normal permission/run-lock checks.
+The stopped result is also copied to `results/.stopped-results/<job>.json` before
+the new attempt starts, so prior partial observations remain available on disk.
+Some stages retain useful checkpoints, but restarting may repeat work: this is
+not an exact, in-memory pause/resume guarantee. Independent jobs/bounties keep
+their own stop markers. Deleting a bounty also removes its stop/owner sidecars.
+
 ## Delete and Reupload
 
 Uploaded bounties have a **Delete bounty** action in their workflow or pending

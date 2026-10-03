@@ -14,6 +14,7 @@ from urllib.parse import urljoin, urlsplit
 
 from program_builder import active_approved, load_manual_analysis, read_guidelines
 from vhost_transport import vhost_opener
+from job_control import check_stop
 
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = ROOT / 'results'
@@ -32,6 +33,7 @@ class ApprovedScopeClient:
         if not active_approved(slug, root=root):
             raise PermissionError('Current program guidelines must be approved')
         self.slug = slug
+        self.job_name = f'manual-url-check-{slug}'
         self.root = root
         _, self.digest = read_guidelines(slug, root=root)
         self.analysis = load_manual_analysis(slug, root=root)
@@ -82,6 +84,7 @@ class ApprovedScopeClient:
             delay = 1 / self.rate - (self.monotonic() - self.last_request)
             if delay > 0:
                 self.sleep(delay)
+        check_stop(self.root, self.job_name)
         self.check_approval()
         self.last_request = self.monotonic()
 

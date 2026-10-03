@@ -24,6 +24,7 @@ if str(AUTOMATION_DIR) not in sys.path:
 
 from program_builder import active_approved, auto_run_policy, configure_auto_run, create_manual_program, create_partitioned_program, create_program, csv_scope_inventory, delete_uploaded_program, load_manual_analysis, load_scope_partitions, parse_scope, partition_csv_scope, program_identity, read_guidelines, set_active_approval, slug_from_program_name
 from stages import ACTIVE_STAGES, STAGE_BY_ID, STAGES, job_name_for, stage_for_job_name
+from job_control import clear_stop, is_stopped, request_stop
 
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = ROOT / 'results'
@@ -156,6 +157,11 @@ def _lock_is_active(job_name: str) -> bool:
 
 
 def _job_state_for(job_name: str, payload: Dict[str, Any] | None = None) -> str:
+    if is_stopped(ROOT, job_name):
+        running = _lock_is_active(job_name)
+        if payload and payload.get('manual_only') and payload.get('program') and (payload.get('stop_was_running') or payload.get('job_state') == 'running'):
+            running = running or _lock_is_active(f"manual-program-{payload['program']}") or _lock_is_active(f"auto-program-{payload['program']}")
+        return 'stopping' if running else 'stopped'
     if _lock_is_active(job_name):
         return 'running'
     if payload and payload.get('auto_run') and payload.get('job_state') in {'stopped', 'blocked'}:
@@ -837,6 +843,9 @@ def rerun_job(job_name: str) -> Dict[str, Any]:
         raise KeyError(f'Unknown job: {job_name}')
 
     program = match.get('program', 'unknown')
+    restarting_stopped = is_stopped(ROOT, job_name)
+    if restarting_stopped and (_lock_is_active(job_name) or _lock_is_active(f'auto-program-{program}') or _lock_is_active(f'manual-program-{program}')):
+      raise PermissionError('Job is still stopping; wait for its worker to exit before restarting')
     if (ROOT / 'programs' / program / '.auto-run.json').is_file():
       if _lock_is_active(f'auto-program-{program}'):
         raise PermissionError('This program is already running')
@@ -854,6 +863,7 @@ def rerun_job(job_name: str) -> Dict[str, Any]:
         reason = stage_block_reason(program, stage_for_job_name(job_name), root=ROOT)
         if reason:
           raise PermissionError(reason)
+        clear_stop(ROOT, job_name)
         process = subprocess.Popen([sys.executable, str(ROOT / 'automation' / 'worker.py'), '--program', program,
                       '--auto-run', '--queue', 'manual', '--job', job_name, '--force'],
                        cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -866,6 +876,7 @@ def rerun_job(job_name: str) -> Dict[str, Any]:
         raise PermissionError(reason)
       if _lock_is_active(f'manual-program-{program}') or _lock_is_active(f'manual-url-check-{program}'):
         raise PermissionError('Another manual check for this program is running')
+      clear_stop(ROOT, job_name)
       process = subprocess.Popen([sys.executable, str(ROOT / 'automation' / 'manual_workflow.py'), program, stage_id],
                      cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
@@ -894,6 +905,7 @@ def rerun_job(job_name: str) -> Dict[str, Any]:
         queued_targets = combined_live_roots_from_step4_and_step5()
     else:
         queued_targets = []
+    clear_stop(ROOT, job_name)
     result_path.write_text(json.dumps({
         'job': job_name,
         'program': program,
@@ -1387,7 +1399,11 @@ def index():
                   <div class="job-content">
                     <p><a href="{{ url_for('review_queue', program=job.program, job=job.name) }}">Review job findings</a></p>
                     <div class="rerun-form">
-                      <button class="rerun-button" type="button" onclick="rerunJob('{{ job.name }}', this)" {% if job.blocked_reason %}disabled title="{{ job.blocked_reason }}"{% elif job.program in generated_programs and job.type == 'active' and job.program not in approved_programs %}disabled title="Review guidelines before active testing"{% endif %}>{{ 'Start step manually' if job.raw.manual_only else 'Re-run job' }}</button>
+                      <button class="rerun-button" type="button" onclick="rerunJob('{{ job.name }}', this)" {% if job.job_state == 'stopping' %}disabled title="Wait for the worker to stop"{% elif job.blocked_reason %}disabled title="{{ job.blocked_reason }}"{% elif job.program in generated_programs and job.type == 'active' and job.program not in approved_programs %}disabled title="Review guidelines before active testing"{% endif %}>{{ 'Restart job' if job.job_state == 'stopped' else 'Start step manually' if job.raw.manual_only else 'Re-run job' }}</button>
+                      {% if job.job_state in ['queued', 'running', 'waiting_on_dependencies', 'stopping'] %}
+                        <button class="stop-job-button" type="button" data-job="{{ job.name }}" {% if job.job_state == 'stopping' %}disabled{% endif %}>{{ 'Stopping...' if job.job_state == 'stopping' else 'Stop job' }}</button>
+                      {% endif %}
+                      <span class="job-control-status" role="status" aria-live="polite"></span>
                       {% if job.blocked_reason %}<span class="meta">{{ job.blocked_reason }}</span>{% endif %}
                     </div>
                     <p><strong>Program:</strong> {{ program_label(job.program) }}</p>
@@ -1555,6 +1571,30 @@ def index():
         const guidelinesText = document.getElementById('guidelines-text');
         const autoRun = document.getElementById('auto-run');
         const uploadStatus = document.getElementById('upload-status');
+        document.addEventListener('click', async event => {
+          const button = event.target.closest('.stop-job-button');
+          if (!button) return;
+          const token = getToken(false);
+          if (!token) return;
+          const status = button.parentElement.querySelector('.job-control-status');
+          button.disabled = true;
+          button.setAttribute('aria-busy', 'true');
+          try {
+            const response = await fetch('/jobs/' + encodeURIComponent(button.dataset.job) + '/stop', {
+              method: 'POST', headers: {'X-BugBounty-Token': token},
+            });
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.message || 'Stop failed');
+            if (dashboardRefresh) await dashboardRefresh.catch(() => {});
+            await refreshDashboard(true);
+            status.textContent = result.message;
+          } catch (error) {
+            status.textContent = error.message || 'Stop failed';
+          } finally {
+            button.removeAttribute('aria-busy');
+            if (button.isConnected && !button.textContent.includes('Stopping')) button.disabled = false;
+          }
+        });
         document.addEventListener('click', async event => {
           const button = event.target.closest('.delete-program');
           if (!button) return;
@@ -2106,6 +2146,34 @@ def index():
     </body>
     </html>
     ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, manual_programs=manual_programs, pending_manual_programs=pending_manual_programs, generated_programs=generated_programs, approved_programs=approved_programs, auto_programs=auto_programs, asset_queues=asset_queues, deletable_programs=deletable_programs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs, workflow_order=workflow_order, highest_severity=highest_severity, asset_render_cap=ASSET_RENDER_CAP, evidence_render_cap=EVIDENCE_RENDER_CAP, thread_render_cap=THREAD_RENDER_CAP)
+
+
+@app.route('/jobs/<job_name>/stop', methods=['POST'])
+def stop_job_endpoint(job_name: str):
+  if not _authorized_for_state_change():
+    return jsonify({'status': 'error', 'message': 'unauthorized'}), 401
+  match = next((job for job in list_jobs() if job['name'] == job_name), None)
+  if not match:
+    return jsonify({'status': 'error', 'message': 'Unknown job'}), 404
+  if match['job_state'] == 'completed':
+    return jsonify({'status': 'error', 'message': 'Job has already completed'}), 409
+  pid = None
+  names = [job_name, f"auto-program-{match['program']}", f"manual-program-{match['program']}"]
+  for name in names:
+    path = RUNNING_DIR / f'{name}.lock'
+    try:
+      candidate = int(path.read_text().strip())
+    except (OSError, ValueError):
+      continue
+    if candidate > 1 and _lock_is_active(name):
+      pid = candidate
+      break
+  try:
+    result = request_stop(ROOT, job_name, match['program'], candidate_pid=pid)
+  except (ValueError, OSError) as exc:
+    return jsonify({'status': 'error', 'message': str(exc)}), 409
+  result['status'] = _job_state_for(job_name, match.get('raw'))
+  return jsonify(result), 202
 
 
 @app.route('/jobs/<job_name>/rerun', methods=['POST'])

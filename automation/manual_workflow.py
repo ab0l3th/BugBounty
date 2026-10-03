@@ -12,6 +12,7 @@ from manual_url_checker import ApprovedScopeClient
 from program_builder import ROOT, active_approved, load_manual_analysis, load_scope_partitions, partition_job_name, read_guidelines
 from stages import STAGES, STAGE_BY_ID, job_name_for
 import worker
+from job_control import check_stop, job_execution
 
 
 def _save(path: Path, payload: dict) -> None:
@@ -127,6 +128,7 @@ def run_manual_stage(slug: str, stage_id: str, *, root: Path = ROOT, client=None
     hosts = sorted({asset['host'] for asset in scope_assets})
     stage = STAGE_BY_ID[stage_id]
     name = job_name_for(slug, stage_id)
+    check_stop(root, name)
     output = root / 'results' / f'{name}.json'
     result = {'job': name, 'program': slug, 'stage': stage_id, 'type': stage['type'], 'manual_only': True,
               'targets': hosts, 'queued': hosts, 'discovered': [], 'assets': [], 'source_count': 0,
@@ -134,6 +136,7 @@ def run_manual_stage(slug: str, stage_id: str, *, root: Path = ROOT, client=None
     _save(output, result)
 
     def progress(snapshot):
+        check_stop(root, name)
         result.update(snapshot)
         _save(output, result)
 
@@ -159,6 +162,7 @@ def run_manual_stage(slug: str, stage_id: str, *, root: Path = ROOT, client=None
             result['discovered'] = hosts
         else:
             client = client or ApprovedScopeClient(slug, root=root)
+            client.job_name = name
             if stage_id == 'passive-dns-discovery':
                 for host in hosts:
                     client.wait()
@@ -268,7 +272,8 @@ def main() -> None:
     with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
         handle.write(str(os.getpid()))
     try:
-        run_manual_stage(args.program, args.stage)
+        with job_execution(ROOT, job_name_for(args.program, args.stage), args.program, worker=worker):
+            run_manual_stage(args.program, args.stage)
     finally:
         lock.unlink(missing_ok=True)
 

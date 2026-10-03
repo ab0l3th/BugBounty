@@ -15,6 +15,7 @@ from program_builder import ROOT, active_approved, auto_run_policy, load_scope_p
 from scope_validator import is_in_scope, parse_scope_pattern
 from stages import STAGES, ACTIVE_STAGES, job_name_for
 from vhost_transport import vhost_opener
+from job_control import check_stop, is_stopped, job_execution, mark_stopped_result
 
 
 PUBLIC_DISCOVERY_HOSTS = {'api.certspotter.com', 'api.hackertarget.com', 'crt.sh', 'dns.google'}
@@ -39,6 +40,7 @@ class AutoRunGuard:
             raise PermissionError('Auto-run configuration is stale or disabled')
         self.check_approval()
         self.stage = None
+        self.current_job = None
         self.last_request = None
         self.sleep = sleep_fn
         self.monotonic = monotonic_fn
@@ -88,6 +90,8 @@ class AutoRunGuard:
                 delay = 1 / self.policy['requests_per_second'] - (self.monotonic() - self.last_request)
                 if delay > 0:
                     self.sleep(delay)
+            if self.current_job:
+                check_stop(self.root, self.current_job)
             self.check_approval()
             self.last_request = self.monotonic()
 
@@ -300,6 +304,9 @@ def run_auto_pipeline(slug: str, *, root: Path = ROOT, job_name=None, force=Fals
                 if job_name and name != job_name:
                     continue
                 output = root / 'results' / f'{name}.json'
+                if is_stopped(root, name):
+                    mark_stopped_result(root, name)
+                    continue
                 guard.check_approval()
                 if stage['stage'] not in guard.policy['allowed_stages']:
                     payload = {'job': name, 'program': slug, 'type': stage['type'], 'status': 'blocked_by_guidelines',
@@ -335,6 +342,7 @@ def run_auto_pipeline(slug: str, *, root: Path = ROOT, job_name=None, force=Fals
                 job = worker.load_job(job_path) if queue == 'automatic' else {'name': name, 'program': slug, 'stage': stage['stage'], 'type': stage['type'], 'targets': guard.scope}
                 job['targets'] = guard.domain_scope if guard.partitions is not None else [target for target in job.get('targets', []) if is_in_scope(target, guard.scope)]
                 guard.stage = stage['stage']
+                guard.current_job = name
                 job_lock = running / f'{name}.lock'
                 job_lock.write_text(str(os.getpid()), encoding='utf-8')
                 progress_path = root / 'results' / '.scan-progress' / f'{name}.json'
@@ -346,6 +354,7 @@ def run_auto_pipeline(slug: str, *, root: Path = ROOT, job_name=None, force=Fals
                 progress_lock = threading.Lock()
 
                 def progress(snapshot):
+                    check_stop(root, name)
                     with progress_lock:
                         updated = {**payload, **snapshot, 'status': 'running', 'job_state': 'running'}
                         for field in ('probe_log', 'thread_status'):
@@ -361,15 +370,16 @@ def run_auto_pipeline(slug: str, *, root: Path = ROOT, job_name=None, force=Fals
                         if saved.get('guidelines_sha256') == guard.digest and saved.get('scope_sha256') == guard.scope_digest:
                             scan_progress = saved
                     while True:
-                        if guard.domain_scope:
-                            result = worker.run_passive_job(job, guard.domain_scope, use_external_tools=False, progress=progress, scan_progress=scan_progress)
-                        else:
-                            result = {'job': name, 'program': slug, 'type': stage['type'], 'status': 'ok', 'assets': [], 'discovered': [], 'targets': []}
-                        if guard.url_assets:
-                            exact = _run_url_stage(guard, worker, stage['stage'], progress)
-                            result['assets'] = [*result.get('assets', []), *exact['assets']]
-                            result['discovered'] = sorted(set(result.get('discovered', [])) | set(exact['discovered']))
-                            result['targets'] = sorted(set(result.get('targets', [])) | set(exact['targets']))
+                        with job_execution(root, name, slug, worker=worker):
+                            if guard.domain_scope:
+                                result = worker.run_passive_job(job, guard.domain_scope, use_external_tools=False, progress=progress, scan_progress=scan_progress)
+                            else:
+                                result = {'job': name, 'program': slug, 'type': stage['type'], 'status': 'ok', 'assets': [], 'discovered': [], 'targets': []}
+                            if guard.url_assets:
+                                exact = _run_url_stage(guard, worker, stage['stage'], progress)
+                                result['assets'] = [*result.get('assets', []), *exact['assets']]
+                                result['discovered'] = sorted(set(result.get('discovered', [])) | set(exact['discovered']))
+                                result['targets'] = sorted(set(result.get('targets', [])) | set(exact['targets']))
                         if guard.partitions is not None:
                             selected_hosts = {host for host in result.get('discovered', []) if guard.permits_host(host)}
                             result['discovered'] = sorted(selected_hosts)
