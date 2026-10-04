@@ -40,12 +40,13 @@ class ApprovedScopeClient:
         policy = self.analysis['policy']
         if policy['automated_requests'] != 'manual_approval_required':
             raise PermissionError(policy['reason'])
-        self.rate = min(MAX_REQUESTS_PER_SECOND, policy['stated_max_requests_per_second'])
+        self.rate = policy['stated_max_requests_per_second']
         self.open_request = open_request or vhost_opener(NoRedirect()).open
         self.sleep = sleep_fn
         self.monotonic = monotonic_fn
         self.last_request = None
         self.lock = threading.Lock()
+        self.network_slots = threading.BoundedSemaphore(8)
         self.ip_owners = {}
 
     def allows(self, url, host_header=None):
@@ -80,16 +81,17 @@ class ApprovedScopeClient:
             raise PermissionError('Approval revoked or guidelines changed; no further requests sent')
 
     def wait(self):
-        if self.last_request is not None:
-            delay = 1 / self.rate - (self.monotonic() - self.last_request)
-            if delay > 0:
-                self.sleep(delay)
-        check_stop(self.root, self.job_name)
-        self.check_approval()
-        self.last_request = self.monotonic()
+        with self.lock:
+            if self.last_request is not None:
+                delay = 1 / self.rate - (self.monotonic() - self.last_request)
+                if delay > 0:
+                    self.sleep(delay)
+            check_stop(self.root, self.job_name)
+            self.check_approval()
+            self.last_request = self.monotonic()
 
     def request(self, url, *, method='HEAD', headers=None, read_body=False, data=None, connect_ip=None):
-        with self.lock:
+        with self.network_slots:
             visited = set()
             redirects = []
             target = url

@@ -1157,7 +1157,12 @@ def index():
     for program in grouped_jobs:
       path = ROOT / 'programs' / program / '.auto-run.json'
       if path.is_file():
-        auto_programs[program] = read_result_file(path)
+        auto_programs[program] = dict(read_result_file(path))
+        try:
+          current_policy = auto_run_policy(read_guidelines(program, root=ROOT)[0])
+          auto_programs[program].update(current_policy)
+        except (OSError, ValueError):
+          pass
     asset_queues = {}
     for program in grouped_jobs:
       partitions = load_scope_partitions(program, root=ROOT)
@@ -1364,7 +1369,7 @@ def index():
                 <p><button type="button" class="delete-program" data-program="{{ program_name }}">Delete bounty</button><span class="delete-program-status" role="status"></span></p>
               {% endif %}
               {% if program_name in auto_programs %}
-                <p class="meta">Auto-run: {{ 'approved' if program_name in approved_programs else 'paused pending current guideline approval' }}; {{ auto_programs[program_name].requests_per_second }} request/second; {{ auto_programs[program_name].max_workers }} workers maximum</p>
+                <p class="meta">Auto-run: {{ 'approved' if program_name in approved_programs else 'paused pending current guideline approval' }}; {{ auto_programs[program_name].requests_per_second }} requests/second aggregate; {{ auto_programs[program_name].discovery_workers or auto_programs[program_name].max_workers }} discovery workers maximum</p>
               {% endif %}
               <p><a href="{{ url_for('review_queue', program=program_name) }}">Review {{ program_label(program_name) }} findings</a></p>
               {% if program_name in generated_programs %}
@@ -1408,6 +1413,7 @@ def index():
                     </div>
                     <p><strong>Program:</strong> {{ program_label(job.program) }}</p>
                     <p><strong>Type:</strong> {{ job.type }}</p>
+                    {% if job.raw.rate_scope %}<p><strong>Traffic policy:</strong> {{ job.raw.requests_per_second }} requests/second, {{ job.raw.rate_scope }} aggregate; up to {{ job.raw.max_workers }} workers</p>{% endif %}
                     <p><strong>Pipeline status:</strong> {{ job.status }}</p>
                     {% if job.raw.reason %}<p class="meta">{{ job.raw.reason }}</p>{% endif %}
                     <p><strong>Source count:</strong> {{ job.source_count }}</p>
@@ -1704,7 +1710,7 @@ def index():
               policy.className = 'analysis-policy';
               policy.textContent = 'Offline analysis only; no target requests sent. Automated requests: ' +
                 analysis.policy.automated_requests + '. ' + analysis.policy.reason +
-                (analysis.policy.stated_max_requests_per_second ? ' Program limit: ' + analysis.policy.stated_max_requests_per_second + ' requests/second; this checker caps at 1 request/second.' : '');
+                (analysis.policy.stated_max_requests_per_second ? ' Program aggregate limit: ' + analysis.policy.stated_max_requests_per_second + ' requests/second.' : '');
               output.append(policy);
               const counts = document.createElement('p');
               counts.textContent = analysis.eligible_urls + ' eligible exact URLs (' + Object.entries(analysis.categories).map(([key, value]) => key + ': ' + value).join(', ') + '); ' +
@@ -2400,7 +2406,7 @@ def start_manual_url_check(slug: str):
                      stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError as exc:
         return jsonify({'status': 'error', 'message': f'Could not start URL check: {exc}'}), 500
-    return jsonify({'status': 'running', 'pid': process.pid, 'requests_per_second': 1,
+    return jsonify({'status': 'running', 'pid': process.pid, 'requests_per_second': analysis['policy']['stated_max_requests_per_second'],
             'method': 'HEAD', 'targets': analysis['eligible_urls'],
             'skipped_query_urls': sum(1 for asset in analysis['assets'] if asset['query_present'])}), 202
 

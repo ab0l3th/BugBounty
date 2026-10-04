@@ -228,6 +228,10 @@ class ProgramBuilderTest(unittest.TestCase):
         self.assertNotIn('directory-enumeration', limited['allowed_stages'])
         self.assertEqual(auto_run_policy('Rate limit: 12 requests per minute.')['requests_per_second'], 0.2)
         self.assertEqual(auto_run_policy('Maximum 0.25 RPS.')['requests_per_second'], 0.25)
+        aggregate = auto_run_policy('Traffic requests must not exceed 3 requests per second.')
+        self.assertEqual(aggregate['requests_per_second'], 3)
+        self.assertEqual(aggregate['rate_scope'], 'program')
+        self.assertEqual(aggregate['discovery_workers'], 8)
         for rules in ('No automated scans.', 'Automation is prohibited.', 'Do not perform automated testing.'):
             with self.subTest(rules=rules), self.assertRaises(ValueError):
                 auto_run_policy(rules)
@@ -260,6 +264,63 @@ class ProgramBuilderTest(unittest.TestCase):
             self.assertFalse(hasattr(other, '_vhost_connect_ip'))
             with self.assertRaises(URLError):
                 guard.before_http(vhost_request('outside.example.org', '203.0.113.9'))
+
+    def test_auto_requests_overlap_network_io_without_exceeding_aggregate_rate(self):
+        from auto_run import AutoRunGuard
+        from program_builder import configure_auto_run
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_program('automatic', ['*.example.com'], root=root, guidelines='Maximum 3 requests per second.')
+            _, digest = read_guidelines('automatic', root=root)
+            set_active_approval('automatic', True, digest, root=root)
+            configure_auto_run('automatic', root=root)
+            first_entered = threading.Event()
+            second_entered = threading.Event()
+            calls = []
+            now = [0.0]
+
+            def fake_open(req, **kwargs):
+                calls.append((req.full_url, now[0]))
+                if req.full_url.endswith('/first'):
+                    first_entered.set()
+                    if not second_entered.wait(2):
+                        raise AssertionError('network I/O was serialized under the pacing lock')
+                else:
+                    second_entered.set()
+                return None
+
+            guard = AutoRunGuard('automatic', root=root, open_request=fake_open,
+                                  sleep_fn=lambda delay: now.__setitem__(0, now[0] + delay), monotonic_fn=lambda: now[0])
+            guard.scope = ['*.example.com']
+            guard.stage = 'directory-enumeration'
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first = executor.submit(guard.urlopen, 'https://app.example.com/first')
+                self.assertTrue(first_entered.wait(2))
+                second = executor.submit(guard.urlopen, 'https://app.example.com/second')
+                first.result()
+                second.result()
+            self.assertEqual([timestamp for _, timestamp in calls], [0.0, 1 / 3])
+
+    def test_multi_host_aggregate_rate_is_not_multiplied_by_endpoint_count(self):
+        from auto_run import AutoRunGuard
+        from program_builder import configure_auto_run
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_program('automatic', ['*.example.com'], root=root, guidelines='Maximum 2 requests per second.')
+            _, digest = read_guidelines('automatic', root=root)
+            set_active_approval('automatic', True, digest, root=root)
+            configure_auto_run('automatic', root=root)
+            now = [0.0]
+            starts = []
+            guard = AutoRunGuard('automatic', root=root, open_request=lambda req, **kwargs: starts.append(now[0]),
+                                  sleep_fn=lambda delay: now.__setitem__(0, now[0] + delay), monotonic_fn=lambda: now[0])
+            guard.scope = ['*.example.com']
+            guard.stage = 'vhost-discovery'
+            for index in range(20):
+                guard.urlopen(f'https://host{index}.example.com/path{index}')
+            self.assertEqual(starts, [index * 0.5 for index in range(20)])
 
     def test_auto_run_configuration_requires_current_approval_and_domain_scope(self):
         from program_builder import configure_auto_run
@@ -336,7 +397,7 @@ class ProgramBuilderTest(unittest.TestCase):
             def fake_stage(job, scope, **kwargs):
                 stages.append(job['stage'])
                 self.assertFalse(kwargs['use_external_tools'])
-                self.assertLessEqual(worker.MAX_WORKERS, 2)
+                self.assertLessEqual(worker.MAX_WORKERS, 8 if job['stage'] in {'vhost-discovery', 'directory-enumeration'} else 2)
                 url = 'https://crt.sh/?q=example.com' if job['type'] == 'passive' else 'https://app.example.com/'
                 worker.urllib_request.urlopen(url)
                 return {'job': job['name'], 'program': 'automatic', 'type': job['type'], 'status': 'ok',
@@ -472,7 +533,7 @@ class ProgramBuilderTest(unittest.TestCase):
                    'com.example.app,GOOGLE_PLAY_APP_ID,true\n')
         analysis = analyze_url_scope(content, 'No aggressive scanning. Traffic must not exceed 3 requests per second.')
         self.assertEqual(analysis['policy']['automated_requests'], 'manual_approval_required')
-        self.assertEqual(analysis['policy']['max_requests_per_second'], 1)
+        self.assertEqual(analysis['policy']['max_requests_per_second'], 3)
         self.assertEqual(analysis['policy']['stated_max_requests_per_second'], 3)
         self.assertEqual(analysis['policy']['method'], 'HEAD')
         self.assertTrue(analysis['policy']['follows_redirects'])

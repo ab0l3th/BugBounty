@@ -206,7 +206,7 @@ def analyze_url_scope(content: str, guidelines: str) -> dict:
         reason = 'No explicit request-rate limit was found in the guidelines'
     policy = {'automated_requests': automation_status,
               'stated_max_requests_per_second': stated_limit,
-              'max_requests_per_second': min(1, stated_limit) if stated_limit else None,
+              'max_requests_per_second': stated_limit,
               'method': 'HEAD', 'follows_redirects': True, 'max_redirects': 3,
               'skips_login_redirects': True, 'redirects_must_be_in_scope': True, 'reason': reason}
     return {'eligible_urls': inventory['eligible_asset_types'].get('URL', 0), 'invalid_urls': invalid_urls,
@@ -388,7 +388,7 @@ def auto_run_policy(guidelines: str) -> dict:
         limits.append(float(match.group(1)) / (60 if (match.group(2) or '').lower().startswith('m') else 1))
     if limits and min(limits) <= 0:
         raise ValueError('Guidelines do not permit request traffic')
-    rate = min([1.0, *limits])
+    rate = min(limits) if limits else 1.0
     stage_terms = {
         'vhost-discovery': r'(?:vhost|virtual.host)[- ]?(?:discovery|testing|scanning)?',
         'directory-enumeration': r'(?:directory[- ](?:enumeration|scanning)|content[- ]discovery|fuzzing|brute[- ]force)',
@@ -403,7 +403,8 @@ def auto_run_policy(guidelines: str) -> dict:
     if re.search(prohibition + r'aggressive[^.!?\n]{0,30}(?:testing|scann?(?:ing|s)?)', guidelines, re.IGNORECASE):
         for stage in ('directory-enumeration', 'application-testing', 'api-testing', 'port-scan'):
             blocked[stage] = 'Aggressive testing restrictions require manual stage review'
-    return {'enabled': True, 'requests_per_second': rate, 'max_workers': 2,
+    return {'enabled': True, 'requests_per_second': rate, 'rate_scope': 'program', 'max_workers': 2,
+            'discovery_workers': 8,
             'allowed_stages': [stage['stage'] for stage in STAGES if stage['stage'] not in blocked],
             'blocked_stages': blocked, 'external_probes': False}
 

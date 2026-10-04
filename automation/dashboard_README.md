@@ -119,8 +119,12 @@ host, port, and path; they do not silently become domain-wide scope.
 
 Auto-run advances the canonical stages in dependency order. Recognized testing
 bans mark stages blocked; stages requiring their results remain waiting. Defaults
-are at most 1 request per second and 2 workers, with lower stated limits taking
-precedence. External curl/nmap/whatweb probes are disabled. HTTP requests,
+are 1 request per second when no numeric limit is stated and 2 general workers.
+An explicit numeric request limit is honored directly. Vhost/directory stages
+use up to 8 discovery workers (subject to the server worker budget), with one
+program-wide request-start limiter; network I/O does not hold the pacing lock.
+Limits are not multiplied by the number of URLs/hosts. External curl/nmap/whatweb
+probes are disabled. HTTP requests,
 redirects, worker DNS lookups, and TCP checks share program pacing and a lock.
 Redirects must remain in scope; login, excessive, and HTTPS-downgrade redirects
 are skipped. Public passive lookups use the existing discovery providers.
@@ -151,8 +155,11 @@ HTTP follow-up steps use hosts confirmed live; TCP enumeration also includes
 authorized hosts that do not serve HTTP. URL-restricted assets never
 expand into domain-wide or wildcard scope. App IDs remain inventory-only.
 
-All manual HTTP requests, including redirect hops, are serialized at no more than
-1 request per second. Redirects must remain in uploaded scope; login/SSO,
+All manual HTTP requests, including redirect hops, share the stated program
+aggregate request-start limit. Slow responses can overlap within the bounded
+worker budget; directory/vhost checks can use up to 8 host workers. A per-host or
+per-endpoint rate must be explicitly stated before it can replace an aggregate
+limit. Redirects must remain in uploaded scope; login/SSO,
 query-bearing, looping, excessive, and HTTPS-downgrade redirects are skipped.
 Manual HTTP checks use GET/HEAD plus the fixed read-only GraphQL introspection
 query, bounded response reads, and no external scanners or mutating API methods.

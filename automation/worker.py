@@ -903,14 +903,14 @@ def _discovery_wordlist(kind: str) -> list[str]:
     return list(dict.fromkeys([*defaults, *values]))
 
 
-def _directory_enumeration(hosts: list[str], *, wordlist: list[str] | None = None, use_external_tools: bool = False, progress=None) -> dict:
+def _directory_enumeration(hosts: list[str], *, wordlist: list[str] | None = None, use_external_tools: bool = False, progress=None, fetch=None, workers: int | None = None) -> dict:
     deduped_hosts = sorted(set(hosts))
     paths = list(dict.fromkeys(_discovery_wordlist('directories') if wordlist is None else wordlist))
     assets: list[dict] = []
     probe_log: list[dict] = []
     login_seen: set[str] = set()
     thread_status: list[dict] = []
-    max_workers = _bounded_workers(len(deduped_hosts))
+    max_workers = workers or _bounded_workers(len(deduped_hosts))
     headers = {'User-Agent': 'BugBountyPassiveRecon/1.0'}
 
     def scan_host(host: str) -> dict:
@@ -930,11 +930,17 @@ def _directory_enumeration(hosts: list[str], *, wordlist: list[str] | None = Non
             url = base + path
             try:
                 req = urllib_request.Request(url, headers=headers, method='GET')
-                with urllib_request.urlopen(req, timeout=8) as resp:
-                    code = getattr(resp, 'status', resp.getcode())
-                    body = resp.read(2048) if callable(getattr(resp, 'read', None)) else b''
-                    length = len(body) if body else 0
-                    final_url = _response_final_url(resp, url)
+                if fetch:
+                    code, response_headers, body_text = fetch(url)
+                    body = body_text.encode('utf-8')
+                    length = len(body)
+                    final_url = response_headers.get('x-final-url', url)
+                else:
+                    with urllib_request.urlopen(req, timeout=8) as resp:
+                        code = getattr(resp, 'status', resp.getcode())
+                        body = resp.read(2048) if callable(getattr(resp, 'read', None)) else b''
+                        length = len(body) if body else 0
+                        final_url = _response_final_url(resp, url)
             except urllib_error.HTTPError as exc:
                 code = exc.code
                 length = 0

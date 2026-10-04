@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import threading
 from pathlib import Path
 from urllib.error import URLError
 from urllib.parse import urlsplit
@@ -134,11 +135,13 @@ def run_manual_stage(slug: str, stage_id: str, *, root: Path = ROOT, client=None
               'targets': hosts, 'queued': hosts, 'discovered': [], 'assets': [], 'source_count': 0,
               'status': 'running', 'job_state': 'running', 'guidelines_sha256': digest, 'requests_per_second': 1}
     _save(output, result)
+    progress_lock = threading.Lock()
 
     def progress(snapshot):
         check_stop(root, name)
-        result.update(snapshot)
-        _save(output, result)
+        with progress_lock:
+            result.update(snapshot)
+            _save(output, result)
 
     def fetch(url, *, extra_headers=None, method='GET', data=None, **kwargs):
         introspection = method == 'POST' and data == worker._GRAPHQL_INTROSPECTION
@@ -163,6 +166,10 @@ def run_manual_stage(slug: str, stage_id: str, *, root: Path = ROOT, client=None
         else:
             client = client or ApprovedScopeClient(slug, root=root)
             client.job_name = name
+            discovery_workers = min(worker.MAX_WORKERS, 8)
+            result['requests_per_second'] = client.rate
+            result['rate_scope'] = 'program'
+            result['max_workers'] = discovery_workers if stage_id in {'vhost-discovery', 'directory-enumeration'} else 1
             if stage_id == 'passive-dns-discovery':
                 for host in hosts:
                     client.wait()
@@ -190,7 +197,7 @@ def run_manual_stage(slug: str, stage_id: str, *, root: Path = ROOT, client=None
                     return signature
 
                 result.update(worker._run_vhost_discovery([{'domain': host} for host in full_hosts], allowed_scope=full_hosts,
-                                                          probe=scoped_probe, resolver=scoped_resolve, workers=1, progress=progress))
+                                                          probe=scoped_probe, resolver=scoped_resolve, workers=discovery_workers, progress=progress))
             elif stage_id in {'confirm-live-web-assets', 'service-enumeration'}:
                 for asset in scope_assets:
                     response = client.request(_asset_url(asset))
@@ -204,8 +211,20 @@ def run_manual_stage(slug: str, stage_id: str, *, root: Path = ROOT, client=None
                     result['discovered'] = sorted({item['domain'] for item in result['assets'] if item['status'] == 'live'})
                     progress({'assets': result['assets'], 'discovered': result['discovered']})
             elif stage_id == 'directory-enumeration':
-                for asset in scope_assets:
-                    paths = worker._discovery_wordlist('directories') if asset['scope_kind'] == 'exact_host' else [asset['path']]
+                full_hosts = sorted({asset['host'] for asset in scope_assets if asset['scope_kind'] == 'exact_host'})
+
+                def directory_fetch(url):
+                    response = client.request(url, method='GET', read_body=True)
+                    if response.get('error') or response.get('redirect_stop') or response['status'] is None:
+                        raise URLError(response.get('error') or response.get('redirect_stop') or 'No response')
+                    headers = dict(response['headers'])
+                    headers['x-final-url'] = response['final_url']
+                    return response['status'], headers, response['body']
+
+                if full_hosts:
+                    result.update(worker._directory_enumeration(full_hosts, fetch=directory_fetch, workers=discovery_workers, progress=progress))
+                for asset in (asset for asset in scope_assets if asset['scope_kind'] == 'exact_url'):
+                    paths = [asset['path']]
                     found = []
                     record = {'domain': asset['host'], 'paths': found, 'findings': [], 'source': 'scoped directory enumeration',
                               'checked_paths': 0, 'total_paths': len(paths)}
@@ -245,6 +264,10 @@ def run_manual_stage(slug: str, stage_id: str, *, root: Path = ROOT, client=None
         if current_digest != digest or not active_approved(slug, root=root):
             raise PermissionError('Approval revoked or guidelines changed')
         result['source_count'] = sum(len(item.get('findings', [])) or len(item.get('paths', [])) or item.get('source_count', 0) for item in result['assets'])
+        for field in ('checked_paths', 'total_paths', 'checked_ports', 'total_ports'):
+            rows = [asset for asset in result['assets'] if field in asset]
+            if rows:
+                result[field] = sum(asset[field] for asset in rows)
         result['status'] = 'ok'
         result['job_state'] = 'completed'
     except Exception as exc:

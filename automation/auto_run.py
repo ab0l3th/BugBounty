@@ -45,6 +45,7 @@ class AutoRunGuard:
         self.sleep = sleep_fn
         self.monotonic = monotonic_fn
         self.lock = threading.RLock()
+        self.network_slots = threading.BoundedSemaphore(8)
         self.ip_owners = {}
         self.scope = []
         self.resolve_original = None
@@ -156,16 +157,16 @@ class AutoRunGuard:
 
     def urlopen(self, target, data=None, timeout=8, **kwargs):
         req = target if isinstance(target, request.Request) else request.Request(target, data=data)
-        with self.lock:
+        with self.network_slots:
             self.before_http(req)
             return self.open_request(req, timeout=min(timeout, 8))
 
     def resolve(self, host):
         if not is_in_scope(host, self.scope) or not self.permits_host(host):
             return set()
+        self.wait()
+        addresses = self.resolve_original(host)
         with self.lock:
-            self.wait()
-            addresses = self.resolve_original(host)
             if self.partitions is None or is_in_scope(host, self.domain_scope):
                 for address in addresses:
                     self.ip_owners.setdefault(address, set()).add(host)
@@ -174,14 +175,14 @@ class AutoRunGuard:
     def tcp(self, address, port, timeout=1.5):
         if address not in self.ip_owners or self.stage != 'port-scan':
             return False
-        with self.lock:
-            self.wait()
-            return self.tcp_original(address, port, timeout)
+        self.wait()
+        return self.tcp_original(address, port, timeout)
 
     @contextmanager
     def installed(self, worker):
         original_http = request.urlopen
         original_workers = worker.MAX_WORKERS
+        self.runtime_workers = original_workers
         self.resolve_original = worker._resolve_host_ips
         self.tcp_original = worker._tcp_port_open
         original_result_name = worker.result_name_for
@@ -342,6 +343,7 @@ def run_auto_pipeline(slug: str, *, root: Path = ROOT, job_name=None, force=Fals
                 job = worker.load_job(job_path) if queue == 'automatic' else {'name': name, 'program': slug, 'stage': stage['stage'], 'type': stage['type'], 'targets': guard.scope}
                 job['targets'] = guard.domain_scope if guard.partitions is not None else [target for target in job.get('targets', []) if is_in_scope(target, guard.scope)]
                 guard.stage = stage['stage']
+                worker.MAX_WORKERS = min(guard.runtime_workers, guard.policy['discovery_workers'] if stage['stage'] in {'vhost-discovery', 'directory-enumeration'} else guard.policy['max_workers'])
                 guard.current_job = name
                 job_lock = running / f'{name}.lock'
                 job_lock.write_text(str(os.getpid()), encoding='utf-8')
@@ -351,6 +353,8 @@ def run_auto_pipeline(slug: str, *, root: Path = ROOT, job_name=None, force=Fals
                            'guidelines_sha256': guard.digest, 'scope_sha256': guard.scope_digest,
                            'execution_queue': queue, 'manual_only': queue == 'manual', 'queue_asset_count': len(guard.partitions.get(queue, [])) if guard.partitions else 0,
                            'requests_per_second': guard.policy['requests_per_second']}
+                payload['rate_scope'] = 'program'
+                payload['max_workers'] = worker.MAX_WORKERS
                 progress_lock = threading.Lock()
 
                 def progress(snapshot):

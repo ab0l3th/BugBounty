@@ -100,7 +100,7 @@ class ManualUrlCheckerTest(unittest.TestCase):
             content = ('identifier,asset_type,in_scope\n'
                        'one.example.com,URL,true\n'
                        'two.example.com,URL,true\n')
-            create_manual_program('sample', content, 'Traffic must not exceed 3 requests per second.',
+            create_manual_program('sample', content, 'Traffic must not exceed 1 requests per second.',
                                   {'eligible_asset_types': {'URL': 2}, 'manual_only': True}, root=root)
             _, digest = read_guidelines('sample', root=root)
             set_active_approval('sample', True, digest, root=root)
@@ -132,7 +132,7 @@ class ManualUrlCheckerTest(unittest.TestCase):
             self.assertEqual(result['checked'], 2)
             self.assertTrue(result['complete'])
 
-    def test_in_scope_non_login_redirect_is_followed_at_one_rps(self):
+    def test_in_scope_non_login_redirect_is_followed_at_stated_rps(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             create_manual_program('sample', 'identifier,asset_type,in_scope\napp.example.com,URL,true\n',
@@ -157,7 +157,7 @@ class ManualUrlCheckerTest(unittest.TestCase):
             result = run_url_check('sample', root=root, open_request=fake_open,
                                    sleep_fn=fake_sleep, monotonic_fn=lambda: now[0])
             self.assertEqual(calls, [('https://app.example.com/', 'HEAD'), ('https://app.example.com/public', 'HEAD')])
-            self.assertEqual(sleeps, [1.0])
+            self.assertEqual(sleeps, [1 / 3])
             self.assertEqual(result['results'][0]['final_url'], 'https://app.example.com/public')
 
     def test_redirects_stop_before_login_scope_exit_query_or_downgrade(self):
@@ -255,7 +255,7 @@ class ManualUrlCheckerTest(unittest.TestCase):
             self.assertTrue(all(url.endswith('/graphql') for url, method, _ in calls if method == 'POST'))
             self.assertTrue(post_bodies)
             self.assertTrue(all(body == b'{"query":"{__schema{types{name}}}"}' for body in post_bodies))
-            self.assertTrue(all(later[2] - earlier[2] >= 1 for earlier, later in zip(calls, calls[1:])))
+            self.assertTrue(all(later[2] - earlier[2] >= 1 / 3 - 1e-9 for earlier, later in zip(calls, calls[1:])))
             self.assertEqual(len(list((root / 'results').glob('*.json'))), 9)
 
     def test_full_host_scope_allows_alt_web_ports_but_not_new_domains(self):
@@ -303,6 +303,82 @@ class ManualUrlCheckerTest(unittest.TestCase):
             client = ApprovedScopeClient('sample', root=root, open_request=lambda *args, **kwargs: self.fail('Unapproved origin must not be contacted'))
             response = client.request('https://app.example.com/login', method='GET', headers={'Host': 'app.example.com'}, connect_ip='203.0.113.9')
             self.assertEqual(response['error'], 'UnapprovedVhostOrigin')
+
+    def test_manual_requests_overlap_io_but_share_one_program_limiter(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_manual_program('sample', 'identifier,asset_type,in_scope\napp.example.com,URL,true\n',
+                                  'Maximum 3 requests per second.', {'manual_only': True}, root=root)
+            _, digest = read_guidelines('sample', root=root)
+            set_active_approval('sample', True, digest, root=root)
+            first_entered = threading.Event()
+            second_entered = threading.Event()
+            now = [0.0]
+            calls = []
+
+            def fake_open(req, **kwargs):
+                calls.append((req.full_url, now[0]))
+                if req.full_url.endswith('/first'):
+                    first_entered.set()
+                    if not second_entered.wait(2):
+                        raise AssertionError('manual network I/O is still globally serialized')
+                else:
+                    second_entered.set()
+                return HTTPError(req.full_url, 200, 'response', Message(), io.BytesIO(b'public'))
+
+            client = ApprovedScopeClient('sample', root=root, open_request=fake_open,
+                                         sleep_fn=lambda delay: now.__setitem__(0, now[0] + delay), monotonic_fn=lambda: now[0])
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first = executor.submit(client.request, 'https://app.example.com/first')
+                self.assertTrue(first_entered.wait(2))
+                second = executor.submit(client.request, 'https://app.example.com/second')
+                self.assertEqual(first.result()['status'], 200)
+                self.assertEqual(second.result()['status'], 200)
+            self.assertEqual([timestamp for _, timestamp in calls], [0.0, 1 / 3])
+
+    def test_manual_directory_stage_parallelizes_hosts_under_one_aggregate_cap(self):
+        import threading
+        from stages import job_name_for
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            content = 'identifier,asset_type,in_scope\none.example.com,URL,true\ntwo.example.com,URL,true\n'
+            create_manual_program('sample', content, 'Maximum 3 requests per second.', {'manual_only': True}, root=root)
+            _, digest = read_guidelines('sample', root=root)
+            set_active_approval('sample', True, digest, root=root)
+            queue_manual_workflow('sample', root=root)
+            for stage in ('passive-web-discovery', 'passive-dns-discovery', 'confirm-live-web-assets', 'service-enumeration', 'vhost-discovery'):
+                path = root / 'results' / f'{job_name_for("sample", stage)}.json'
+                path.write_text(json.dumps({'job_state': 'completed', 'guidelines_sha256': digest,
+                                            'discovered': ['one.example.com', 'two.example.com']}))
+            first_entered = threading.Event()
+            second_entered = threading.Event()
+            now = [0.0]
+            calls = []
+
+            def fake_open(req, **kwargs):
+                calls.append((req.full_url, now[0]))
+                if req.full_url.startswith('https://one.'):
+                    first_entered.set()
+                    if not second_entered.wait(2):
+                        raise AssertionError('directory hosts did not overlap')
+                else:
+                    second_entered.set()
+                return HTTPError(req.full_url, 200, 'response', Message(), io.BytesIO(b'public page'))
+
+            client = ApprovedScopeClient('sample', root=root, open_request=fake_open,
+                                         sleep_fn=lambda delay: now.__setitem__(0, now[0] + delay), monotonic_fn=lambda: now[0])
+            with patch('worker._discovery_wordlist', return_value=['/public']):
+                result = run_manual_stage('sample', 'directory-enumeration', root=root, client=client)
+            self.assertEqual(result['job_state'], 'completed', result.get('error'))
+            self.assertEqual(result['max_workers'], 8)
+            self.assertEqual(result['requests_per_second'], 3)
+            self.assertEqual(result['rate_scope'], 'program')
+            self.assertEqual(result['checked_paths'], 2)
+            self.assertEqual(result['total_paths'], 2)
+            self.assertTrue(first_entered.is_set() and second_entered.is_set())
+            self.assertGreaterEqual(abs(calls[1][1] - calls[0][1]), 1 / 3 - 1e-9)
 
     def test_explicit_port_ban_still_blocks_full_host_scan(self):
         with TemporaryDirectory() as directory:
