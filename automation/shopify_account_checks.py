@@ -346,7 +346,7 @@ def _profile_pair(plan: dict, directory: Path, browser_name: str) -> dict:
     return profiles
 
 
-def run_checks(plan: dict, directory: Path, *, browser_name='edge') -> dict:
+def run_checks(plan: dict, directory: Path, *, browser_name='edge', progress=None) -> dict:
     validate_plan(plan)
     profiles = _profile_pair(plan, directory, browser_name)
     from playwright.sync_api import sync_playwright
@@ -369,12 +369,12 @@ def run_checks(plan: dict, directory: Path, *, browser_name='edge') -> dict:
 
                 def guard(route):
                     req = route.request
-                    parsed = urlsplit(req.url)
-                    if req.is_navigation_request() and not navigation_allowed(req.url, plan):
-                        blocked['count'] += 1
+                    if not req.is_navigation_request():
+                        if not read_only_request(req.method, req.url, req.post_data):
+                            blocked['count'] += 1
                         route.abort()
                         return
-                    if not req.is_navigation_request() and not resource_allowed(req.url, plan):
+                    if req.is_navigation_request() and not navigation_allowed(req.url, plan):
                         blocked['count'] += 1
                         route.abort()
                         return
@@ -394,6 +394,8 @@ def run_checks(plan: dict, directory: Path, *, browser_name='edge') -> dict:
                 page = context.pages[0] if context.pages else context.new_page()
                 context.on('page', lambda popup: popup.close())
                 for target in plan['targets']:
+                    if progress:
+                        progress(f"{role}/{target['name']}: navigating")
                     if last_main is not None:
                         delay = 1 - (time.monotonic() - last_main)
                         if delay > 0:
@@ -401,18 +403,13 @@ def run_checks(plan: dict, directory: Path, *, browser_name='edge') -> dict:
                     blocked['count'] = 0
                     status = None
                     navigation_error = False
-                    text = ''
                     last_main = time.monotonic()
                     try:
-                        response = page.goto(target['url'], wait_until='domcontentloaded', timeout=20000)
+                        response = page.goto(target['url'], wait_until='commit', timeout=20000)
                         status = response.status if response else None
-                        try:
-                            text = page.locator('body').inner_text(timeout=3000)[:65536]
-                        except Exception:
-                            navigation_error = True
                     except Exception:
                         navigation_error = True
-                    observed = classify_observation(status, page.url, text, target['expected'].get(role, 'unknown'),
+                    observed = classify_observation(status, page.url, '', target['expected'].get(role, 'unknown'),
                                                     blocked_requests=blocked['count'], navigation_error=navigation_error)
                     final = urlsplit(page.url)
                     selected_paths = {urlsplit(selected['url']).path for selected in plan['targets']}
@@ -420,6 +417,8 @@ def run_checks(plan: dict, directory: Path, *, browser_name='edge') -> dict:
                     rows.append({'role': role, 'target': target['name'], 'url': target['url'], 'http_status': status,
                                  'final_host': final.hostname, 'final_path': safe_path, 'query_present': bool(final.query),
                                  'blocked_requests': blocked['count'], **observed})
+                    if progress:
+                        progress(f"{role}/{target['name']}: HTTP {status if status is not None else 'none'}, {observed['observed']}")
                     if observed['observed'] == 'login_required':
                         break
             finally:
@@ -480,7 +479,8 @@ def main() -> None:
     if args.command == 'capture':
         capture_session(plan, args.role, args.profiles, browser_name=args.browser)
         return
-    report = run_checks(plan, args.profiles, browser_name=args.browser)
+    report = run_checks(plan, args.profiles, browser_name=args.browser,
+                        progress=lambda message: print(message, flush=True))
     private_write(args.output, report)
     markdown = args.output.with_suffix('.md')
     private_write(markdown, report_markdown(report))

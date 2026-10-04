@@ -108,6 +108,14 @@ class ShopifyPolicyTest(unittest.TestCase):
             route.request.is_navigation_request.return_value = True
             guard(route)
             route.abort.assert_called_once()
+            resource_route = MagicMock()
+            resource_route.request.url = 'https://cdn.shopify.com/assets/admin.js'
+            resource_route.request.method = 'GET'
+            resource_route.request.post_data = None
+            resource_route.request.is_navigation_request.return_value = False
+            guard(resource_route)
+            resource_route.abort.assert_called_once()
+            self.assertTrue(all(call.kwargs['wait_until'] == 'commit' for call in context.pages[0].goto.call_args_list))
         self.assertEqual(launch_edge.call_count, 2)
 
     def test_account_session_capture_refuses_login_page(self):

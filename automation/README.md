@@ -94,9 +94,11 @@ and Markdown under
 local storage, or token/query values. These observations are not scanner findings
 and do not trigger alerts or enable the general Shopify scanner.
 
-The runner blocks mutation/action requests, websockets, foreign store/org routes,
-unknown backend endpoints, and unknown persisted GraphQL operations. First-party
-requests share a one-request-per-second limit. Rendering may therefore be partial;
-blocked requests, failed navigation, or login redirects are not permission bypasses.
-Reachability/HTTP 200 alone never confirms protected-data access or a vulnerability.
-Use the report to select manual verification against the current program criteria.
+Checks observe only the top-level navigation response; page subresources are
+aborted to keep the probe bounded and avoid login/UI load stalls. A 200 is recorded
+as `reachable_unverified`, not proof of page data, action access, or a vulnerability.
+Mutation/action requests, websockets, foreign store/org routes, and unknown
+persisted GraphQL operations are blocked. The selected top-level requests share
+a one-request-per-second limit. Login redirects and failed navigation are not
+permission bypasses. Use the report to select manual verification against current
+program criteria.
