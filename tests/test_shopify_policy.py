@@ -115,6 +115,26 @@ class ShopifyPolicyTest(unittest.TestCase):
         context.close.assert_called_once()
         browser.close.assert_called_once()
 
+    def test_account_session_capture_can_use_edge(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+        from shopify_account_checks import build_plan, capture_session
+        plan = build_plan('owned-example.myshopify.com', '12345', owned_confirmed=True, alias_confirmed=True)
+        browser = MagicMock()
+        context = browser.new_context.return_value
+        page = context.new_page.return_value
+        page.url = 'https://dev.shopify.com/dashboard/12345'
+        context.storage_state.return_value = {'cookies': [], 'origins': []}
+        playwright = SimpleNamespace(chromium=SimpleNamespace(launch=MagicMock(return_value=browser)))
+        manager = MagicMock()
+        manager.__enter__.return_value = playwright
+        with TemporaryDirectory() as directory, patch.dict(sys.modules, {'playwright': SimpleNamespace(), 'playwright.sync_api': SimpleNamespace(sync_playwright=MagicMock(return_value=manager))}), patch('builtins.input', return_value=''), patch('shopify_account_checks.private_write') as write, patch('builtins.print'):
+            capture_session(plan, 'owner', Path(directory), browser_name='edge')
+        playwright.chromium.launch.assert_called_once_with(headless=False, channel='msedge')
+        self.assertEqual(write.call_count, 2)
+        context.close.assert_called_once()
+        browser.close.assert_called_once()
+
     def test_pending_owned_store_is_recorded_but_not_enabled(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)

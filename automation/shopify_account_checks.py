@@ -164,15 +164,20 @@ def classify_observation(status: int | None, final_url: str, text: str, expected
             'reason': 'A reachable admin shell is not proof of protected-data access' if review else 'Read-only observation; permissions require independent confirmation'}
 
 
-def capture_session(plan: dict, role: str, directory: Path) -> None:
+def capture_session(plan: dict, role: str, directory: Path, *, browser_name='chromium') -> None:
     validate_plan(plan)
     if role not in plan['roles']:
         raise ValueError('Unsupported account role')
+    if browser_name not in {'chromium', 'edge'}:
+        raise ValueError('Browser must be chromium or edge')
     from playwright.sync_api import sync_playwright
     directory.mkdir(parents=True, exist_ok=True)
     os.chmod(directory, 0o700)
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=False)
+        launch_options = {'headless': False}
+        if browser_name == 'edge':
+            launch_options['channel'] = 'msedge'
+        browser = playwright.chromium.launch(**launch_options)
         context = browser.new_context()
         page = context.new_page()
         page.goto(f'https://dev.shopify.com/dashboard/{plan["organization"]}', wait_until='domcontentloaded')
@@ -328,6 +333,7 @@ def main() -> None:
             command.add_argument('--sessions', type=Path, default=Path('.secrets/shopify-sessions'))
         if name == 'capture':
             command.add_argument('--role', choices=['owner', 'appdev'], required=True)
+            command.add_argument('--browser', choices=['chromium', 'edge'], default='chromium')
         if name == 'run':
             command.add_argument('--headed', action='store_true')
             command.add_argument('--output', type=Path, default=Path('results/shopify-owned-account-checks.json'))
@@ -341,7 +347,7 @@ def main() -> None:
         return
     plan = private_read(args.plan)
     if args.command == 'capture':
-        capture_session(plan, args.role, args.sessions)
+        capture_session(plan, args.role, args.sessions, browser_name=args.browser)
         return
     report = run_checks(plan, args.sessions, headless=not args.headed)
     private_write(args.output, report)

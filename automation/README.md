@@ -65,6 +65,9 @@ Capture each account separately:
 .venv/bin/python automation/shopify_account_checks.py run
 ```
 
+On macOS with Microsoft Edge installed, add `--browser edge` to either capture
+command to use the Edge channel instead of Playwright's bundled Chromium.
+
 Login and MFA happen directly in the browser, with no credential entry in chat
 or the terminal. Verify the account identity and assigned role before pressing
 Enter; role labels are user attestations, not independently verified identities.
