@@ -178,6 +178,11 @@ def capture_session(plan: dict, role: str, directory: Path) -> None:
         page.goto(f'https://dev.shopify.com/dashboard/{plan["organization"]}', wait_until='domcontentloaded')
         print(f'Log in directly in this isolated browser as {role}. Do not paste credentials into this terminal or chat.')
         input('After confirming the requested account/role, press Enter to save its private session: ')
+        if not navigation_allowed(page.url, plan, allow_login=False) or urlsplit(page.url).hostname != 'dev.shopify.com':
+            context.close()
+            browser.close()
+            print('Session not saved: return to the selected developer organization after login, then capture again.')
+            return
         private_write(directory / f'{role}.json', context.storage_state())
         private_write(directory / f'{role}.metadata.json', {'role': role, 'shop': plan['shop'],
                                                           'organization': plan['organization'], 'role_confirmation': 'user_attestation',
