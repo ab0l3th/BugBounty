@@ -15,6 +15,7 @@ from program_builder import ROOT, active_approved, auto_run_policy, load_scope_p
 from scope_validator import is_in_scope, parse_scope_pattern
 from stages import STAGES, ACTIVE_STAGES, job_name_for
 from vhost_transport import vhost_opener
+from shopify_policy import apply_finding_eligibility, url_allowed
 from job_control import check_stop, is_stopped, job_execution, mark_stopped_result
 
 
@@ -103,6 +104,8 @@ class AutoRunGuard:
         except ValueError:
             return False
         if parsed.scheme not in {'http', 'https'} or not parsed.hostname or parsed.username or parsed.password:
+            return False
+        if not url_allowed(url, self.slug, self.root):
             return False
         if self.partitions is None:
             return is_in_scope(parsed.hostname, self.scope)
@@ -390,6 +393,7 @@ def run_auto_pipeline(slug: str, *, root: Path = ROOT, job_name=None, force=Fals
                             result['assets'] = [asset for asset in result.get('assets', []) if asset.get('domain') and guard.permits_host(asset['domain'])]
                         guard.check_approval()
                         result = worker._result_for_write(name, None, result)
+                        result = apply_finding_eligibility(result, root)
                         result['job_state'] = ('running' if result.get('remaining_count') else
                                                'completed' if result.get('status') in worker.COMPLETED_STATUSES else
                                                result.get('job_state', result.get('status', 'stopped')))

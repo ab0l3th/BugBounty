@@ -46,6 +46,25 @@ nodes, open/closed states, scroll position, focus, file selections, and in-progr
 upload or guideline inputs remain intact. Approval, upload, and job-start actions
 also refresh in place. Failed refreshes leave the current dashboard visible.
 
+## Shopify Owned-Store Controls
+
+Shopify store testing is restricted to researcher-created development stores
+using the required HackerOne email alias. Registering a hostname with
+`shopify_policy.register_pending_store` records the user's ownership statement,
+but leaves testing disabled until signup/ownership setup is confirmed. It does
+not replace the scope placeholder, expand a wildcard, or launch a scan.
+
+The private `.shopify-controls.json` inventory is displayed under the Shopify
+bounty. Runtime URL/DNS/vhost guards block the placeholder, unconfirmed merchant
+stores, known instruction-level exclusions/aliases, and unreviewed test/third-party
+cloud hosts. Explicit listed platform URLs can remain available. These built-in
+guards supplement, not replace, current program scope and permission review.
+
+Intentional Shopify GraphQL/introspection responses are non-reportable policy
+observations, excluded from findings/review/ntfy signals. Other programs retain
+their normal findings. Credential discovery remains detection-only; registration
+does not authorize authenticating with found credentials or touching other shops.
+
 ## Phone Alerts With ntfy
 
 The independent `bugbounty-ntfy.service` watches saved results every 10 seconds

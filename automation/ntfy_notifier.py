@@ -14,6 +14,7 @@ from urllib import request
 from urllib.parse import urlencode, urlsplit
 
 from program_builder import ROOT, program_identity
+from shopify_policy import apply_finding_eligibility
 
 
 class NoRedirect(request.HTTPRedirectHandler):
@@ -74,6 +75,7 @@ def topic_is_private(config: dict, *, open_request=None) -> bool:
 
 
 def finding_signals(payload: dict, *, root: Path = ROOT) -> list[dict]:
+    payload = apply_finding_eligibility(payload, root)
     program = payload.get('program', '')
     job = payload.get('job', '')
     if not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', program) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,159}', job):

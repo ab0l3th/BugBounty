@@ -15,6 +15,7 @@ from urllib.parse import urljoin, urlsplit
 from program_builder import active_approved, load_manual_analysis, read_guidelines
 from vhost_transport import vhost_opener
 from job_control import check_stop
+from shopify_policy import url_allowed
 
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = ROOT / 'results'
@@ -56,6 +57,9 @@ class ApprovedScopeClient:
         except ValueError:
             return False
         if parsed.scheme not in {'http', 'https'} or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            return False
+        checked_url = parsed._replace(netloc=host_header + (f':{port}' if port else '')).geturl() if host_header else url
+        if not url_allowed(checked_url, self.slug, self.root):
             return False
         if port is not None and not 1 <= port <= 65535:
             return False

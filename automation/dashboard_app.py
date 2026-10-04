@@ -25,6 +25,7 @@ if str(AUTOMATION_DIR) not in sys.path:
 from program_builder import active_approved, auto_run_policy, configure_auto_run, create_manual_program, create_partitioned_program, create_program, csv_scope_inventory, delete_uploaded_program, load_manual_analysis, load_scope_partitions, parse_scope, partition_csv_scope, program_identity, read_guidelines, set_active_approval, slug_from_program_name
 from stages import ACTIVE_STAGES, STAGE_BY_ID, STAGES, job_name_for, stage_for_job_name
 from job_control import clear_stop, is_stopped, request_stop
+from shopify_policy import apply_finding_eligibility, load_controls, is_shopify_program
 
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = ROOT / 'results'
@@ -214,6 +215,7 @@ def review_candidates(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     candidates = []
     seen: set[str] = set()
     for job in jobs:
+        job = apply_finding_eligibility(dict(job), ROOT)
         generation = program_identity(job.get('program', 'unknown'), root=ROOT)
         for asset in job.get('assets', []) or []:
             if not isinstance(asset, dict) or not asset.get('domain'):
@@ -1171,6 +1173,7 @@ def index():
                                      'manual': partitions['manual'], 'excluded': partitions['excluded']}
     pending_manual_programs = [item for item in manual_programs if not item.get('split_queue') and not (item['approved'] and item['workflow_queued'])]
     deletable_programs = generated_programs | {item['slug'] for item in manual_programs}
+    shopify_controls = {program: load_controls(program, ROOT) for program in grouped_jobs if is_shopify_program(program, ROOT)}
     return render_template_string('''
     <!doctype html>
     <html lang="en">
@@ -1357,6 +1360,13 @@ def index():
             {% set program_summary = summarize_program_jobs(program_jobs) %}
             <details class="program-group" id="manual-workflow-{{ program_name }}" data-state-key="program-{{ program_name }}">
               <summary class="program-header">{{ program_label(program_name) }} <span class="program-count">({{ program_summary.jobs }} jobs)</span></summary>
+              {% if program_name in shopify_controls %}
+                <details data-state-key="owned-stores-{{ program_name }}"><summary>Owned Shopify store setup</summary>
+                  {% for store in shopify_controls[program_name].owned_stores or [] %}
+                    <p><code>{{ store.hostname }}</code>: {{ store.status }}; testing {{ 'enabled' if store.testing_enabled else 'disabled' }}</p>
+                  {% else %}<p>No confirmed development-store targets registered. Merchant-store testing is blocked.</p>{% endfor %}
+                </details>
+              {% endif %}
               {% if program_name in asset_queues %}
                 <p class="meta">Automatic assets: {{ asset_queues[program_name].counts.automatic }}; operator-started/manual verification: {{ asset_queues[program_name].counts.manual }}; excluded: {{ asset_queues[program_name].counts.excluded }}</p>
                 <details data-state-key="asset-partitions-{{ program_name }}"><summary>Manual and excluded asset inventory</summary>
@@ -1436,6 +1446,14 @@ def index():
                       </details>
                     {% endif %}
                     {% set probe_log = (job.raw.probe_log if job.raw else []) %}
+                    {% set observation_assets = job.assets|selectattr('policy_observations')|list %}
+                    {% if observation_assets %}
+                      <details data-state-key="policy-observations-{{ job.name }}"><summary>Non-reportable policy observations</summary>
+                        {% for asset in observation_assets[:asset_render_cap] %}{% for observation in asset.policy_observations[:evidence_render_cap] %}
+                          <p><code>{{ asset.domain }}</code>: {{ observation.type }} - {{ observation.reason }}</p>
+                        {% endfor %}{% endfor %}
+                      </details>
+                    {% endif %}
                     {% set thread_status = (job.raw.thread_status if job.raw else []) %}
                     {% set login_redirects = probe_log|selectattr('status', 'equalto', 'login_redirect')|list %}
                     {% if probe_log or thread_status %}
@@ -2151,7 +2169,7 @@ def index():
       </script>
     </body>
     </html>
-    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, manual_programs=manual_programs, pending_manual_programs=pending_manual_programs, generated_programs=generated_programs, approved_programs=approved_programs, auto_programs=auto_programs, asset_queues=asset_queues, deletable_programs=deletable_programs, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs, workflow_order=workflow_order, highest_severity=highest_severity, asset_render_cap=ASSET_RENDER_CAP, evidence_render_cap=EVIDENCE_RENDER_CAP, thread_render_cap=THREAD_RENDER_CAP)
+    ''', jobs=jobs, summary=summary, grouped_jobs=grouped_jobs, manual_programs=manual_programs, pending_manual_programs=pending_manual_programs, generated_programs=generated_programs, approved_programs=approved_programs, auto_programs=auto_programs, asset_queues=asset_queues, deletable_programs=deletable_programs, shopify_controls=shopify_controls, program_label=program_label, job_title_label=job_title_label, summarize_program_jobs=summarize_program_jobs, workflow_order=workflow_order, highest_severity=highest_severity, asset_render_cap=ASSET_RENDER_CAP, evidence_render_cap=EVIDENCE_RENDER_CAP, thread_render_cap=THREAD_RENDER_CAP)
 
 
 @app.route('/jobs/<job_name>/stop', methods=['POST'])

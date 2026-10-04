@@ -14,6 +14,7 @@ from program_builder import ROOT, active_approved, load_manual_analysis, load_sc
 from stages import STAGES, STAGE_BY_ID, job_name_for
 import worker
 from job_control import check_stop, job_execution
+from shopify_policy import apply_finding_eligibility, host_allowed
 
 
 def _save(path: Path, payload: dict) -> None:
@@ -122,6 +123,7 @@ def run_manual_stage(slug: str, stage_id: str, *, root: Path = ROOT, client=None
     analysis = load_manual_analysis(slug, root=root)
     _, digest = read_guidelines(slug, root=root)
     scope_assets = [asset for asset in analysis['assets'] if not asset['query_present']]
+    scope_assets = [asset for asset in scope_assets if host_allowed(asset['host'], slug, root)]
     if stage_id not in {'passive-web-discovery', 'passive-dns-discovery', 'confirm-live-web-assets', 'port-scan'}:
         live_path = root / 'results' / f'{job_name_for(slug, "confirm-live-web-assets")}.json'
         live_hosts = set(json.loads(live_path.read_text(encoding='utf-8')).get('discovered', []))
@@ -141,6 +143,7 @@ def run_manual_stage(slug: str, stage_id: str, *, root: Path = ROOT, client=None
         check_stop(root, name)
         with progress_lock:
             result.update(snapshot)
+            apply_finding_eligibility(result, root)
             _save(output, result)
 
     def fetch(url, *, extra_headers=None, method='GET', data=None, **kwargs):
@@ -274,7 +277,7 @@ def run_manual_stage(slug: str, stage_id: str, *, root: Path = ROOT, client=None
         result['status'] = 'stopped'
         result['job_state'] = 'stopped'
         result['error'] = str(exc)
-    _save(output, result)
+    _save(output, apply_finding_eligibility(result, root))
     return result
 
 

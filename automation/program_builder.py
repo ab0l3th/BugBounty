@@ -76,6 +76,7 @@ def partition_csv_scope(content: str) -> dict:
         identifier = next((row[key] for key in ('identifier', 'target', 'asset_identifier', 'asset') if row.get(key)), '')
         kind = (row.get('asset_type') or row.get('type') or '').upper()
         record = {'identifier': identifier, 'asset_type': kind,
+                  'instructions': row.get('instruction', row.get('instructions', '')),
                   'id': hashlib.sha256(json.dumps([identifier, kind], sort_keys=True).encode()).hexdigest()}
         record['display_identifier'] = identifier
         if '://' in identifier:
@@ -91,6 +92,9 @@ def partition_csv_scope(content: str) -> dict:
             partitions['excluded'].append(record)
             continue
         automatic = all(value in truth for value in flags.values())
+        instruction_review = identifier.lower() == 'your-store.myshopify.com' or identifier.lower() in {'*.shopifycloud.com', '*.shopifykloud.com', '*.shopify.io'} and bool(re.search(r'third.party|test application|developer test', record['instructions'], re.IGNORECASE))
+        if instruction_review:
+            automatic = False
         web_asset = False
         pattern = parse_scope_pattern(identifier)
         if kind in {'DOMAIN', 'WILDCARD'} and pattern:
@@ -114,7 +118,9 @@ def partition_csv_scope(content: str) -> dict:
             record['reason'] = 'Eligible supported web asset'
             partitions['automatic'].append(record)
         else:
-            record['reason'] = 'In-scope eligibility requires operator review' if web_asset else 'Unsupported/app/query-bearing asset requires manual verification'
+            record['reason'] = ('Asset instructions require ownership/scope review' if instruction_review else
+                                'In-scope eligibility requires operator review' if web_asset else
+                                'Unsupported/app/query-bearing asset requires manual verification')
             partitions['manual'].append(record)
     if not partitions['automatic'] and not partitions['manual']:
         raise ValueError('No explicitly in-scope assets found')

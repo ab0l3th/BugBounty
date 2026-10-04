@@ -24,6 +24,7 @@ from stages import ACTIVE_STAGES, LEGACY_NAME_TO_STAGE, STAGE_BY_ID, job_name_fo
 from program_builder import active_approved, parse_scope
 from vhost_transport import vhost_opener, vhost_request
 from job_control import JobStopped, check_stop, is_stopped, job_execution, mark_stopped_result
+from shopify_policy import apply_finding_eligibility
 
 ROOT = Path(__file__).resolve().parent.parent
 JOBS_DIR = ROOT / 'jobs'
@@ -81,6 +82,7 @@ def _cap_log(entries: list) -> list:
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
+    payload = apply_finding_eligibility(payload, ROOT)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f'.{path.name}.tmp')
     temporary.write_text(json.dumps(payload, indent=2), encoding='utf-8')
