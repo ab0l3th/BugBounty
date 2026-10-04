@@ -205,6 +205,22 @@ def _free_loopback_port() -> int:
         return listener.getsockname()[1]
 
 
+def _clear_stale_edge_locks(profile_dir: Path) -> None:
+    commands = subprocess.run(['ps', '-axo', 'command'], capture_output=True, text=True, check=False).stdout
+    profile_arg = f'--user-data-dir={profile_dir.resolve()}'
+    if profile_arg in commands:
+        raise RuntimeError('The selected Edge profile is already open; close it before running checks')
+    for name in ('SingletonLock', 'SingletonCookie', 'SingletonSocket'):
+        marker = profile_dir / name
+        try:
+            info = marker.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+            raise RuntimeError('Unexpected directory in Edge profile lock location')
+        marker.unlink()
+
+
 def _wait_for_edge_debugger(endpoint: str, process: subprocess.Popen, timeout=20) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -219,6 +235,7 @@ def _wait_for_edge_debugger(endpoint: str, process: subprocess.Popen, timeout=20
 
 
 def _launch_edge(profile_dir: Path, start_url: str) -> tuple[subprocess.Popen, str]:
+    _clear_stale_edge_locks(profile_dir)
     port = _free_loopback_port()
     endpoint = f'http://127.0.0.1:{port}'
     process = subprocess.Popen(_edge_launch_args(_edge_binary(), profile_dir, port, start_url),
@@ -249,11 +266,15 @@ def _stop_edge(process: subprocess.Popen, browser=None) -> None:
         except Exception:
             pass
     if process.poll() is None:
-        process.terminate()
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            pass
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
 
 
 def capture_session(plan: dict, role: str, directory: Path, *, browser_name='edge') -> None:
@@ -268,38 +289,36 @@ def capture_session(plan: dict, role: str, directory: Path, *, browser_name='edg
     profile_dir = profile_root / role
     _ensure_private_directory(profile_dir)
     process, endpoint = _launch_edge(profile_dir, f'https://dev.shopify.com/dashboard/{plan["organization"]}')
-    browser = None
     try:
         print(f'Log in directly in the standalone Microsoft Edge window as {role}. Do not paste credentials into this terminal or chat.')
         input('After confirming the requested account/role in Microsoft Edge, press Enter to save its private profile: ')
         from playwright.sync_api import sync_playwright
         with sync_playwright() as playwright:
-            browser, context = _connect_edge(playwright, endpoint)
-            pages = context.pages
-            page = next((item for item in pages if navigation_allowed(item.url, plan, allow_login=False)), None)
-            if page is None or urlsplit(page.url).hostname != 'dev.shopify.com':
-                browser.close()
-                browser = None
-                print('Session not saved: return to the selected developer organization after login, then capture again.')
-                return
-            fingerprint = _state_fingerprint(context.storage_state())
-            other_role = 'appdev' if role == 'owner' else 'owner'
-            other_metadata = profile_root / f'{other_role}.metadata.json'
-            if other_metadata.exists() and private_read(other_metadata).get('profile_fingerprint') == fingerprint:
-                browser.close()
-                browser = None
-                print('Session not saved: this profile matches the other role; sign in with the separate account.')
-                return
-            private_write(profile_root / f'{role}.metadata.json', {'role': role, 'shop': plan['shop'],
-                                                                  'organization': plan['organization'], 'browser': browser_name,
-                                                                  'role_confirmation': 'user_attestation',
-                                                                  'profile_fingerprint': fingerprint,
-                                                                  'captured_at': int(time.time())})
-            browser.close()
             browser = None
-        print(f'{role} {browser_name} profile saved privately. Never share these files or commit them.')
+            try:
+                browser, context = _connect_edge(playwright, endpoint)
+                pages = context.pages
+                page = next((item for item in pages if navigation_allowed(item.url, plan, allow_login=False)), None)
+                if page is None or urlsplit(page.url).hostname != 'dev.shopify.com':
+                    print('Session not saved: return to the selected developer organization after login, then capture again.')
+                    return
+                fingerprint = _state_fingerprint(context.storage_state())
+                other_role = 'appdev' if role == 'owner' else 'owner'
+                other_metadata = profile_root / f'{other_role}.metadata.json'
+                if other_metadata.exists() and private_read(other_metadata).get('profile_fingerprint') == fingerprint:
+                    print('Session not saved: this profile matches the other role; sign in with the separate account.')
+                    return
+                private_write(profile_root / f'{role}.metadata.json', {'role': role, 'shop': plan['shop'],
+                                                                      'organization': plan['organization'], 'browser': browser_name,
+                                                                      'role_confirmation': 'user_attestation',
+                                                                      'profile_fingerprint': fingerprint,
+                                                                      'captured_at': int(time.time())})
+                print(f'{role} {browser_name} profile saved privately. Never share these files or commit them.')
+            finally:
+                _stop_edge(process, browser)
     finally:
-        _stop_edge(process, browser)
+        if process.poll() is None:
+            _stop_edge(process)
 
 
 def _profile_pair(plan: dict, directory: Path, browser_name: str) -> dict:

@@ -113,7 +113,7 @@ class ShopifyPolicyTest(unittest.TestCase):
     def test_account_session_capture_refuses_login_page(self):
         from types import SimpleNamespace
         from unittest.mock import MagicMock, patch
-        from shopify_account_checks import build_plan, capture_session
+        from shopify_account_checks import build_plan, capture_session, _clear_stale_edge_locks
         plan = build_plan('owned-example.myshopify.com', '12345', owned_confirmed=True, alias_confirmed=True)
         browser = MagicMock()
         context = MagicMock()
@@ -121,15 +121,36 @@ class ShopifyPolicyTest(unittest.TestCase):
         context.pages[0].url = 'https://accounts.shopify.com/login'
         manager = MagicMock()
         manager.__enter__.return_value = SimpleNamespace()
+        process = MagicMock()
+        process.poll.return_value = 0
         with TemporaryDirectory() as directory, patch.dict(sys.modules, {'playwright': SimpleNamespace(), 'playwright.sync_api': SimpleNamespace(sync_playwright=MagicMock(return_value=manager))}), \
-            patch('shopify_account_checks._launch_edge', return_value=(MagicMock(), 'http://127.0.0.1:9001')), \
+            patch('shopify_account_checks._launch_edge', return_value=(process, 'http://127.0.0.1:9001')), \
             patch('shopify_account_checks._connect_edge', return_value=(browser, context)), \
-            patch('shopify_account_checks._stop_edge'), patch('builtins.input', return_value=''), \
+            patch('shopify_account_checks._stop_edge') as stop_edge, patch('builtins.input', return_value=''), \
             patch('shopify_account_checks.private_write') as write, patch('builtins.print') as output:
             capture_session(plan, 'owner', Path(directory), browser_name='edge')
         write.assert_not_called()
         output.assert_any_call('Session not saved: return to the selected developer organization after login, then capture again.')
-        browser.close.assert_called_once()
+        stop_edge.assert_called_once_with(process, browser)
+
+    def test_stale_edge_lock_cleanup_never_removes_lock_for_active_profile(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from shopify_account_checks import _clear_stale_edge_locks
+        with TemporaryDirectory() as directory:
+            profile = Path(directory) / 'owner'
+            profile.mkdir()
+            lock = profile / 'SingletonLock'
+            lock.symlink_to('stale-edge-process')
+            with patch('shopify_account_checks.subprocess.run', return_value=SimpleNamespace(stdout='')):
+                _clear_stale_edge_locks(profile)
+            self.assertFalse(lock.is_symlink())
+            lock.symlink_to('active-edge-process')
+            command = f'edge --user-data-dir={profile.resolve()}'
+            with patch('shopify_account_checks.subprocess.run', return_value=SimpleNamespace(stdout=command)):
+                with self.assertRaises(RuntimeError):
+                    _clear_stale_edge_locks(profile)
+            self.assertTrue(lock.is_symlink())
 
     def test_account_session_capture_can_use_edge(self):
         from types import SimpleNamespace
@@ -146,9 +167,11 @@ class ShopifyPolicyTest(unittest.TestCase):
         connect = MagicMock(side_effect=lambda _playwright, _endpoint: (events.append('attached') or (browser, context)))
         manager = MagicMock()
         manager.__enter__.return_value = SimpleNamespace()
+        process = MagicMock()
+        process.poll.return_value = 0
         with TemporaryDirectory() as directory, patch.dict(sys.modules, {'playwright': SimpleNamespace(), 'playwright.sync_api': SimpleNamespace(sync_playwright=MagicMock(return_value=manager))}), \
-            patch('shopify_account_checks._launch_edge', return_value=(MagicMock(), 'http://127.0.0.1:9001')) as launch, \
-            patch('shopify_account_checks._connect_edge', connect), patch('shopify_account_checks._stop_edge'), \
+            patch('shopify_account_checks._launch_edge', return_value=(process, 'http://127.0.0.1:9001')) as launch, \
+            patch('shopify_account_checks._connect_edge', connect), patch('shopify_account_checks._stop_edge') as stop_edge, \
             patch('builtins.input', side_effect=lambda _prompt: events.append('login_confirmed')), \
             patch('shopify_account_checks.private_write') as write, patch('builtins.print'):
             capture_session(plan, 'owner', Path(directory), browser_name='edge')
@@ -156,7 +179,7 @@ class ShopifyPolicyTest(unittest.TestCase):
         launch.assert_called_once_with(profile, 'https://dev.shopify.com/dashboard/12345')
         self.assertEqual(events, ['login_confirmed', 'attached'])
         self.assertEqual(write.call_count, 1)
-        browser.close.assert_called_once()
+        stop_edge.assert_called_once_with(process, browser)
         args = _edge_launch_args('/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge', profile, 9222, 'about:blank')
         self.assertIn('--remote-debugging-address=127.0.0.1', args)
         self.assertIn('--remote-debugging-port=9222', args)
