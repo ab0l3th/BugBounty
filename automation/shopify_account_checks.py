@@ -6,10 +6,14 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import socket
 import stat
+import subprocess
 import tempfile
 import time
 from urllib.parse import parse_qs, urlsplit
+from urllib.request import urlopen
 
 
 def build_plan(shop: str, organization: str, *, owned_confirmed=False, alias_confirmed=False,
@@ -178,45 +182,124 @@ def _state_fingerprint(state: dict) -> str:
     return hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
 
 
+def _edge_binary() -> str:
+    mac_edge = Path('/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge')
+    if mac_edge.is_file() and os.access(mac_edge, os.X_OK):
+        return str(mac_edge)
+    for name in ('msedge', 'microsoft-edge'):
+        executable = shutil.which(name)
+        if executable:
+            return executable
+    raise RuntimeError('Microsoft Edge executable not found')
+
+
+def _edge_launch_args(binary: str, profile_dir: Path, port: int, start_url: str) -> list[str]:
+    return [binary, f'--user-data-dir={profile_dir}', '--remote-debugging-address=127.0.0.1',
+            f'--remote-debugging-port={port}', '--no-first-run', '--no-default-browser-check',
+            '--disable-background-mode', start_url]
+
+
+def _free_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(('127.0.0.1', 0))
+        return listener.getsockname()[1]
+
+
+def _wait_for_edge_debugger(endpoint: str, process: subprocess.Popen, timeout=20) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError('Microsoft Edge exited before its local debugger was ready')
+        try:
+            with urlopen(endpoint + '/json/version', timeout=0.5):
+                return
+        except Exception:
+            time.sleep(0.1)
+    raise TimeoutError('Microsoft Edge local debugger did not become ready')
+
+
+def _launch_edge(profile_dir: Path, start_url: str) -> tuple[subprocess.Popen, str]:
+    port = _free_loopback_port()
+    endpoint = f'http://127.0.0.1:{port}'
+    process = subprocess.Popen(_edge_launch_args(_edge_binary(), profile_dir, port, start_url),
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        _wait_for_edge_debugger(endpoint, process)
+    except Exception:
+        _stop_edge(process)
+        raise
+    return process, endpoint
+
+
+def _connect_edge(playwright, endpoint: str):
+    if not endpoint.startswith('http://127.0.0.1:'):
+        raise ValueError('Edge debugger endpoint must be loopback-only')
+    browser = playwright.chromium.connect_over_cdp(endpoint, timeout=10000)
+    if not browser.contexts:
+        browser.close()
+        raise RuntimeError('Edge has no browser context')
+    return browser, browser.contexts[0]
+
+
+def _stop_edge(process: subprocess.Popen, browser=None) -> None:
+    if browser is not None:
+        try:
+            browser.close()
+        except Exception:
+            pass
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+
 def capture_session(plan: dict, role: str, directory: Path, *, browser_name='edge') -> None:
     validate_plan(plan)
     if role not in plan['roles']:
         raise ValueError('Unsupported account role')
-    if browser_name not in {'chromium', 'edge'}:
-        raise ValueError('Browser must be chromium or edge')
-    from playwright.sync_api import sync_playwright
+    if browser_name != 'edge':
+        raise ValueError('Only ordinary Microsoft Edge is supported for account authentication')
     _ensure_private_directory(directory)
     profile_root = directory / browser_name
     _ensure_private_directory(profile_root)
     profile_dir = profile_root / role
     _ensure_private_directory(profile_dir)
-    with sync_playwright() as playwright:
-        launch_options = {'headless': False}
-        if browser_name == 'edge':
-            launch_options['channel'] = 'msedge'
-        context = playwright.chromium.launch_persistent_context(str(profile_dir), **launch_options)
-        page = context.pages[0] if context.pages else context.new_page()
-        page.goto(f'https://dev.shopify.com/dashboard/{plan["organization"]}', wait_until='domcontentloaded')
-        print(f'Log in directly in this isolated browser as {role}. Do not paste credentials into this terminal or chat.')
-        input('After confirming the requested account/role, press Enter to save its private session: ')
-        if not navigation_allowed(page.url, plan, allow_login=False) or urlsplit(page.url).hostname != 'dev.shopify.com':
-            context.close()
-            print('Session not saved: return to the selected developer organization after login, then capture again.')
-            return
-        fingerprint = _state_fingerprint(context.storage_state())
-        other_role = 'appdev' if role == 'owner' else 'owner'
-        other_metadata = profile_root / f'{other_role}.metadata.json'
-        if other_metadata.exists() and private_read(other_metadata).get('profile_fingerprint') == fingerprint:
-            context.close()
-            print('Session not saved: this profile matches the other role; sign in with the separate account.')
-            return
-        private_write(profile_root / f'{role}.metadata.json', {'role': role, 'shop': plan['shop'],
-                                                              'organization': plan['organization'], 'browser': browser_name,
-                                                              'role_confirmation': 'user_attestation',
-                                                              'profile_fingerprint': fingerprint,
-                                                              'captured_at': int(time.time())})
-        context.close()
-    print(f'{role} {browser_name} profile saved privately. Never share these files or commit them.')
+    process, endpoint = _launch_edge(profile_dir, f'https://dev.shopify.com/dashboard/{plan["organization"]}')
+    browser = None
+    try:
+        print(f'Log in directly in the standalone Microsoft Edge window as {role}. Do not paste credentials into this terminal or chat.')
+        input('After confirming the requested account/role in Microsoft Edge, press Enter to save its private profile: ')
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as playwright:
+            browser, context = _connect_edge(playwright, endpoint)
+            pages = context.pages
+            page = next((item for item in pages if navigation_allowed(item.url, plan, allow_login=False)), None)
+            if page is None or urlsplit(page.url).hostname != 'dev.shopify.com':
+                browser.close()
+                browser = None
+                print('Session not saved: return to the selected developer organization after login, then capture again.')
+                return
+            fingerprint = _state_fingerprint(context.storage_state())
+            other_role = 'appdev' if role == 'owner' else 'owner'
+            other_metadata = profile_root / f'{other_role}.metadata.json'
+            if other_metadata.exists() and private_read(other_metadata).get('profile_fingerprint') == fingerprint:
+                browser.close()
+                browser = None
+                print('Session not saved: this profile matches the other role; sign in with the separate account.')
+                return
+            private_write(profile_root / f'{role}.metadata.json', {'role': role, 'shop': plan['shop'],
+                                                                  'organization': plan['organization'], 'browser': browser_name,
+                                                                  'role_confirmation': 'user_attestation',
+                                                                  'profile_fingerprint': fingerprint,
+                                                                  'captured_at': int(time.time())})
+            browser.close()
+            browser = None
+        print(f'{role} {browser_name} profile saved privately. Never share these files or commit them.')
+    finally:
+        _stop_edge(process, browser)
 
 
 def _profile_pair(plan: dict, directory: Path, browser_name: str) -> dict:
@@ -244,7 +327,7 @@ def _profile_pair(plan: dict, directory: Path, browser_name: str) -> dict:
     return profiles
 
 
-def run_checks(plan: dict, directory: Path, *, headless=True, browser_name='edge') -> dict:
+def run_checks(plan: dict, directory: Path, *, browser_name='edge') -> dict:
     validate_plan(plan)
     profiles = _profile_pair(plan, directory, browser_name)
     from playwright.sync_api import sync_playwright
@@ -253,74 +336,75 @@ def run_checks(plan: dict, directory: Path, *, headless=True, browser_name='edge
     last_first_party = [None]
     with sync_playwright() as playwright:
         for role in plan['roles']:
-            launch_options = {'headless': headless, 'service_workers': 'block'}
-            if browser_name == 'edge':
-                launch_options['channel'] = 'msedge'
-            context = playwright.chromium.launch_persistent_context(str(profiles[role]), **launch_options)
-            blocked = {'count': 0}
+            process, endpoint = _launch_edge(profiles[role], 'about:blank')
+            browser = None
+            try:
+                browser, context = _connect_edge(playwright, endpoint)
+                blocked = {'count': 0}
 
-            def block_websocket(socket):
-                blocked['count'] += 1
-                socket.close()
-
-            context.route_web_socket('**/*', block_websocket)
-
-            def guard(route):
-                req = route.request
-                parsed = urlsplit(req.url)
-                if req.is_navigation_request() and not navigation_allowed(req.url, plan):
+                def block_websocket(socket):
                     blocked['count'] += 1
-                    route.abort()
-                    return
-                if not req.is_navigation_request() and not resource_allowed(req.url, plan):
-                    blocked['count'] += 1
-                    route.abort()
-                    return
-                if not read_only_request(req.method, req.url, req.post_data):
-                    blocked['count'] += 1
-                    route.abort()
-                    return
-                previous = last_first_party[0]
-                if previous is not None:
-                    delay = 1 - (time.monotonic() - previous)
-                    if delay > 0:
-                        time.sleep(delay)
-                last_first_party[0] = time.monotonic()
-                route.continue_()
+                    socket.close()
 
-            context.route('**/*', guard)
-            page = context.pages[0] if context.pages else context.new_page()
-            context.on('page', lambda popup: popup.close())
-            for target in plan['targets']:
-                if last_main is not None:
-                    delay = 1 - (time.monotonic() - last_main)
-                    if delay > 0:
-                        time.sleep(delay)
-                blocked['count'] = 0
-                status = None
-                navigation_error = False
-                text = ''
-                last_main = time.monotonic()
-                try:
-                    response = page.goto(target['url'], wait_until='domcontentloaded', timeout=20000)
-                    status = response.status if response else None
+                context.route_web_socket('**/*', block_websocket)
+
+                def guard(route):
+                    req = route.request
+                    parsed = urlsplit(req.url)
+                    if req.is_navigation_request() and not navigation_allowed(req.url, plan):
+                        blocked['count'] += 1
+                        route.abort()
+                        return
+                    if not req.is_navigation_request() and not resource_allowed(req.url, plan):
+                        blocked['count'] += 1
+                        route.abort()
+                        return
+                    if not read_only_request(req.method, req.url, req.post_data):
+                        blocked['count'] += 1
+                        route.abort()
+                        return
+                    previous = last_first_party[0]
+                    if previous is not None:
+                        delay = 1 - (time.monotonic() - previous)
+                        if delay > 0:
+                            time.sleep(delay)
+                    last_first_party[0] = time.monotonic()
+                    route.continue_()
+
+                context.route('**/*', guard)
+                page = context.pages[0] if context.pages else context.new_page()
+                context.on('page', lambda popup: popup.close())
+                for target in plan['targets']:
+                    if last_main is not None:
+                        delay = 1 - (time.monotonic() - last_main)
+                        if delay > 0:
+                            time.sleep(delay)
+                    blocked['count'] = 0
+                    status = None
+                    navigation_error = False
+                    text = ''
+                    last_main = time.monotonic()
                     try:
-                        text = page.locator('body').inner_text(timeout=3000)[:65536]
+                        response = page.goto(target['url'], wait_until='domcontentloaded', timeout=20000)
+                        status = response.status if response else None
+                        try:
+                            text = page.locator('body').inner_text(timeout=3000)[:65536]
+                        except Exception:
+                            navigation_error = True
                     except Exception:
                         navigation_error = True
-                except Exception:
-                    navigation_error = True
-                observed = classify_observation(status, page.url, text, target['expected'].get(role, 'unknown'),
-                                                blocked_requests=blocked['count'], navigation_error=navigation_error)
-                final = urlsplit(page.url)
-                selected_paths = {urlsplit(selected['url']).path for selected in plan['targets']}
-                safe_path = '/login' if final.hostname in {'accounts.shopify.com', 'accounts.shopifycloud.com'} else final.path if final.path in selected_paths else '[unselected path withheld]'
-                rows.append({'role': role, 'target': target['name'], 'url': target['url'], 'http_status': status,
-                             'final_host': final.hostname, 'final_path': safe_path, 'query_present': bool(final.query),
-                             'blocked_requests': blocked['count'], **observed})
-                if observed['observed'] == 'login_required':
-                    break
-            context.close()
+                    observed = classify_observation(status, page.url, text, target['expected'].get(role, 'unknown'),
+                                                    blocked_requests=blocked['count'], navigation_error=navigation_error)
+                    final = urlsplit(page.url)
+                    selected_paths = {urlsplit(selected['url']).path for selected in plan['targets']}
+                    safe_path = '/login' if final.hostname in {'accounts.shopify.com', 'accounts.shopifycloud.com'} else final.path if final.path in selected_paths else '[unselected path withheld]'
+                    rows.append({'role': role, 'target': target['name'], 'url': target['url'], 'http_status': status,
+                                 'final_host': final.hostname, 'final_path': safe_path, 'query_present': bool(final.query),
+                                 'blocked_requests': blocked['count'], **observed})
+                    if observed['observed'] == 'login_required':
+                        break
+            finally:
+                _stop_edge(process, browser)
     return {'program': 'shopify', 'job': 'shopify-owned-account-checks', 'shop': plan['shop'],
             'generated_at': int(time.time()),
             'organization': plan['organization'], 'test_selection': 'read_only_account_comparison',
@@ -361,10 +445,9 @@ def main() -> None:
             command.add_argument('--profiles', type=Path, default=Path('.secrets/shopify-account-profiles'))
         if name == 'capture':
             command.add_argument('--role', choices=['owner', 'appdev'], required=True)
-            command.add_argument('--browser', choices=['chromium', 'edge'], default='edge')
+            command.add_argument('--browser', choices=['edge'], default='edge')
         if name == 'run':
-            command.add_argument('--headed', action='store_true')
-            command.add_argument('--browser', choices=['chromium', 'edge'], default='edge')
+            command.add_argument('--browser', choices=['edge'], default='edge')
             command.add_argument('--output', type=Path, default=Path('results/shopify-owned-account-checks.json'))
     args = parser.parse_args()
     if args.command == 'prepare':
@@ -378,7 +461,7 @@ def main() -> None:
     if args.command == 'capture':
         capture_session(plan, args.role, args.profiles, browser_name=args.browser)
         return
-    report = run_checks(plan, args.profiles, headless=not args.headed, browser_name=args.browser)
+    report = run_checks(plan, args.profiles, browser_name=args.browser)
     private_write(args.output, report)
     markdown = args.output.with_suffix('.md')
     private_write(markdown, report_markdown(report))
@@ -392,6 +475,6 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         raise SystemExit('Stopped by operator; no browser/session details logged')
     except ModuleNotFoundError:
-        raise SystemExit('Install the optional account-check requirements and Chromium browser; see automation/README.md')
+        raise SystemExit('Install the account-check requirements and Microsoft Edge; see automation/README.md')
     except Exception:
         raise SystemExit('Account check failed. Check private plan/session permissions, role capture, and browser setup. Sensitive exception details withheld.')

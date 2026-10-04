@@ -73,9 +73,8 @@ class ShopifyPolicyTest(unittest.TestCase):
         from shopify_account_checks import build_plan, private_write, _state_fingerprint, run_checks
         plan = build_plan('owned-example.myshopify.com', '12345', owned_confirmed=True, alias_confirmed=True, store_kind='production')
         factory = MagicMock()
-        playwright = factory.return_value.__enter__.return_value
         contexts = [MagicMock(), MagicMock()]
-        playwright.chromium.launch_persistent_context.side_effect = contexts
+        browsers = [MagicMock(), MagicMock()]
         for context in contexts:
             context.pages = [MagicMock()]
             context.pages[0].goto.return_value.status = 200
@@ -89,7 +88,10 @@ class ShopifyPolicyTest(unittest.TestCase):
                 (edge / role).mkdir(mode=0o700)
                 private_write(edge / f'{role}.metadata.json', {'role': role, 'shop': plan['shop'], 'organization': plan['organization'],
                                                                'browser': 'edge', 'profile_fingerprint': _state_fingerprint({'role': role})})
-            with patch.dict(sys.modules, {'playwright': SimpleNamespace(), 'playwright.sync_api': SimpleNamespace(sync_playwright=factory)}), patch('shopify_account_checks.time.sleep'):
+            with patch.dict(sys.modules, {'playwright': SimpleNamespace(), 'playwright.sync_api': SimpleNamespace(sync_playwright=factory)}), \
+                    patch('shopify_account_checks._launch_edge', side_effect=[(MagicMock(), 'http://127.0.0.1:9001'), (MagicMock(), 'http://127.0.0.1:9002')]) as launch_edge, \
+                    patch('shopify_account_checks._connect_edge', side_effect=list(zip(browsers, contexts))), \
+                    patch('shopify_account_checks._stop_edge'), patch('shopify_account_checks.time.sleep'):
                 report = run_checks(plan, profiles)
         self.assertEqual(len(report['rows']), 6)
         self.assertTrue(report['rows'][-1]['manual_review_required'])
@@ -100,53 +102,66 @@ class ShopifyPolicyTest(unittest.TestCase):
         self.assertNotIn('private-response-body', serialized)
         for context in contexts:
             context.route_web_socket.assert_called_once()
-            context.close.assert_called_once()
             guard = context.route.call_args.args[1]
             route = MagicMock()
             route.request.url = 'https://other.myshopify.com/admin'
             route.request.is_navigation_request.return_value = True
             guard(route)
             route.abort.assert_called_once()
-        self.assertEqual(playwright.chromium.launch_persistent_context.call_count, 2)
+        self.assertEqual(launch_edge.call_count, 2)
 
     def test_account_session_capture_refuses_login_page(self):
         from types import SimpleNamespace
         from unittest.mock import MagicMock, patch
         from shopify_account_checks import build_plan, capture_session
         plan = build_plan('owned-example.myshopify.com', '12345', owned_confirmed=True, alias_confirmed=True)
+        browser = MagicMock()
         context = MagicMock()
         context.pages = [MagicMock()]
         context.pages[0].url = 'https://accounts.shopify.com/login'
-        launch = MagicMock(return_value=context)
-        playwright = SimpleNamespace(chromium=SimpleNamespace(launch_persistent_context=launch))
         manager = MagicMock()
-        manager.__enter__.return_value = playwright
-        with TemporaryDirectory() as directory, patch.dict(sys.modules, {'playwright': SimpleNamespace(), 'playwright.sync_api': SimpleNamespace(sync_playwright=MagicMock(return_value=manager))}), patch('builtins.input', return_value=''), patch('shopify_account_checks.private_write') as write, patch('builtins.print') as output:
+        manager.__enter__.return_value = SimpleNamespace()
+        with TemporaryDirectory() as directory, patch.dict(sys.modules, {'playwright': SimpleNamespace(), 'playwright.sync_api': SimpleNamespace(sync_playwright=MagicMock(return_value=manager))}), \
+            patch('shopify_account_checks._launch_edge', return_value=(MagicMock(), 'http://127.0.0.1:9001')), \
+            patch('shopify_account_checks._connect_edge', return_value=(browser, context)), \
+            patch('shopify_account_checks._stop_edge'), patch('builtins.input', return_value=''), \
+            patch('shopify_account_checks.private_write') as write, patch('builtins.print') as output:
             capture_session(plan, 'owner', Path(directory), browser_name='edge')
         write.assert_not_called()
         output.assert_any_call('Session not saved: return to the selected developer organization after login, then capture again.')
-        context.close.assert_called_once()
+        browser.close.assert_called_once()
 
     def test_account_session_capture_can_use_edge(self):
         from types import SimpleNamespace
         from unittest.mock import MagicMock, patch
-        from shopify_account_checks import build_plan, capture_session
+        from shopify_account_checks import build_plan, capture_session, _edge_launch_args, _connect_edge
         plan = build_plan('owned-example.myshopify.com', '12345', owned_confirmed=True, alias_confirmed=True)
+        browser = MagicMock()
         context = MagicMock()
         page = MagicMock()
         context.pages = [page]
         page.url = 'https://dev.shopify.com/dashboard/12345'
         context.storage_state.return_value = {'cookies': [], 'origins': []}
-        launch = MagicMock(return_value=context)
-        playwright = SimpleNamespace(chromium=SimpleNamespace(launch_persistent_context=launch))
+        events = []
+        connect = MagicMock(side_effect=lambda _playwright, _endpoint: (events.append('attached') or (browser, context)))
         manager = MagicMock()
-        manager.__enter__.return_value = playwright
-        with TemporaryDirectory() as directory, patch.dict(sys.modules, {'playwright': SimpleNamespace(), 'playwright.sync_api': SimpleNamespace(sync_playwright=MagicMock(return_value=manager))}), patch('builtins.input', return_value=''), patch('shopify_account_checks.private_write') as write, patch('builtins.print'):
+        manager.__enter__.return_value = SimpleNamespace()
+        with TemporaryDirectory() as directory, patch.dict(sys.modules, {'playwright': SimpleNamespace(), 'playwright.sync_api': SimpleNamespace(sync_playwright=MagicMock(return_value=manager))}), \
+            patch('shopify_account_checks._launch_edge', return_value=(MagicMock(), 'http://127.0.0.1:9001')) as launch, \
+            patch('shopify_account_checks._connect_edge', connect), patch('shopify_account_checks._stop_edge'), \
+            patch('builtins.input', side_effect=lambda _prompt: events.append('login_confirmed')), \
+            patch('shopify_account_checks.private_write') as write, patch('builtins.print'):
             capture_session(plan, 'owner', Path(directory), browser_name='edge')
         profile = Path(directory) / 'edge' / 'owner'
-        launch.assert_called_once_with(str(profile), headless=False, channel='msedge')
+        launch.assert_called_once_with(profile, 'https://dev.shopify.com/dashboard/12345')
+        self.assertEqual(events, ['login_confirmed', 'attached'])
         self.assertEqual(write.call_count, 1)
-        context.close.assert_called_once()
+        browser.close.assert_called_once()
+        args = _edge_launch_args('/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge', profile, 9222, 'about:blank')
+        self.assertIn('--remote-debugging-address=127.0.0.1', args)
+        self.assertIn('--remote-debugging-port=9222', args)
+        with self.assertRaises(ValueError):
+            _connect_edge(SimpleNamespace(), 'http://192.168.1.10:9222')
 
     def test_pending_owned_store_is_recorded_but_not_enabled(self):
         with TemporaryDirectory() as directory:
