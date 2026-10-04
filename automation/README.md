@@ -43,6 +43,12 @@ Install the optional browser dependency locally:
 ```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install -r automation/requirements-account-checks.txt
+```
+
+Edge uses the installed Microsoft Edge application. To use the optional bundled
+Chromium fallback instead, install its browser binary:
+
+```sh
 .venv/bin/python -m playwright install chromium
 ```
 
@@ -57,27 +63,36 @@ Prepare the matrix after confirming ownership and required HackerOne-alias signu
 Add `--store-kind production` only if confirmed. Billing is excluded unless
 explicitly selected with `--include-billing` during preparation.
 
-Capture each account separately:
+Capture each account separately. Edge is the default; the first capture creates a
+separate persistent profile for that role and opens a visible Edge window:
 
 ```sh
-.venv/bin/python automation/shopify_account_checks.py capture --role owner
-.venv/bin/python automation/shopify_account_checks.py capture --role appdev
+.venv/bin/python automation/shopify_account_checks.py capture --role owner --browser edge
+.venv/bin/python automation/shopify_account_checks.py capture --role appdev --browser edge
 .venv/bin/python automation/shopify_account_checks.py run
 ```
 
-On macOS with Microsoft Edge installed, add `--browser edge` to either capture
-command to use the Edge channel instead of Playwright's bundled Chromium.
+The profiles are created under `.secrets/shopify-account-profiles/edge/owner`
+and `.secrets/shopify-account-profiles/edge/appdev`. Log into the appropriate
+account in each window, confirm the selected developer organization, then press
+Enter in the terminal. The profile is reused by later `run` commands; it is not
+exported as a cookie/storage-state JSON file. You do not need to create Edge
+profiles manually. Keep the profile directories local, don't enable browser
+sync for them, and never copy, share, or commit them. They contain reusable
+authentication state and are owner-only under the ignored `.secrets/` directory.
+
+Use `--browser chromium` only if you want Playwright's bundled Chromium instead.
+Microsoft Edge must be installed for `--browser edge`; install the Playwright
+Chromium binary only for the Chromium option. `run --headed` opens visible test
+windows; otherwise checks use headless Edge with the same persistent profiles.
 
 Login and MFA happen directly in the browser, with no credential entry in chat
 or the terminal. Verify the account identity and assigned role before pressing
 Enter; role labels are user attestations, not independently verified identities.
 Capture permits your manual authentication flow; it is not an automated test.
-Session JSON contains authentication material: keep it local and never share it,
-commit it, or upload it to the scanner server. Default files are ignored by Git
-under `.secrets/`; sessions use a private directory and owner-only files.
-
-Repeat `run` to refresh the comparison, or capture again after session expiry.
-`--headed` shows the test browser. Reports are owner-only JSON and Markdown under
+Repeat `run` to refresh the comparison. If Shopify expires the session, rerun
+`capture` for that role in the existing profile and complete login interactively;
+the tool never bypasses passkeys, MFA, or CAPTCHA. Reports are owner-only JSON and Markdown under
 `results/shopify-owned-account-checks.*`, with no raw text, screenshots, cookies,
 local storage, or token/query values. These observations are not scanner findings
 and do not trigger alerts or enable the general Shopify scanner.

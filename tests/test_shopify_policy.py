@@ -37,21 +37,31 @@ class ShopifyPolicyTest(unittest.TestCase):
         self.assertEqual(classify_observation(200, plan['targets'][0]['url'], 'Partial shell', 'allowed', blocked_requests=1)['observed'], 'inconclusive')
 
     def test_private_account_session_files_and_reports_never_expose_tokens(self):
-        from shopify_account_checks import build_plan, private_write, private_read, _session_pair, report_markdown
+        from shopify_account_checks import build_plan, private_write, private_read, _profile_pair, _state_fingerprint, report_markdown
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            sessions = root / 'sessions'
-            sessions.mkdir(mode=0o700)
+            profiles = root / 'profiles'
+            profiles.mkdir(mode=0o700)
+            edge = profiles / 'edge'
+            edge.mkdir(mode=0o700)
             plan = build_plan('owned-example.myshopify.com', '12345', owned_confirmed=True, alias_confirmed=True)
-            state = {'cookies': [{'name': 'test-session', 'value': 'private-session-value', 'domain': '.shopify.com', 'path': '/'}], 'origins': []}
             for role in ('owner', 'appdev'):
-                private_write(sessions / f'{role}.json', state)
-                private_write(sessions / f'{role}.metadata.json', {'role': role, 'shop': plan['shop'], 'organization': plan['organization']})
+                (edge / role).mkdir(mode=0o700)
+                state = {'cookies': [{'name': 'test-session', 'value': role, 'domain': '.shopify.com', 'path': '/'}], 'origins': []}
+                private_write(edge / f'{role}.metadata.json', {'role': role, 'shop': plan['shop'], 'organization': plan['organization'],
+                                                               'browser': 'edge', 'profile_fingerprint': _state_fingerprint(state)})
+            self.assertEqual(set(_profile_pair(plan, profiles, 'edge')), {'owner', 'appdev'})
+            owner_metadata = private_read(edge / 'owner.metadata.json')
+            appdev_metadata = private_read(edge / 'appdev.metadata.json')
+            owner_metadata['profile_fingerprint'] = appdev_metadata['profile_fingerprint']
+            private_write(edge / 'owner.metadata.json', owner_metadata)
             with self.assertRaises(ValueError):
-                _session_pair(plan, sessions)
-            (sessions / 'owner.json').chmod(0o644)
+                _profile_pair(plan, profiles, 'edge')
+            owner_metadata['profile_fingerprint'] = _state_fingerprint({'role': 'owner'})
+            private_write(edge / 'owner.metadata.json', owner_metadata)
+            (edge / 'owner.metadata.json').chmod(0o644)
             with self.assertRaises(ValueError):
-                private_read(sessions / 'owner.json')
+                _profile_pair(plan, profiles, 'edge')
             markdown = report_markdown({'shop': plan['shop'], 'rows': [{'role': 'appdev', 'target': 'owned_store_admin', 'expected': 'denied',
                                       'observed': 'reachable_unverified', 'http_status': 200, 'manual_review_required': True}]})
             self.assertNotIn('private-session-value', markdown)
@@ -60,25 +70,27 @@ class ShopifyPolicyTest(unittest.TestCase):
     def test_account_browser_runner_isolated_read_only_and_sanitized(self):
         from types import SimpleNamespace
         from unittest.mock import MagicMock, patch
-        from shopify_account_checks import build_plan, private_write, run_checks
+        from shopify_account_checks import build_plan, private_write, _state_fingerprint, run_checks
         plan = build_plan('owned-example.myshopify.com', '12345', owned_confirmed=True, alias_confirmed=True, store_kind='production')
         factory = MagicMock()
-        browser = factory.return_value.__enter__.return_value.chromium.launch.return_value
+        playwright = factory.return_value.__enter__.return_value
         contexts = [MagicMock(), MagicMock()]
-        browser.new_context.side_effect = contexts
+        playwright.chromium.launch_persistent_context.side_effect = contexts
         for context in contexts:
-            page = context.new_page.return_value
-            page.goto.return_value.status = 200
-            page.url = plan['targets'][0]['url'] + '?token=private-response-token'
-            page.locator.return_value.inner_text.return_value = 'Admin shell private-response-body'
+            context.pages = [MagicMock()]
+            context.pages[0].goto.return_value.status = 200
+            context.pages[0].url = plan['targets'][0]['url'] + '?token=private-response-token'
+            context.pages[0].locator.return_value.inner_text.return_value = 'Admin shell private-response-body'
         with TemporaryDirectory() as directory:
-            sessions = Path(directory)
-            sessions.chmod(0o700)
+            profiles = Path(directory)
+            edge = profiles / 'edge'
+            edge.mkdir(mode=0o700)
             for role in ('owner', 'appdev'):
-                private_write(sessions / f'{role}.json', {'cookies': [{'name': 'session', 'value': role + '-private-cookie'}], 'origins': []})
-                private_write(sessions / f'{role}.metadata.json', {'role': role, 'shop': plan['shop'], 'organization': plan['organization']})
+                (edge / role).mkdir(mode=0o700)
+                private_write(edge / f'{role}.metadata.json', {'role': role, 'shop': plan['shop'], 'organization': plan['organization'],
+                                                               'browser': 'edge', 'profile_fingerprint': _state_fingerprint({'role': role})})
             with patch.dict(sys.modules, {'playwright': SimpleNamespace(), 'playwright.sync_api': SimpleNamespace(sync_playwright=factory)}), patch('shopify_account_checks.time.sleep'):
-                report = run_checks(plan, sessions)
+                report = run_checks(plan, profiles)
         self.assertEqual(len(report['rows']), 6)
         self.assertTrue(report['rows'][-1]['manual_review_required'])
         self.assertFalse(report['rows'][-1]['confirmed_vulnerability'])
@@ -95,45 +107,46 @@ class ShopifyPolicyTest(unittest.TestCase):
             route.request.is_navigation_request.return_value = True
             guard(route)
             route.abort.assert_called_once()
-        browser.close.assert_called_once()
+        self.assertEqual(playwright.chromium.launch_persistent_context.call_count, 2)
 
     def test_account_session_capture_refuses_login_page(self):
         from types import SimpleNamespace
         from unittest.mock import MagicMock, patch
         from shopify_account_checks import build_plan, capture_session
         plan = build_plan('owned-example.myshopify.com', '12345', owned_confirmed=True, alias_confirmed=True)
-        browser = MagicMock()
-        context = browser.new_context.return_value
-        context.new_page.return_value.url = 'https://accounts.shopify.com/login'
-        playwright = SimpleNamespace(chromium=SimpleNamespace(launch=MagicMock(return_value=browser)))
+        context = MagicMock()
+        context.pages = [MagicMock()]
+        context.pages[0].url = 'https://accounts.shopify.com/login'
+        launch = MagicMock(return_value=context)
+        playwright = SimpleNamespace(chromium=SimpleNamespace(launch_persistent_context=launch))
         manager = MagicMock()
         manager.__enter__.return_value = playwright
         with TemporaryDirectory() as directory, patch.dict(sys.modules, {'playwright': SimpleNamespace(), 'playwright.sync_api': SimpleNamespace(sync_playwright=MagicMock(return_value=manager))}), patch('builtins.input', return_value=''), patch('shopify_account_checks.private_write') as write, patch('builtins.print') as output:
-            capture_session(plan, 'owner', Path(directory))
+            capture_session(plan, 'owner', Path(directory), browser_name='edge')
         write.assert_not_called()
         output.assert_any_call('Session not saved: return to the selected developer organization after login, then capture again.')
         context.close.assert_called_once()
-        browser.close.assert_called_once()
 
     def test_account_session_capture_can_use_edge(self):
         from types import SimpleNamespace
         from unittest.mock import MagicMock, patch
         from shopify_account_checks import build_plan, capture_session
         plan = build_plan('owned-example.myshopify.com', '12345', owned_confirmed=True, alias_confirmed=True)
-        browser = MagicMock()
-        context = browser.new_context.return_value
-        page = context.new_page.return_value
+        context = MagicMock()
+        page = MagicMock()
+        context.pages = [page]
         page.url = 'https://dev.shopify.com/dashboard/12345'
         context.storage_state.return_value = {'cookies': [], 'origins': []}
-        playwright = SimpleNamespace(chromium=SimpleNamespace(launch=MagicMock(return_value=browser)))
+        launch = MagicMock(return_value=context)
+        playwright = SimpleNamespace(chromium=SimpleNamespace(launch_persistent_context=launch))
         manager = MagicMock()
         manager.__enter__.return_value = playwright
         with TemporaryDirectory() as directory, patch.dict(sys.modules, {'playwright': SimpleNamespace(), 'playwright.sync_api': SimpleNamespace(sync_playwright=MagicMock(return_value=manager))}), patch('builtins.input', return_value=''), patch('shopify_account_checks.private_write') as write, patch('builtins.print'):
             capture_session(plan, 'owner', Path(directory), browser_name='edge')
-        playwright.chromium.launch.assert_called_once_with(headless=False, channel='msedge')
-        self.assertEqual(write.call_count, 2)
+        profile = Path(directory) / 'edge' / 'owner'
+        launch.assert_called_once_with(str(profile), headless=False, channel='msedge')
+        self.assertEqual(write.call_count, 1)
         context.close.assert_called_once()
-        browser.close.assert_called_once()
 
     def test_pending_owned_store_is_recorded_but_not_enabled(self):
         with TemporaryDirectory() as directory:

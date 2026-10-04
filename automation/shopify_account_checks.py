@@ -164,70 +164,99 @@ def classify_observation(status: int | None, final_url: str, text: str, expected
             'reason': 'A reachable admin shell is not proof of protected-data access' if review else 'Read-only observation; permissions require independent confirmation'}
 
 
-def capture_session(plan: dict, role: str, directory: Path, *, browser_name='chromium') -> None:
+def _ensure_private_directory(path: Path) -> None:
+    if path.is_symlink():
+        raise ValueError('Refuse symlink profile directory')
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    info = path.stat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise ValueError('Profile directory must be owned by the current user')
+    os.chmod(path, 0o700)
+
+
+def _state_fingerprint(state: dict) -> str:
+    return hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
+
+
+def capture_session(plan: dict, role: str, directory: Path, *, browser_name='edge') -> None:
     validate_plan(plan)
     if role not in plan['roles']:
         raise ValueError('Unsupported account role')
     if browser_name not in {'chromium', 'edge'}:
         raise ValueError('Browser must be chromium or edge')
     from playwright.sync_api import sync_playwright
-    directory.mkdir(parents=True, exist_ok=True)
-    os.chmod(directory, 0o700)
+    _ensure_private_directory(directory)
+    profile_root = directory / browser_name
+    _ensure_private_directory(profile_root)
+    profile_dir = profile_root / role
+    _ensure_private_directory(profile_dir)
     with sync_playwright() as playwright:
         launch_options = {'headless': False}
         if browser_name == 'edge':
             launch_options['channel'] = 'msedge'
-        browser = playwright.chromium.launch(**launch_options)
-        context = browser.new_context()
-        page = context.new_page()
+        context = playwright.chromium.launch_persistent_context(str(profile_dir), **launch_options)
+        page = context.pages[0] if context.pages else context.new_page()
         page.goto(f'https://dev.shopify.com/dashboard/{plan["organization"]}', wait_until='domcontentloaded')
         print(f'Log in directly in this isolated browser as {role}. Do not paste credentials into this terminal or chat.')
         input('After confirming the requested account/role, press Enter to save its private session: ')
         if not navigation_allowed(page.url, plan, allow_login=False) or urlsplit(page.url).hostname != 'dev.shopify.com':
             context.close()
-            browser.close()
             print('Session not saved: return to the selected developer organization after login, then capture again.')
             return
-        private_write(directory / f'{role}.json', context.storage_state())
-        private_write(directory / f'{role}.metadata.json', {'role': role, 'shop': plan['shop'],
-                                                          'organization': plan['organization'], 'role_confirmation': 'user_attestation',
-                                                          'captured_at': int(time.time())})
+        fingerprint = _state_fingerprint(context.storage_state())
+        other_role = 'appdev' if role == 'owner' else 'owner'
+        other_metadata = profile_root / f'{other_role}.metadata.json'
+        if other_metadata.exists() and private_read(other_metadata).get('profile_fingerprint') == fingerprint:
+            context.close()
+            print('Session not saved: this profile matches the other role; sign in with the separate account.')
+            return
+        private_write(profile_root / f'{role}.metadata.json', {'role': role, 'shop': plan['shop'],
+                                                              'organization': plan['organization'], 'browser': browser_name,
+                                                              'role_confirmation': 'user_attestation',
+                                                              'profile_fingerprint': fingerprint,
+                                                              'captured_at': int(time.time())})
         context.close()
-        browser.close()
-    print(f'{role} session saved privately. Never share these files or commit them.')
+    print(f'{role} {browser_name} profile saved privately. Never share these files or commit them.')
 
 
-def _session_pair(plan: dict, directory: Path) -> dict:
-    directory_info = directory.stat()
-    if directory.is_symlink() or directory_info.st_mode & 0o077 or directory_info.st_uid != os.getuid():
-        raise ValueError('Session directory must be owner-only and not symlinked')
-    sessions = {}
-    fingerprints = []
+def _profile_pair(plan: dict, directory: Path, browser_name: str) -> dict:
+    profile_root = directory / browser_name
+    for path in (directory, profile_root):
+        info = path.stat()
+        if path.is_symlink() or not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.getuid():
+            raise ValueError('Profile directories must be owner-only regular directories')
+    profiles = {}
+    fingerprints = set()
     for role in plan['roles']:
-        session = private_read(directory / f'{role}.json')
-        metadata = private_read(directory / f'{role}.metadata.json')
-        if metadata.get('role') != role or metadata.get('shop') != plan['shop'] or metadata.get('organization') != plan['organization']:
-            raise ValueError('Session capture belongs to a different role/shop/organization')
-        if not session.get('cookies'):
-            raise ValueError('Session contains no authenticated cookie state; capture login again')
-        fingerprints.append(hashlib.sha256(json.dumps(session, sort_keys=True).encode()).hexdigest())
-        sessions[role] = session
-    if len(set(fingerprints)) != len(fingerprints):
-        raise ValueError('Owner and appdev session files are identical; capture isolated accounts separately')
-    return sessions
+        profile_dir = profile_root / role
+        metadata = private_read(profile_root / f'{role}.metadata.json')
+        info = profile_dir.stat()
+        if profile_dir.is_symlink() or not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.getuid():
+            raise ValueError('Each role needs a private, owner-only browser profile')
+        if (metadata.get('role') != role or metadata.get('shop') != plan['shop'] or
+                metadata.get('organization') != plan['organization'] or metadata.get('browser') != browser_name):
+            raise ValueError('Browser profile belongs to a different role/shop/organization/browser')
+        fingerprint = metadata.get('profile_fingerprint')
+        if not isinstance(fingerprint, str) or not re.fullmatch(r'[0-9a-f]{64}', fingerprint) or fingerprint in fingerprints:
+            raise ValueError('Owner and appdev must have distinct captured sessions')
+        fingerprints.add(fingerprint)
+        profiles[role] = profile_dir
+    return profiles
 
 
-def run_checks(plan: dict, directory: Path, *, headless=True) -> dict:
+def run_checks(plan: dict, directory: Path, *, headless=True, browser_name='edge') -> dict:
     validate_plan(plan)
-    sessions = _session_pair(plan, directory)
+    profiles = _profile_pair(plan, directory, browser_name)
     from playwright.sync_api import sync_playwright
     rows = []
     last_main = None
     last_first_party = [None]
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=headless)
         for role in plan['roles']:
-            context = browser.new_context(storage_state=sessions[role], service_workers='block')
+            launch_options = {'headless': headless, 'service_workers': 'block'}
+            if browser_name == 'edge':
+                launch_options['channel'] = 'msedge'
+            context = playwright.chromium.launch_persistent_context(str(profiles[role]), **launch_options)
             blocked = {'count': 0}
 
             def block_websocket(socket):
@@ -260,7 +289,7 @@ def run_checks(plan: dict, directory: Path, *, headless=True) -> dict:
                 route.continue_()
 
             context.route('**/*', guard)
-            page = context.new_page()
+            page = context.pages[0] if context.pages else context.new_page()
             context.on('page', lambda popup: popup.close())
             for target in plan['targets']:
                 if last_main is not None:
@@ -292,7 +321,6 @@ def run_checks(plan: dict, directory: Path, *, headless=True) -> dict:
                 if observed['observed'] == 'login_required':
                     break
             context.close()
-        browser.close()
     return {'program': 'shopify', 'job': 'shopify-owned-account-checks', 'shop': plan['shop'],
             'generated_at': int(time.time()),
             'organization': plan['organization'], 'test_selection': 'read_only_account_comparison',
@@ -330,12 +358,13 @@ def main() -> None:
         command = prepare if name == 'prepare' else commands.add_parser(name)
         command.add_argument('--plan', type=Path, default=Path('.secrets/shopify-account-plan.json'))
         if name != 'prepare':
-            command.add_argument('--sessions', type=Path, default=Path('.secrets/shopify-sessions'))
+            command.add_argument('--profiles', type=Path, default=Path('.secrets/shopify-account-profiles'))
         if name == 'capture':
             command.add_argument('--role', choices=['owner', 'appdev'], required=True)
-            command.add_argument('--browser', choices=['chromium', 'edge'], default='chromium')
+            command.add_argument('--browser', choices=['chromium', 'edge'], default='edge')
         if name == 'run':
             command.add_argument('--headed', action='store_true')
+            command.add_argument('--browser', choices=['chromium', 'edge'], default='edge')
             command.add_argument('--output', type=Path, default=Path('results/shopify-owned-account-checks.json'))
     args = parser.parse_args()
     if args.command == 'prepare':
@@ -347,9 +376,9 @@ def main() -> None:
         return
     plan = private_read(args.plan)
     if args.command == 'capture':
-        capture_session(plan, args.role, args.sessions, browser_name=args.browser)
+        capture_session(plan, args.role, args.profiles, browser_name=args.browser)
         return
-    report = run_checks(plan, args.sessions, headless=not args.headed)
+    report = run_checks(plan, args.profiles, headless=not args.headed, browser_name=args.browser)
     private_write(args.output, report)
     markdown = args.output.with_suffix('.md')
     private_write(markdown, report_markdown(report))
