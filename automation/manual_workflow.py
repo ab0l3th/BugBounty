@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import tempfile
 import threading
 from pathlib import Path
 from urllib.error import URLError
@@ -19,9 +20,14 @@ from shopify_policy import apply_finding_eligibility, host_allowed
 
 def _save(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
-    temporary.write_text(json.dumps(payload, indent=2), encoding='utf-8')
-    temporary.replace(path)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f'.{path.name}.', dir=path.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as temporary:
+            json.dump(payload, temporary, indent=2)
+        Path(temporary_name).replace(path)
+    finally:
+        Path(temporary_name).unlink(missing_ok=True)
 
 
 def queue_manual_workflow(slug: str, *, root: Path = ROOT) -> list[str]:

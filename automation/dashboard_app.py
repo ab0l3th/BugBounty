@@ -378,37 +378,18 @@ def finding_writeup(slug: str, finding_id: str):
       endpoint = f"tcp://{candidate['host']}:{finding['port']}"
       method = 'TCP connect'
     else:
-      endpoint = candidate['target_url'] or candidate['host']
-      parsed_endpoint = urlsplit(endpoint)
-      if parsed_endpoint.scheme and parsed_endpoint.hostname:
-        safe_query = []
-        for key, value in parse_qsl(parsed_endpoint.query, keep_blank_values=True):
-          if re.search(r'token|secret|password|passwd|auth|session|cookie|api[_-]?key|signature', key, re.IGNORECASE):
-            value = '[REDACTED]'
-          safe_query.append((key, value))
-        endpoint = urlunsplit((parsed_endpoint.scheme, parsed_endpoint.netloc, parsed_endpoint.path or '/', urlencode(safe_query), ''))
-      method = str(finding.get('method', 'GET')).upper()
+        endpoint = finding.get('request_url') or candidate['target_url'] or candidate['host']
+        method = str(finding.get('method', 'GET')).upper()
     status_code = finding.get('status_code', finding.get('http_status'))
     response_headers = finding.get('response_headers', {})
-    allowed_headers = {'content-type', 'location', 'www-authenticate', 'access-control-allow-origin',
-                       'access-control-allow-credentials', 'server', 'x-powered-by'}
-    safe_headers = {str(key).lower(): str(value)[:500] for key, value in response_headers.items()
-                    if isinstance(response_headers, dict) and str(key).lower() in allowed_headers} if isinstance(response_headers, dict) else {}
-    response_excerpt = finding.get('response_excerpt', finding.get('response_body_excerpt'))
-    if isinstance(response_excerpt, str):
-      response_excerpt = response_excerpt[:4000]
-      response_excerpt = re.sub(r'(?i)(bearer\s+)[A-Za-z0-9._~+/-]+=*', r'\1[REDACTED]', response_excerpt)
-      response_excerpt = re.sub(r"(?i)(\"?(?:password|token|secret|api[_-]?key)\"?\s*:\s*)\"[^\"]*\"", r'\1"[REDACTED]"', response_excerpt)
-      response_excerpt = re.sub(r'(?i)((?:password|token|secret|api[_-]?key)\s*[=:]\s*)[^&\s,;}\"]+', r'\1[REDACTED]', response_excerpt)
-      response_excerpt = re.sub(r'(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}', '[REDACTED_EMAIL]', response_excerpt)
-    else:
-      response_excerpt = None
+    captured_headers = {str(key): str(value) for key, value in response_headers.items()} if isinstance(response_headers, dict) else {}
+    response_excerpt = finding.get('response_body', finding.get('response_excerpt', finding.get('response_body_excerpt')))
     checks = {
         'open_port': 'Confirm the reported TCP port and service only if port checks are explicitly allowed. A reachable port does not prove unauthenticated access or impact.',
         'missing_security_headers': 'Inspect response headers at the exact observed URL. Record missing headers and demonstrate relevant application impact; missing headers alone may be ineligible.',
         'tech_disclosure': 'Confirm the exact advertised header and version. Check report eligibility; a version banner alone does not demonstrate an exploitable vulnerability.',
         'insecure_cookie': 'Inspect the observed Set-Cookie attributes. Establish whether the cookie is security-sensitive without exposing another user\'s session.',
-        'error_disclosure': 'Confirm the observed error or stack trace using a permitted request. Identify what sensitive information is disclosed and redact it in the report.',
+          'error_disclosure': 'Confirm the observed error or stack trace using a permitted request. Preserve the exact response in private report storage.',
         'cors_misconfig': 'Confirm the returned origin and credentials headers. Use your own test account to establish whether unauthorized cross-origin reads are actually possible.',
         'debug_endpoint': 'Confirm the exact observed endpoint is not a login page, then establish whether it exposes sensitive data without collecting unnecessary records.',
         'graphql_introspection': 'Check whether introspection testing is permitted. Confirm the observation and establish distinct, demonstrable impact rather than reporting introspection alone.',
@@ -417,7 +398,10 @@ def finding_writeup(slug: str, finding_id: str):
     verification = checks.get(candidate['evidence']['type'], 'Independently verify the recorded scanner observation and demonstrate impact using only permitted, non-destructive checks.')
     evidence = json.dumps(candidate['evidence'], indent=2, ensure_ascii=True)
     response_status = f'HTTP {status_code}' if status_code is not None else 'Not captured by scanner'
-    response_header_lines = [f'{key}: {value}' for key, value in safe_headers.items()]
+    response_header_lines = [f'{key}: {value}' for key, value in captured_headers.items()]
+    response_body_bytes = finding.get('response_body_bytes_stored')
+    response_body_state = ('truncated at 8192 bytes' if finding.get('response_body_truncated') else
+                 f'{response_body_bytes} bytes stored' if response_body_bytes is not None else 'body not captured')
     if finding.get('type') == 'open_port':
       reproduction_action = f"Connect to the TCP endpoint with `nc -vz {candidate['host']} {finding.get('port', '')}`."
     else:
@@ -435,13 +419,13 @@ def finding_writeup(slug: str, finding_id: str):
       '## Captured request and response',
       f"Request: `{method} {endpoint}`", f"Response status: `{response_status}`",
       'Response headers:', '```http', *(response_header_lines or ['[No relevant response headers were retained]']), '```',
-      'Response body excerpt:', '```text', response_excerpt or '[No response body excerpt was retained by the scanner; capture a sanitized response during manual reproduction.]', '```', '',
+      f'Captured response body (unredacted; {response_body_state}):', '```text', response_excerpt if response_excerpt is not None else '[No response body was retained by this scan.]', '```', '',
       '## Scanner evidence', '```json', evidence, '```', '',
       '## Step-by-step reproduction',
       '1. Confirm the exact asset is in scope and use only the authorized test account and test data.',
       f'2. {reproduction_action}',
       f"3. Compare the response with the expected behavior. The scanner recorded `{response_status}`; verify any authorization or impact claim independently.",
-      '4. Capture the minimal sanitized request and response needed to demonstrate impact; do not include cookies, tokens, or unrelated personal data.',
+        '4. Preserve the exact captured request and response in the private report.',
       '5. Stop once the behavior is confirmed. Do not enumerate records or perform destructive actions.', '',
       '## Expected behavior', '[State the documented permission or security boundary for this endpoint.]', '',
       '## Actual behavior and impact',
@@ -451,7 +435,7 @@ def finding_writeup(slug: str, finding_id: str):
       '## Remediation', '[Describe a fix after confirming the root cause.]', '',
       '## Reportability check',
       'This is an unverified draft, not a confirmed vulnerability. Confirm program eligibility and meaningful impact before submission.',
-      'The scanner does not retain a response body unless an explicit sanitized response excerpt is present above.',
+      'Response contents are shown verbatim from the captured scan record. A response may be truncated at the scanner fetch limit.',
     ])
     if request.args.get('download') == '1':
       return app.response_class(draft, mimetype='text/markdown',

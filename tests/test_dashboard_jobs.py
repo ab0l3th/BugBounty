@@ -483,12 +483,44 @@ class DashboardJobMetadataTest(unittest.TestCase):
             result = _application_security_tests(['app.example.com'])
             asset = next(a for a in result['assets'] if a['domain'] == 'app.example.com')
             self.assertEqual(asset.get('report_url'), '/reports/application-security-testing/app.example.com')
+            self.assertTrue(asset['findings'])
+            for finding in asset['findings']:
+                self.assertEqual(finding['request_url'], 'https://app.example.com')
+                self.assertEqual(finding['status_code'], 200)
+                self.assertEqual(finding['response_body'], 'ok')
+            cors_finding = next(finding for finding in asset['findings'] if finding['type'] == 'cors_misconfig')
+            self.assertEqual(cors_finding['request_headers'], {'Origin': 'https://evil.example'})
             self.assertTrue(report.exists())
+            import stat
+            self.assertEqual(stat.S_IMODE(report.stat().st_mode), 0o600)
             html = report.read_text(encoding='utf-8')
             self.assertIn('Steps to Reproduce', html)
             self.assertIn('app.example.com', html)
             self.assertIn('curl', html)
         report.unlink(missing_ok=True)
+
+    def test_response_capture_stores_verbatim_data_with_fetch_size_bound(self):
+        from worker import _capture_response_evidence
+        body = '{"email":"researcher@example.com","token":"abc123"}'
+        evidence = _capture_response_evidence(200, {'Set-Cookie': 'session=secret-cookie'}, body,
+                                              'https://api.example.test/path?token=abc123',
+                                              request_headers={'Authorization': 'Bearer exact-value'})
+        self.assertEqual(evidence['request_headers']['Authorization'], 'Bearer exact-value')
+        self.assertEqual(evidence['request_url'], 'https://api.example.test/path?token=abc123')
+        self.assertEqual(evidence['response_headers']['Set-Cookie'], 'session=secret-cookie')
+        self.assertEqual(evidence['response_body'], body)
+        long_response = _capture_response_evidence(200, {}, 'x' * 9000, 'https://api.example.test/large')
+        self.assertEqual(len(long_response['response_body']), 8192)
+        self.assertTrue(long_response['response_body_truncated'])
+
+    def test_manual_workflow_result_file_is_owner_only(self):
+        from tempfile import TemporaryDirectory
+        import stat
+        from manual_workflow import _save
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / 'manual-result.json'
+            _save(path, {'response_body': 'unredacted test data'})
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
     def test_scanner_report_renders_for_non_application_job_without_saved_html(self):
         from tempfile import TemporaryDirectory
@@ -512,22 +544,41 @@ class DashboardJobMetadataTest(unittest.TestCase):
         self.assertIn('Steps to Reproduce', html)
         self.assertIn('Response body not retained', html)
 
-    def test_scanner_report_shows_exact_response_evidence_safely(self):
+    def test_scanner_report_shows_exact_unredacted_response_evidence(self):
         from worker import _render_finding_report_html
         html = _render_finding_report_html('api.example.com', [{
             'type': 'unauthenticated_endpoint', 'path': '/api/v1/fixture?token=secret-value',
             'status_code': 200, 'severity': 'high', 'detail': 'test fixture response',
             'response_headers': {'Content-Type': 'application/json', 'Set-Cookie': 'session=secret-cookie'},
-            'response_excerpt': '{"record":"owned-fixture","email":"researcher@example.com","token":"abc123"}',
+            'response_body': '{"record":"owned-fixture","email":"researcher@example.com","token":"abc123"}',
         }], 'api-endpoint-testing')
-        self.assertIn('https://api.example.com/api/v1/fixture?token=%5BREDACTED%5D', html)
+        self.assertIn('https://api.example.com/api/v1/fixture?token=secret-value', html)
         self.assertIn('HTTP 200', html)
-        self.assertIn('content-type', html)
+        self.assertIn('Content-Type', html)
         self.assertIn('owned-fixture', html)
-        self.assertIn('[REDACTED_EMAIL]', html)
-        self.assertIn('[REDACTED]', html)
-        self.assertNotIn('secret-cookie', html)
-        self.assertNotIn('secret-value', html)
+        self.assertIn('researcher@example.com', html)
+        self.assertIn('abc123', html)
+        self.assertIn('session=secret-cookie', html)
+
+    def test_response_capture_is_verbatim_bounded_and_result_file_is_private(self):
+        from tempfile import TemporaryDirectory
+        import stat
+        from worker import _atomic_write_json, _capture_response_evidence
+        body = '{"email":"researcher@example.com","token":"abc123"}'
+        evidence = _capture_response_evidence(200, {'Set-Cookie': 'session=secret-cookie'}, body,
+                                              'https://api.example.test/path?token=abc123',
+                                              request_headers={'Authorization': 'Bearer exact-value'})
+        self.assertEqual(evidence['response_body'], body)
+        self.assertEqual(evidence['response_headers']['Set-Cookie'], 'session=secret-cookie')
+        self.assertEqual(evidence['request_headers']['Authorization'], 'Bearer exact-value')
+        self.assertFalse(evidence['response_body_truncated'])
+        long_evidence = _capture_response_evidence(200, {}, 'x' * 9000, 'https://api.example.test/large')
+        self.assertEqual(len(long_evidence['response_body']), 8192)
+        self.assertTrue(long_evidence['response_body_truncated'])
+        with TemporaryDirectory() as directory:
+            result_path = Path(directory) / 'result.json'
+            _atomic_write_json(result_path, {'assets': [{'findings': [evidence]}]})
+            self.assertEqual(stat.S_IMODE(result_path.stat().st_mode), 0o600)
 
     def test_api_endpoint_tests_flag_exposed_debug_endpoint(self):
         from worker import _api_endpoint_tests
@@ -563,6 +614,10 @@ class DashboardJobMetadataTest(unittest.TestCase):
             asset = next(a for a in result['assets'] if a['domain'] == 'api.example.com')
             debug = [f for f in asset['findings'] if f['type'] == 'debug_endpoint']
             self.assertTrue(any(f['path'] == '/actuator/env' and f['exposes_data'] for f in debug))
+            captured = next(f for f in debug if f['path'] == '/actuator/env')
+            self.assertEqual(captured['request_url'], 'https://api.example.com/actuator/env')
+            self.assertEqual(captured['status_code'], 200)
+            self.assertEqual(captured['response_body'], '{"activeProfiles":["prod"],"propertySources":[]}')
 
     def test_api_debug_endpoint_ignores_login_redirect(self):
         from worker import _api_endpoint_tests
@@ -1172,14 +1227,14 @@ class DashboardJobMetadataTest(unittest.TestCase):
             self.assertIn(b'CRITICAL', page.data)
             self.assertIn(b'tcp://host.alpha.test:6379', page.data)
             self.assertIn(b'nc -vz host.alpha.test 6379', page.data)
-            self.assertIn(b'No response body excerpt was retained', page.data)
+            self.assertIn(b'No response body was retained by this scan', page.data)
             self.assertNotIn(b'<script>untrusted</script>', page.data)
             download = client.get(url + '?download=1')
             self.assertEqual(download.mimetype, 'text/markdown')
             self.assertIn('attachment', download.headers['Content-Disposition'])
             self.assertEqual(client.get(f'/programs/beta/findings/{finding_id}/writeup').status_code, 404)
 
-    def test_writeup_includes_exact_recorded_endpoint_and_sanitized_response(self):
+    def test_writeup_includes_exact_unredacted_endpoint_and_response(self):
         from dashboard_app import review_candidates
         finding = {'type': 'unauthenticated_endpoint', 'path': '/api/v1/test-record', 'method': 'GET',
                    'status_code': 200, 'response_headers': {'Content-Type': 'application/json',
@@ -1195,9 +1250,9 @@ class DashboardJobMetadataTest(unittest.TestCase):
         self.assertIn('GET https://api.alpha.test/api/v1/test-record', draft)
         self.assertIn('HTTP 200', draft)
         self.assertIn('test-fixture', draft)
-        self.assertIn('[REDACTED_EMAIL]', draft)
-        self.assertIn('"token":"[REDACTED]"', draft)
-        self.assertNotIn('session=secret', draft)
+        self.assertIn('researcher@example.com', draft)
+        self.assertIn('"token":"abc123"', draft)
+        self.assertIn('session=secret', draft)
         self.assertIn('2. Send the `GET` request', draft)
 
     def test_packaged_wordlists_are_full_and_can_be_replaced_without_count_caps(self):

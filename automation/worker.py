@@ -11,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -84,9 +85,14 @@ def _cap_log(entries: list) -> list:
 def _atomic_write_json(path: Path, payload: dict) -> None:
     payload = apply_finding_eligibility(payload, ROOT)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f'.{path.name}.tmp')
-    temporary.write_text(json.dumps(payload, indent=2), encoding='utf-8')
-    temporary.replace(path)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f'.{path.name}.', dir=path.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as temporary:
+            json.dump(payload, temporary, indent=2)
+        Path(temporary_name).replace(path)
+    finally:
+        Path(temporary_name).unlink(missing_ok=True)
 
 
 def _emit_progress(progress, snapshot: dict) -> None:
@@ -1023,9 +1029,26 @@ _ERROR_SIGNATURES = (
     'traceback (most recent call last)', 'exception in thread', 'java.lang.',
     'sqlstate', 'stack trace', 'syntaxerror', 'fatal error:', 'undefined index',
 )
+_MAX_STORED_RESPONSE_BYTES = 8192
+
+
+def _capture_response_evidence(status: int, headers: dict, body: str, endpoint: str, *, method='GET', request_headers=None, request_body=None) -> dict:
+    body_bytes = body.encode('utf-8', 'replace') if isinstance(body, str) else bytes(body or b'')
+    return {'method': method, 'request_url': endpoint, 'request_headers': dict(request_headers or {}),
+            'request_body': request_body, 'status_code': status,
+            'response_headers': {str(key): str(value) for key, value in (headers or {}).items()},
+            'response_body': body_bytes[:_MAX_STORED_RESPONSE_BYTES].decode('utf-8', 'replace'),
+            'response_body_truncated': len(body_bytes) >= _MAX_STORED_RESPONSE_BYTES,
+            'response_body_bytes_stored': min(len(body_bytes), _MAX_STORED_RESPONSE_BYTES),
+            'response_sha256': hashlib.sha256(body_bytes).hexdigest() if body_bytes else None}
 
 
 def _finding_endpoint(finding: dict, host: str) -> str:
+    request_url = finding.get('request_url')
+    if isinstance(request_url, str):
+        parsed_request = urlsplit(request_url)
+        if parsed_request.scheme in {'http', 'https'} and parsed_request.hostname == host and not parsed_request.username and not parsed_request.password:
+            return request_url
     if finding.get('type') == 'open_port' and isinstance(finding.get('port'), int):
         port = finding['port']
         if finding.get('service') == 'https-alt' and port == 8443:
@@ -1038,33 +1061,14 @@ def _finding_endpoint(finding: dict, host: str) -> str:
         path = '/'
     parsed = urlsplit(path)
     safe_path = quote(parsed.path or '/', safe="/%:@!$&'()*+,;=-._~")
-    query = []
-    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
-        if re.search(r'token|secret|password|passwd|auth|session|cookie|api[_-]?key|signature', key, re.IGNORECASE):
-            value = '[REDACTED]'
-        query.append((key, value))
-    return urlunsplit(('https', host, safe_path, urlencode(query), ''))
-
-
-def _sanitize_report_excerpt(value) -> str | None:
-    if not isinstance(value, str):
-        return None
-    value = value[:4000]
-    value = re.sub(r'(?i)(bearer\s+)[A-Za-z0-9._~+/-]+=*', r'\1[REDACTED]', value)
-    value = re.sub(r"(?i)(\"?(?:password|token|secret|api[_-]?key)\"?\s*:\s*)\"[^\"]*\"", r'\1"[REDACTED]"', value)
-    value = re.sub(r'(?i)((?:password|token|secret|api[_-]?key)\s*[=:]\s*)[^&\s,;}\"]+', r'\1[REDACTED]', value)
-    return re.sub(r'(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}', '[REDACTED_EMAIL]', value)
+    return urlunsplit(('https', host, safe_path, parsed.query, ''))
 
 
 def _safe_response_headers(finding: dict) -> dict:
     headers = finding.get('response_headers')
     if not isinstance(headers, dict):
         return {}
-    allowed = {'content-type', 'location', 'www-authenticate', 'access-control-allow-origin',
-               'access-control-allow-credentials', 'server', 'x-powered-by', 'strict-transport-security',
-               'x-frame-options', 'content-security-policy', 'x-content-type-options', 'referrer-policy'}
-    return {str(key).lower(): str(value)[:500] for key, value in headers.items()
-            if str(key).lower() in allowed}
+    return {str(key): str(value) for key, value in headers.items()}
 
 
 def _reproduction_steps(finding: dict, host: str) -> dict:
@@ -1116,7 +1120,7 @@ def _reproduction_steps(finding: dict, host: str) -> dict:
             'title': 'Insecure cookie flags',
             'steps': [
                 f'Run: curl -sS -D - -o /dev/null {url}',
-                'Inspect Set-Cookie attributes; redact cookie values from evidence.',
+                'Inspect the complete Set-Cookie response header in the private report.',
                 'Confirm the following attributes are missing: ' + ', '.join(flags),
             ],
             'expected': 'Session/other cookies are set without one or more of Secure, HttpOnly, SameSite.',
@@ -1182,12 +1186,13 @@ def _render_finding_report_html(host: str, findings: list[dict], job_name: str) 
         status = finding.get('status_code', finding.get('http_status'))
         headers = _safe_response_headers(finding)
         header_html = ''.join(f'<li><code>{escape(key)}</code>: {escape(value)}</li>' for key, value in headers.items()) or '<li>[Response headers not retained]</li>'
-        excerpt = _sanitize_report_excerpt(finding.get('response_excerpt', finding.get('response_body_excerpt')))
-        response_body_html = f'<pre>{escape(excerpt)}</pre>' if excerpt else '<p>[Response body not retained by scanner; capture a sanitized excerpt during manual reproduction.]</p>'
+        response_body = finding.get('response_body', finding.get('response_excerpt', finding.get('response_body_excerpt')))
+        response_body_html = f'<pre>{escape(str(response_body))}</pre>' if response_body is not None else '<p>[Response body not retained by scanner.]</p>'
         status_text = f'HTTP {status}' if status is not None else 'Not retained'
-        evidence = {key: finding[key] for key in ('type', 'port', 'service', 'severity', 'status_code', 'http_status') if key in finding}
+        evidence = {key: finding[key] for key in ('type', 'port', 'service', 'severity', 'status_code', 'http_status',
+                                                   'response_body_truncated', 'response_body_bytes_stored', 'response_sha256') if key in finding}
         if isinstance(finding.get('detail'), str):
-            evidence['detail'] = _sanitize_report_excerpt(finding['detail'])
+            evidence['detail'] = finding['detail']
         evidence_html = escape(json.dumps(evidence, indent=2, ensure_ascii=True))
         sections.append(f'''
       <section class="finding sev-{severity}">
@@ -1199,7 +1204,7 @@ def _render_finding_report_html(host: str, findings: list[dict], job_name: str) 
             <h3>Recorded response</h3>
             <p><strong>Status:</strong> <code>{escape(status_text)}</code></p>
             <ul>{header_html}</ul>
-            <p><strong>Sanitized body excerpt:</strong></p>{response_body_html}
+            <p><strong>Captured response body (unredacted):</strong></p>{response_body_html}
             <h3>Scanner evidence</h3>
             <pre>{evidence_html}</pre>
         <h3>Steps to Reproduce</h3>
@@ -1235,8 +1240,17 @@ def _write_finding_report(job_name: str, host: str, findings: list[dict]) -> str
     if not findings:
         return None
     out_dir = REPORTS_DIR / job_name
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / f'{host}.html').write_text(_render_finding_report_html(host, findings, job_name), encoding='utf-8')
+    out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(out_dir, 0o700)
+    report_path = out_dir / f'{host}.html'
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f'.{host}.', suffix='.html', dir=out_dir)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as report_file:
+            report_file.write(_render_finding_report_html(host, findings, job_name))
+        Path(temporary_name).replace(report_path)
+    finally:
+        Path(temporary_name).unlink(missing_ok=True)
     return f'/reports/{job_name}/{host}'
 
 
@@ -1274,6 +1288,7 @@ def _application_security_tests(hosts: list[str], *, use_external_tools: bool = 
             _emit_progress(progress, {'targets': list(deduped_hosts), 'assets': list(assets), 'discovered': [], 'probe_log': list(probe_log), 'thread_status': list(thread_status), 'threads': max_workers})
             return record
 
+        base_response = _capture_response_evidence(code, hdrs, body, url, method='GET')
         missing = [h for h in _SECURITY_HEADERS if h not in hdrs]
         if missing:
             findings.append({'type': 'missing_security_headers', 'detail': missing, 'severity': 'low'})
@@ -1291,14 +1306,20 @@ def _application_security_tests(hosts: list[str], *, use_external_tools: bool = 
 
         # CORS reflection check with an untrusted Origin (read-only).
         try:
-            _, cors_hdrs, _ = fetch(url, extra_headers={'Origin': 'https://evil.example'})
+            cors_request_headers = {'Origin': 'https://evil.example'}
+            cors_code, cors_hdrs, cors_body = fetch(url, extra_headers=cors_request_headers)
             acao = cors_hdrs.get('access-control-allow-origin', '')
             acac = cors_hdrs.get('access-control-allow-credentials', '')
             if acao == 'https://evil.example' or (acao == '*' and acac.lower() == 'true'):
-                findings.append({'type': 'cors_misconfig', 'detail': f'ACAO={acao} ACAC={acac}', 'severity': 'medium'})
+                findings.append({'type': 'cors_misconfig', 'detail': f'ACAO={acao} ACAC={acac}', 'severity': 'medium',
+                                 **_capture_response_evidence(cors_code, cors_hdrs, cors_body, url, method='GET', request_headers=cors_request_headers)})
                 probe_log.append({'thread_id': thread_name, 'host': host, 'check': 'cors', 'status': 'misconfig', 'timestamp': time.time()})
         except Exception:
             pass
+
+        for finding in findings:
+            if 'request_url' not in finding:
+                finding.update(base_response)
 
         record = {
             'domain': host,
@@ -1474,7 +1495,9 @@ def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False, p
                     continue
                 observed_paths.append({'path': path, 'status_code': code, 'exposes_data': bool(exposes)})
                 if path in debug_paths:
-                    findings.append({'type': 'debug_endpoint', 'path': path, 'status_code': code, 'exposes_data': bool(exposes), 'severity': 'high' if exposes else 'medium'})
+                    findings.append({'type': 'debug_endpoint', 'path': path, 'status_code': code, 'exposes_data': bool(exposes),
+                                     'severity': 'high' if exposes else 'medium',
+                                     **_capture_response_evidence(code, hdrs, body, url, method='GET')})
                 probe_log.append({'thread_id': thread_name, 'host': host, 'path': path, 'status_code': code, 'status': 'found', 'timestamp': time.time()})
                 if path.endswith(('/api-docs', '/openapi.json', '/swagger.json')) and exposes:
                     try:
@@ -1509,7 +1532,11 @@ def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False, p
             try:
                 code, hdrs, body = fetch(f'https://{host}{graphql_path}', extra_headers={'Content-Type': 'application/json'}, method='POST', data=_GRAPHQL_INTROSPECTION)
                 if code == 200 and '__schema' in body:
-                    findings.append({'type': 'graphql_introspection', 'path': graphql_path, 'detail': 'introspection enabled', 'severity': 'medium'})
+                    request_url = f'https://{host}{graphql_path}'
+                    request_headers = {'Content-Type': 'application/json'}
+                    findings.append({'type': 'graphql_introspection', 'path': graphql_path, 'detail': 'introspection enabled', 'severity': 'medium',
+                                     **_capture_response_evidence(code, hdrs, body, request_url, method='POST',
+                                                                  request_headers=request_headers, request_body=_GRAPHQL_INTROSPECTION)})
             except Exception:
                 pass
 
@@ -1529,7 +1556,8 @@ def _api_endpoint_tests(hosts: list[str], *, use_external_tools: bool = False, p
             if code == 200 and _looks_like_data(hdrs.get('content-type', ''), body):
                 observed_paths.append({'path': doc_path, 'status_code': code, 'exposes_data': True})
                 if documented_security.get(doc_path):
-                    findings.append({'type': 'unauthenticated_endpoint', 'path': doc_path, 'status_code': code, 'severity': 'high'})
+                    findings.append({'type': 'unauthenticated_endpoint', 'path': doc_path, 'status_code': code, 'severity': 'high',
+                                     **_capture_response_evidence(code, hdrs, body, url, method='GET')})
 
         record.update({
             'domain': host,
