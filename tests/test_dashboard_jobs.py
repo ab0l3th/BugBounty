@@ -183,6 +183,15 @@ class DashboardJobMetadataTest(unittest.TestCase):
         self.assertIn('Application Security Testing', body)
         self.assertIn('API Endpoint Testing', body)
 
+    def test_dashboard_home_renders_legacy_job_without_thread_status(self):
+        jobs = list_jobs()
+        self.assertTrue(jobs)
+        jobs[0]['raw'] = dict(jobs[0].get('raw') or {})
+        jobs[0]['raw'].pop('thread_status', None)
+        with patch('dashboard_app.list_jobs', return_value=jobs):
+            response = app.test_client().get('/')
+        self.assertEqual(response.status_code, 200)
+
     def test_dashboard_detects_third_workflow_job_and_order(self):
         jobs = list_jobs()
         live_assets_job = next(job for job in jobs if job['name'] == 'confirm-live-web-assets')

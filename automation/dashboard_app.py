@@ -1454,7 +1454,7 @@ def index():
                         {% endfor %}{% endfor %}
                       </details>
                     {% endif %}
-                    {% set thread_status = (job.raw.thread_status if job.raw else []) %}
+                    {% set thread_status = (job.raw.get('thread_status', []) if job.raw else []) %}
                     {% set login_redirects = probe_log|selectattr('status', 'equalto', 'login_redirect')|list %}
                     {% if probe_log or thread_status %}
                       <details class="collapsible-list" data-state-key="threads-{{ job.name }}">
