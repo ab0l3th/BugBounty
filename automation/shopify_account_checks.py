@@ -414,7 +414,7 @@ def run_checks(plan: dict, directory: Path, *, browser_name='edge', progress=Non
                     final = urlsplit(page.url)
                     selected_paths = {urlsplit(selected['url']).path for selected in plan['targets']}
                     safe_path = '/login' if final.hostname in {'accounts.shopify.com', 'accounts.shopifycloud.com'} else final.path if final.path in selected_paths else '[unselected path withheld]'
-                    rows.append({'role': role, 'target': target['name'], 'url': target['url'], 'http_status': status,
+                    rows.append({'role': role, 'target': target['name'], 'method': 'GET', 'url': target['url'], 'http_status': status,
                                  'final_host': final.hostname, 'final_path': safe_path, 'query_present': bool(final.query),
                                  'blocked_requests': blocked['count'], **observed})
                     if progress:
@@ -432,16 +432,22 @@ def run_checks(plan: dict, directory: Path, *, browser_name='edge', progress=Non
 
 def report_markdown(report: dict) -> str:
     lines = ['# Owned Shopify Account Comparison', '', f"Shop: {report['shop']}",
-             'Read-only observations only. No confirmed vulnerability is inferred from a reachable page.', '',
-             '| Role | Target | Expected | Observed | HTTP | Manual Review |',
-             '|---|---|---|---|---|---|']
+             'Read-only reachability checks. No confirmed vulnerability was found; a reachable route is not proof of protected-data access.', '',
+             '| Role | Check | Method | Exact endpoint | Expected | Observed | HTTP | Response body | Manual review |',
+             '|---|---|---|---|---|---|---:|---|---|']
     for row in report['rows']:
-        lines.append(f"| {row['role']} | {row['target']} | {row['expected']} | {row['observed']} | {row['http_status']} | {'Yes' if row['manual_review_required'] else 'No'} |")
+        endpoint = row.get('url') or '[not captured]'
+        response_body = 'Captured excerpt available' if row.get('response_excerpt') else 'Not captured (status only)'
+        lines.append(f"| {row['role']} | {row['target']} | {row.get('method', 'GET')} | `{endpoint}` | {row['expected']} | {row['observed']} | {row['http_status']} | {response_body} | {'Yes' if row['manual_review_required'] else 'No'} |")
     lines.extend(['', '## Verification Notes',
+                  '1. Sign in with the named role in its private Edge profile.',
+                  '2. Navigate to the exact endpoint in the table; requests are GET only.',
+                  '3. Compare the returned status with the expected role behavior.',
+                  '4. A reportable access-control issue requires proof of unauthorized protected data or action, not HTTP 200 alone.', '',
                   '- Reconfirm account identity and actual assigned role; capture labels are user attestations.',
                   '- A 200/SPA shell or visible navigation item is not proof of protected data or action access.',
                   '- Blocked unknown POST/persisted operations, route changes, or expired sessions can make results inconclusive.',
-                  '- No raw response bodies, screenshots, cookies, local storage, or tokens are included.',
+                  '- This run retained status metadata only; no raw response bodies, screenshots, cookies, local storage, or tokens are included.',
                   '- Do not report intentional GraphQL introspection or intended public behavior alone.'])
     return '\n'.join(lines) + '\n'
 

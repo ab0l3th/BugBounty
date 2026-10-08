@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib import error as urllib_error
 from urllib import request as urllib_request
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from scope_validator import is_in_scope, parse_scope_pattern
 from stages import ACTIVE_STAGES, LEGACY_NAME_TO_STAGE, STAGE_BY_ID, job_name_for, stage_for_job_name
@@ -1025,9 +1025,51 @@ _ERROR_SIGNATURES = (
 )
 
 
+def _finding_endpoint(finding: dict, host: str) -> str:
+    if finding.get('type') == 'open_port' and isinstance(finding.get('port'), int):
+        port = finding['port']
+        if finding.get('service') == 'https-alt' and port == 8443:
+            return f'https://{host}:{port}/'
+        if finding.get('service') in {'http-alt', 'http-dev'} and port in {8000, 8080, 8888}:
+            return f'http://{host}:{port}/'
+        return f'tcp://{host}:{port}'
+    path = finding.get('path')
+    if not isinstance(path, str) or not path.startswith('/') or path.startswith('//'):
+        path = '/'
+    parsed = urlsplit(path)
+    safe_path = quote(parsed.path or '/', safe="/%:@!$&'()*+,;=-._~")
+    query = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        if re.search(r'token|secret|password|passwd|auth|session|cookie|api[_-]?key|signature', key, re.IGNORECASE):
+            value = '[REDACTED]'
+        query.append((key, value))
+    return urlunsplit(('https', host, safe_path, urlencode(query), ''))
+
+
+def _sanitize_report_excerpt(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value[:4000]
+    value = re.sub(r'(?i)(bearer\s+)[A-Za-z0-9._~+/-]+=*', r'\1[REDACTED]', value)
+    value = re.sub(r"(?i)(\"?(?:password|token|secret|api[_-]?key)\"?\s*:\s*)\"[^\"]*\"", r'\1"[REDACTED]"', value)
+    value = re.sub(r'(?i)((?:password|token|secret|api[_-]?key)\s*[=:]\s*)[^&\s,;}\"]+', r'\1[REDACTED]', value)
+    return re.sub(r'(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}', '[REDACTED_EMAIL]', value)
+
+
+def _safe_response_headers(finding: dict) -> dict:
+    headers = finding.get('response_headers')
+    if not isinstance(headers, dict):
+        return {}
+    allowed = {'content-type', 'location', 'www-authenticate', 'access-control-allow-origin',
+               'access-control-allow-credentials', 'server', 'x-powered-by', 'strict-transport-security',
+               'x-frame-options', 'content-security-policy', 'x-content-type-options', 'referrer-policy'}
+    return {str(key).lower(): str(value)[:500] for key, value in headers.items()
+            if str(key).lower() in allowed}
+
+
 def _reproduction_steps(finding: dict, host: str) -> dict:
     """Exact manual steps a human can follow to confirm a finding. Non-destructive only."""
-    url = f'https://{host}'
+    url = _finding_endpoint(finding, host)
     ftype = finding.get('type')
     detail = finding.get('detail')
     if ftype == 'missing_security_headers':
@@ -1035,9 +1077,9 @@ def _reproduction_steps(finding: dict, host: str) -> dict:
         return {
             'title': 'Missing security headers',
             'steps': [
-                f'Open a terminal and run: <code>curl -sSI {url}</code>',
-                'Read the response headers printed by curl.',
-                'Confirm these headers are NOT present: <code>' + ', '.join(headers) + '</code>',
+                f'Run: curl -sS -D - -o /dev/null {url}',
+                'Inspect the returned response headers.',
+                'Confirm these headers are absent: ' + ', '.join(headers),
             ],
             'expected': 'The listed headers do not appear in the response.',
             'impact': 'Depending on which are missing: clickjacking (X-Frame-Options), MIME sniffing (X-Content-Type-Options), weaker XSS/isolation defenses (CSP), or downgrade attacks (HSTS).',
@@ -1047,10 +1089,10 @@ def _reproduction_steps(finding: dict, host: str) -> dict:
         return {
             'title': 'CORS misconfiguration (untrusted origin reflected)',
             'steps': [
-                f"Run: <code>curl -sS -I -H 'Origin: https://evil.example' {url}</code>",
-                'Inspect the <code>Access-Control-Allow-Origin</code> and <code>Access-Control-Allow-Credentials</code> response headers.',
-                'Confirm the server reflects <code>https://evil.example</code> (or returns <code>*</code> together with credentials true).',
-                f'Observed by the scanner: <code>{detail}</code>',
+                f"Run: curl -sS -D - -o /dev/null -H 'Origin: https://example.invalid' {url}",
+                'Inspect Access-Control-Allow-Origin and Access-Control-Allow-Credentials in the response.',
+                'Confirm whether the response reflects the test origin and permits credentials.',
+                f'Observed by the scanner: {detail}',
             ],
             'expected': 'Access-Control-Allow-Origin echoes the untrusted origin, indicating cross-origin reads may be possible.',
             'impact': 'A malicious site could read authenticated responses on behalf of a logged-in user.',
@@ -1060,9 +1102,9 @@ def _reproduction_steps(finding: dict, host: str) -> dict:
         return {
             'title': 'Technology/version disclosure',
             'steps': [
-                f'Run: <code>curl -sSI {url}</code>',
-                'Look at the <code>Server</code> / <code>X-Powered-By</code> headers.',
-                f'Confirm the disclosure: <code>{detail}</code>',
+                f'Run: curl -sS -D - -o /dev/null {url}',
+                'Inspect the Server, X-Powered-By, or framework-version headers.',
+                f'Confirm the disclosure: {detail}',
             ],
             'expected': 'The response advertises server or framework version details.',
             'impact': 'Version disclosure helps an attacker target known CVEs for that stack.',
@@ -1073,9 +1115,9 @@ def _reproduction_steps(finding: dict, host: str) -> dict:
         return {
             'title': 'Insecure cookie flags',
             'steps': [
-                f'Run: <code>curl -sSI {url}</code>',
-                'Inspect the <code>Set-Cookie</code> header(s).',
-                'Confirm the following are missing: <code>' + ', '.join(flags) + '</code>',
+                f'Run: curl -sS -D - -o /dev/null {url}',
+                'Inspect Set-Cookie attributes; redact cookie values from evidence.',
+                'Confirm the following attributes are missing: ' + ', '.join(flags),
             ],
             'expected': 'Session/other cookies are set without one or more of Secure, HttpOnly, SameSite.',
             'impact': 'Cookies may be exposed over plaintext, readable by scripts, or sent cross-site (CSRF).',
@@ -1085,7 +1127,7 @@ def _reproduction_steps(finding: dict, host: str) -> dict:
         return {
             'title': 'Verbose error / stack trace disclosure',
             'steps': [
-                f'Browse to <code>{url}</code> (or the specific request that errored).',
+                f'Request {url} using the same method and prerequisites as the finding.',
                 'Observe the response body returned by the server.',
                 'Confirm a stack trace or framework error message is shown to the client.',
             ],
@@ -1093,9 +1135,34 @@ def _reproduction_steps(finding: dict, host: str) -> dict:
             'impact': 'Leaks internal paths, dependencies, and logic useful for further attacks.',
             'remediation': 'Return generic error pages; log details server-side only.',
         }
+    if ftype in {'debug_endpoint', 'unauthenticated_endpoint'}:
+        return {
+            'title': 'Unauthenticated API/debug endpoint',
+            'steps': [
+                f'Use a clean test session with no cookies or Authorization header and request {url}.',
+                f'Run: curl -sS -D - -o response.txt {url}',
+                'Record the HTTP status and only the minimum response evidence needed to establish whether protected data is returned.',
+                'Use a researcher-created fixture; do not enumerate or collect other users\' records.',
+            ],
+            'expected': 'An endpoint documented as authenticated should reject requests without the required authorization.',
+            'impact': 'Report only if the response proves access to protected data or a protected action with meaningful impact.',
+            'remediation': 'Enforce authorization at the endpoint and validate access for the requested object.',
+        }
+    if ftype == 'open_port':
+        return {
+            'title': 'Exposed TCP service',
+            'steps': [
+                f'Run: nc -vz {host} {finding.get("port", "")}',
+                'Record whether the TCP connection succeeds and identify the service only if the program permits it.',
+                'Do not infer a vulnerability from reachability alone; demonstrate a security impact without changing data.',
+            ],
+            'expected': 'A port may be open by design; assess the service against the authorized scope and program criteria.',
+            'impact': 'A reachable port alone does not establish unauthorized access or reportable impact.',
+            'remediation': 'Restrict network exposure to required sources and services if exposure is unintended.',
+        }
     return {
         'title': ftype or 'Finding',
-        'steps': [f'Manually review <code>{url}</code> for: {ftype}'],
+        'steps': [f'Manually review {url} for: {ftype}'],
         'expected': 'Analyst confirmation required.',
         'impact': 'See finding type.',
         'remediation': 'Review and remediate per finding type.',
@@ -1109,11 +1176,32 @@ def _render_finding_report_html(host: str, findings: list[dict], job_name: str) 
     for idx, finding in enumerate(findings, start=1):
         repro = _reproduction_steps(finding, host)
         severity = escape(str(finding.get('severity', 'info')))
-        steps_html = '\n'.join(f'<li>{step}</li>' for step in repro['steps'])
+        steps_html = '\n'.join(f'<li>{escape(step)}</li>' for step in repro['steps'])
+        endpoint = _finding_endpoint(finding, host)
+        method = 'TCP connect' if finding.get('type') == 'open_port' else str(finding.get('method', 'GET')).upper()
+        status = finding.get('status_code', finding.get('http_status'))
+        headers = _safe_response_headers(finding)
+        header_html = ''.join(f'<li><code>{escape(key)}</code>: {escape(value)}</li>' for key, value in headers.items()) or '<li>[Response headers not retained]</li>'
+        excerpt = _sanitize_report_excerpt(finding.get('response_excerpt', finding.get('response_body_excerpt')))
+        response_body_html = f'<pre>{escape(excerpt)}</pre>' if excerpt else '<p>[Response body not retained by scanner; capture a sanitized excerpt during manual reproduction.]</p>'
+        status_text = f'HTTP {status}' if status is not None else 'Not retained'
+        evidence = {key: finding[key] for key in ('type', 'port', 'service', 'severity', 'status_code', 'http_status') if key in finding}
+        if isinstance(finding.get('detail'), str):
+            evidence['detail'] = _sanitize_report_excerpt(finding['detail'])
+        evidence_html = escape(json.dumps(evidence, indent=2, ensure_ascii=True))
         sections.append(f'''
       <section class="finding sev-{severity}">
         <h2>{idx}. {escape(repro['title'])} <span class="sev">{severity}</span></h2>
-        <p><strong>Affected asset:</strong> <code>https://{escape(host)}</code></p>
+            <p><strong>Affected asset:</strong> <code>{escape(host)}</code></p>
+            <h3>Exact request</h3>
+            <p><strong>Method:</strong> <code>{escape(method)}</code></p>
+            <p><strong>Endpoint:</strong> <code>{escape(endpoint)}</code></p>
+            <h3>Recorded response</h3>
+            <p><strong>Status:</strong> <code>{escape(status_text)}</code></p>
+            <ul>{header_html}</ul>
+            <p><strong>Sanitized body excerpt:</strong></p>{response_body_html}
+            <h3>Scanner evidence</h3>
+            <pre>{evidence_html}</pre>
         <h3>Steps to Reproduce</h3>
         <ol>{steps_html}</ol>
         <p><strong>Expected evidence:</strong> {escape(repro['expected'])}</p>
@@ -1130,8 +1218,9 @@ def _render_finding_report_html(host: str, findings: list[dict], job_name: str) 
   .finding {{ background:#1f2937; border-left:4px solid #38bdf8; border-radius:8px; padding:16px 20px; margin-bottom:20px; }}
   .finding.sev-high {{ border-left-color:#ef4444; }} .finding.sev-medium {{ border-left-color:#f59e0b; }}
   .finding.sev-low {{ border-left-color:#3b82f6; }} .finding.sev-info {{ border-left-color:#64748b; }}
-  .sev {{ font-size:12px; text-transform:uppercase; background:#0b1120; padding:2px 8px; border-radius:999px; margin-left:8px; }}
+    .sev {{ font-size:12px; text-transform:uppercase; background:#0b1120; padding:2px 8px; border-radius:999px; margin-left:8px; }}
   code {{ background:#0b1120; padding:2px 6px; border-radius:4px; }}
+    pre {{ white-space:pre-wrap; overflow-wrap:anywhere; background:#0b1120; padding:12px; border-radius:6px; }}
   ol li {{ margin-bottom:6px; }}
   .disclaimer {{ color:#94a3b8; font-size:13px; margin-top:24px; border-top:1px solid #334155; padding-top:12px; }}
 </style></head><body>

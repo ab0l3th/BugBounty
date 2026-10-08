@@ -188,9 +188,14 @@ class DashboardJobMetadataTest(unittest.TestCase):
         self.assertTrue(jobs)
         jobs[0]['raw'] = dict(jobs[0].get('raw') or {})
         jobs[0]['raw'].pop('thread_status', None)
+        jobs[0]['assets'] = list(jobs[0].get('assets') or []) + [{
+            'domain': 'report-fixture.example', 'kind': 'api-test', 'status': 'findings',
+            'ports': [], 'evidence': [], 'findings': [{'type': 'debug_endpoint', 'path': '/debug', 'severity': 'high'}],
+        }]
         with patch('dashboard_app.list_jobs', return_value=jobs):
             response = app.test_client().get('/')
         self.assertEqual(response.status_code, 200)
+        self.assertIn(f'/reports/{jobs[0]["name"]}/report-fixture.example'.encode(), response.data)
 
     def test_dashboard_detects_third_workflow_job_and_order(self):
         jobs = list_jobs()
@@ -484,6 +489,45 @@ class DashboardJobMetadataTest(unittest.TestCase):
             self.assertIn('app.example.com', html)
             self.assertIn('curl', html)
         report.unlink(missing_ok=True)
+
+    def test_scanner_report_renders_for_non_application_job_without_saved_html(self):
+        from tempfile import TemporaryDirectory
+        import json
+        import dashboard_app
+        payload = {'job': 'api-endpoint-testing', 'program': 'alpha', 'assets': [{
+            'domain': 'api.example.com', 'findings': [{
+                'type': 'unauthenticated_endpoint', 'path': '/api/v1/test', 'status_code': 200,
+                'severity': 'high', 'detail': 'Test-only endpoint returned a response',
+            }],
+        }]}
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'api-endpoint-testing.json').write_text(json.dumps(payload), encoding='utf-8')
+            with patch.object(dashboard_app, 'RESULTS_DIR', root), app.test_client() as client:
+                response = client.get('/reports/api-endpoint-testing/api.example.com')
+        html = response.get_data(as_text=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('https://api.example.com/api/v1/test', html)
+        self.assertIn('HTTP 200', html)
+        self.assertIn('Steps to Reproduce', html)
+        self.assertIn('Response body not retained', html)
+
+    def test_scanner_report_shows_exact_response_evidence_safely(self):
+        from worker import _render_finding_report_html
+        html = _render_finding_report_html('api.example.com', [{
+            'type': 'unauthenticated_endpoint', 'path': '/api/v1/fixture?token=secret-value',
+            'status_code': 200, 'severity': 'high', 'detail': 'test fixture response',
+            'response_headers': {'Content-Type': 'application/json', 'Set-Cookie': 'session=secret-cookie'},
+            'response_excerpt': '{"record":"owned-fixture","email":"researcher@example.com","token":"abc123"}',
+        }], 'api-endpoint-testing')
+        self.assertIn('https://api.example.com/api/v1/fixture?token=%5BREDACTED%5D', html)
+        self.assertIn('HTTP 200', html)
+        self.assertIn('content-type', html)
+        self.assertIn('owned-fixture', html)
+        self.assertIn('[REDACTED_EMAIL]', html)
+        self.assertIn('[REDACTED]', html)
+        self.assertNotIn('secret-cookie', html)
+        self.assertNotIn('secret-value', html)
 
     def test_api_endpoint_tests_flag_exposed_debug_endpoint(self):
         from worker import _api_endpoint_tests
@@ -1064,6 +1108,10 @@ class DashboardJobMetadataTest(unittest.TestCase):
         self.assertEqual(candidates[0]['target_url'], 'https://api.example.com/actuator/health')
         self.assertEqual(candidates[0]['report_url'], '/reports/api-endpoint-testing/api.example.com')
         self.assertIsNone(candidates[1]['target_url'])
+        report_without_existing_file = review_candidates([{'name': 'api-endpoint-testing', 'assets': [{
+            'domain': 'new-api.example.com', 'findings': [{'type': 'debug_endpoint', 'path': '/debug', 'severity': 'high'}],
+        }]}])[0]
+        self.assertEqual(report_without_existing_file['report_url'], '/reports/api-endpoint-testing/new-api.example.com')
         web_port = review_candidates([{'name': 'port-scan-live-hosts', 'assets': [{
             'domain': 'app.example.com', 'findings': [
                 {'type': 'open_port', 'service': 'http-alt', 'port': 8080},
@@ -1120,14 +1168,37 @@ class DashboardJobMetadataTest(unittest.TestCase):
             url = f'/programs/alpha/findings/{finding_id}/writeup'
             page = client.get(url)
             self.assertEqual(page.status_code, 200)
-            self.assertIn(b'Manual verification and reporting draft', page.data)
+            self.assertIn(b'Vulnerability Report Draft: open_port', page.data)
             self.assertIn(b'CRITICAL', page.data)
-            self.assertIn(b'6379', page.data)
+            self.assertIn(b'tcp://host.alpha.test:6379', page.data)
+            self.assertIn(b'nc -vz host.alpha.test 6379', page.data)
+            self.assertIn(b'No response body excerpt was retained', page.data)
             self.assertNotIn(b'<script>untrusted</script>', page.data)
             download = client.get(url + '?download=1')
             self.assertEqual(download.mimetype, 'text/markdown')
             self.assertIn('attachment', download.headers['Content-Disposition'])
             self.assertEqual(client.get(f'/programs/beta/findings/{finding_id}/writeup').status_code, 404)
+
+    def test_writeup_includes_exact_recorded_endpoint_and_sanitized_response(self):
+        from dashboard_app import review_candidates
+        finding = {'type': 'unauthenticated_endpoint', 'path': '/api/v1/test-record', 'method': 'GET',
+                   'status_code': 200, 'response_headers': {'Content-Type': 'application/json',
+                   'Access-Control-Allow-Origin': 'https://example.invalid', 'Set-Cookie': 'session=secret'},
+                   'response_excerpt': '{"result":"test-fixture","email":"researcher@example.com","token":"abc123"}',
+                   'severity': 'high', 'detail': 'Test fixture available without auth'}
+        jobs = [{'name': 'alpha-api', 'program': 'alpha', 'assets': [{'domain': 'api.alpha.test', 'findings': [finding]}]}]
+        finding_id = review_candidates(jobs)[0]['id']
+        with patch('dashboard_app.list_jobs', return_value=jobs), app.test_client() as client:
+            response = client.get(f'/programs/alpha/findings/{finding_id}/writeup?download=1')
+        draft = response.get_data(as_text=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('GET https://api.alpha.test/api/v1/test-record', draft)
+        self.assertIn('HTTP 200', draft)
+        self.assertIn('test-fixture', draft)
+        self.assertIn('[REDACTED_EMAIL]', draft)
+        self.assertIn('"token":"[REDACTED]"', draft)
+        self.assertNotIn('session=secret', draft)
+        self.assertIn('2. Send the `GET` request', draft)
 
     def test_packaged_wordlists_are_full_and_can_be_replaced_without_count_caps(self):
         import worker

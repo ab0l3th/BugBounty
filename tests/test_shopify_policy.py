@@ -62,10 +62,15 @@ class ShopifyPolicyTest(unittest.TestCase):
             (edge / 'owner.metadata.json').chmod(0o644)
             with self.assertRaises(ValueError):
                 _profile_pair(plan, profiles, 'edge')
-            markdown = report_markdown({'shop': plan['shop'], 'rows': [{'role': 'appdev', 'target': 'owned_store_admin', 'expected': 'denied',
-                                      'observed': 'reachable_unverified', 'http_status': 200, 'manual_review_required': True}]})
+            markdown = report_markdown({'shop': plan['shop'], 'rows': [{'role': 'appdev', 'target': 'owned_store_admin',
+                                      'url': 'https://admin.shopify.com/store/owned-example', 'method': 'GET',
+                                      'expected': 'denied', 'observed': 'reachable_unverified', 'http_status': 200,
+                                      'manual_review_required': True}]})
             self.assertNotIn('private-session-value', markdown)
             self.assertIn('not proof', markdown)
+            self.assertIn('https://admin.shopify.com/store/owned-example', markdown)
+            self.assertIn('GET', markdown)
+            self.assertIn('Not captured (status only)', markdown)
 
     def test_account_browser_runner_isolated_read_only_and_sanitized(self):
         from types import SimpleNamespace

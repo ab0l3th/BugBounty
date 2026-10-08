@@ -14,7 +14,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from flask import Flask, jsonify, render_template_string, request
 
@@ -246,7 +246,7 @@ def review_candidates(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                   else:
                     target_url = f'https://{host}/'
                   expected_report = f"/reports/{job['name']}/{host}"
-                  if asset.get('report_url') == expected_report:
+                  if asset.get('findings'):
                     report_url = expected_report
                 candidates.append({
                     'id': hashlib.sha256(identity.encode('utf-8')).hexdigest(),
@@ -373,6 +373,36 @@ def finding_writeup(slug: str, finding_id: str):
     if candidate is None:
       return 'Finding not found', 404
     decision = read_reviews().get(finding_id, {})
+    finding = candidate['finding']
+    if finding.get('type') == 'open_port' and finding.get('port'):
+      endpoint = f"tcp://{candidate['host']}:{finding['port']}"
+      method = 'TCP connect'
+    else:
+      endpoint = candidate['target_url'] or candidate['host']
+      parsed_endpoint = urlsplit(endpoint)
+      if parsed_endpoint.scheme and parsed_endpoint.hostname:
+        safe_query = []
+        for key, value in parse_qsl(parsed_endpoint.query, keep_blank_values=True):
+          if re.search(r'token|secret|password|passwd|auth|session|cookie|api[_-]?key|signature', key, re.IGNORECASE):
+            value = '[REDACTED]'
+          safe_query.append((key, value))
+        endpoint = urlunsplit((parsed_endpoint.scheme, parsed_endpoint.netloc, parsed_endpoint.path or '/', urlencode(safe_query), ''))
+      method = str(finding.get('method', 'GET')).upper()
+    status_code = finding.get('status_code', finding.get('http_status'))
+    response_headers = finding.get('response_headers', {})
+    allowed_headers = {'content-type', 'location', 'www-authenticate', 'access-control-allow-origin',
+                       'access-control-allow-credentials', 'server', 'x-powered-by'}
+    safe_headers = {str(key).lower(): str(value)[:500] for key, value in response_headers.items()
+                    if isinstance(response_headers, dict) and str(key).lower() in allowed_headers} if isinstance(response_headers, dict) else {}
+    response_excerpt = finding.get('response_excerpt', finding.get('response_body_excerpt'))
+    if isinstance(response_excerpt, str):
+      response_excerpt = response_excerpt[:4000]
+      response_excerpt = re.sub(r'(?i)(bearer\s+)[A-Za-z0-9._~+/-]+=*', r'\1[REDACTED]', response_excerpt)
+      response_excerpt = re.sub(r"(?i)(\"?(?:password|token|secret|api[_-]?key)\"?\s*:\s*)\"[^\"]*\"", r'\1"[REDACTED]"', response_excerpt)
+      response_excerpt = re.sub(r'(?i)((?:password|token|secret|api[_-]?key)\s*[=:]\s*)[^&\s,;}\"]+', r'\1[REDACTED]', response_excerpt)
+      response_excerpt = re.sub(r'(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}', '[REDACTED_EMAIL]', response_excerpt)
+    else:
+      response_excerpt = None
     checks = {
         'open_port': 'Confirm the reported TCP port and service only if port checks are explicitly allowed. A reachable port does not prove unauthenticated access or impact.',
         'missing_security_headers': 'Inspect response headers at the exact observed URL. Record missing headers and demonstrate relevant application impact; missing headers alone may be ineligible.',
@@ -385,29 +415,43 @@ def finding_writeup(slug: str, finding_id: str):
         'unauthenticated_endpoint': 'Confirm the documented endpoint requires authorization and that the returned data is not intentionally public. Use only your own account and minimal records.',
     }
     verification = checks.get(candidate['evidence']['type'], 'Independently verify the recorded scanner observation and demonstrate impact using only permitted, non-destructive checks.')
+    evidence = json.dumps(candidate['evidence'], indent=2, ensure_ascii=True)
+    response_status = f'HTTP {status_code}' if status_code is not None else 'Not captured by scanner'
+    response_header_lines = [f'{key}: {value}' for key, value in safe_headers.items()]
+    if finding.get('type') == 'open_port':
+      reproduction_action = f"Connect to the TCP endpoint with `nc -vz {candidate['host']} {finding.get('port', '')}`."
+    else:
+      reproduction_action = f"Send the `{method}` request to `{endpoint}`."
     draft = '\n'.join([
-      '# Manual verification and reporting draft', '',
+      f"# Vulnerability Report Draft: {finding['type']}", '',
       f"Program: {program_label(slug)}", f"Job: {candidate['job']}",
       f"Asset: {candidate['host']}", f"Finding: {candidate['evidence']['type']}",
       f"Scanner severity (unverified): {candidate['severity'].upper()}",
       f"Confidence: {candidate['confidence'].upper()}",
       f"Review status: {decision.get('status', 'needs_review')}",
       f"Scope status: {decision.get('scope', 'needs_verification')}", '',
-      '## Observed scanner evidence', '```json', json.dumps(candidate['finding'], indent=2), '```', '',
-      '## Manual verification',
-      '1. Review the current program scope, exclusions, testing restrictions, and request limit.',
-      '2. Verify the exact asset and observed path are authorized before making any request.',
-      f"3. Independently reproduce the scanner observation on {candidate['target_url'] or candidate['host']} using only permitted tests and your own accounts.",
-      '4. Record the exact request, response, timestamp, prerequisites, and sanitized evidence.',
-      '5. Rule out login redirects, false positives, and intended behavior.', '',
-      '## Finding-specific checks', verification, '',
-      '## Confirmed reproduction steps', '[Analyst: enter verified steps and prerequisites]', '',
-      '## Expected and actual behavior', '[Analyst: enter independently verified behavior]', '',
-      '## Demonstrated impact', '[Analyst: enter proven impact; do not infer impact from scanner severity]', '',
-      '## Remediation', '[Analyst: propose a fix after confirming the root cause]', '',
-      '## Reporting decision',
-      'Unverified draft only. Manually confirm scope, impact, and report eligibility before submitting.',
-      'Manual verification does not authorize prohibited automated testing.',
+      '## Affected endpoint', f'- Method: `{method}`', f'- Exact endpoint: `{endpoint}`',
+      f'- Observed status: `{response_status}`', '',
+      '## Captured request and response',
+      f"Request: `{method} {endpoint}`", f"Response status: `{response_status}`",
+      'Response headers:', '```http', *(response_header_lines or ['[No relevant response headers were retained]']), '```',
+      'Response body excerpt:', '```text', response_excerpt or '[No response body excerpt was retained by the scanner; capture a sanitized response during manual reproduction.]', '```', '',
+      '## Scanner evidence', '```json', evidence, '```', '',
+      '## Step-by-step reproduction',
+      '1. Confirm the exact asset is in scope and use only the authorized test account and test data.',
+      f'2. {reproduction_action}',
+      f"3. Compare the response with the expected behavior. The scanner recorded `{response_status}`; verify any authorization or impact claim independently.",
+      '4. Capture the minimal sanitized request and response needed to demonstrate impact; do not include cookies, tokens, or unrelated personal data.',
+      '5. Stop once the behavior is confirmed. Do not enumerate records or perform destructive actions.', '',
+      '## Expected behavior', '[State the documented permission or security boundary for this endpoint.]', '',
+      '## Actual behavior and impact',
+      f"Scanner observation: {finding.get('detail', finding.get('type', 'No detail recorded'))}",
+      '[Describe only impact reproduced with the authorized test account and test data.]', '',
+      '## Finding-specific verification', verification, '',
+      '## Remediation', '[Describe a fix after confirming the root cause.]', '',
+      '## Reportability check',
+      'This is an unverified draft, not a confirmed vulnerability. Confirm program eligibility and meaningful impact before submission.',
+      'The scanner does not retain a response body unless an explicit sanitized response excerpt is present above.',
     ])
     if request.args.get('download') == '1':
       return app.response_class(draft, mimetype='text/markdown',
@@ -1509,8 +1553,8 @@ def index():
                               {% else %}
                                 {{ asset.source or asset.sources|join(', ') }}
                               {% endif %}
-                              {% if asset.report_url %}
-                                <div style="margin-top:6px;"><a href="{{ asset.report_url }}" target="_blank" rel="noopener">📄 View write-up ({{ asset.findings|length }} finding{{ 's' if asset.findings|length != 1 else '' }})</a></div>
+                              {% if asset.findings %}
+                                <div style="margin-top:6px;"><a href="{{ url_for('view_report', job_name=job.name, host=asset.domain) }}" target="_blank" rel="noopener">📄 Scanner report ({{ asset.findings|length }} finding{{ 's' if asset.findings|length != 1 else '' }})</a></div>
                               {% endif %}
                             </td>
                             <td>{% if asset.kind %}<code>{{ asset.kind }}</code>{% else %}—{% endif %}</td>
@@ -2436,11 +2480,29 @@ def api_jobs():
 
 @app.route('/reports/<job_name>/<host>')
 def view_report(job_name: str, host: str):
-    safe_job = re.sub(r'[^a-z0-9\-]', '', job_name.lower())
-    safe_host = re.sub(r'[^a-z0-9.\-]', '', host.lower())
+    safe_job = job_name.lower()
+    safe_host = host.lower()
+    if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,159}', safe_job):
+        return jsonify({'status': 'error', 'message': 'report not found'}), 404
+    if not re.fullmatch(r'[a-z0-9][a-z0-9.-]{0,252}', safe_host) or '..' in safe_host:
+        return jsonify({'status': 'error', 'message': 'report not found'}), 404
     reports_dir = (RESULTS_DIR / 'reports').resolve()
     path = (reports_dir / safe_job / f'{safe_host}.html').resolve()
-    if not str(path).startswith(str(reports_dir)) or not path.exists():
+    if not str(path).startswith(str(reports_dir)):
+        return jsonify({'status': 'error', 'message': 'report not found'}), 404
+    result_path = RESULTS_DIR / f'{safe_job}.json'
+    if result_path.is_file():
+        try:
+            payload = json.loads(result_path.read_text(encoding='utf-8'))
+            payload = apply_finding_eligibility(payload, ROOT)
+            asset = next((item for item in payload.get('assets', []) if isinstance(item, dict) and item.get('domain', '').lower() == safe_host), None)
+            findings = asset.get('findings', []) if asset else []
+            if findings:
+                from worker import _render_finding_report_html
+                return _render_finding_report_html(safe_host, findings, safe_job), 200, {'Content-Type': 'text/html; charset=utf-8'}
+        except (OSError, ValueError, TypeError):
+            pass
+    if not path.is_file():
         return jsonify({'status': 'error', 'message': 'report not found'}), 404
     return path.read_text(encoding='utf-8'), 200, {'Content-Type': 'text/html; charset=utf-8'}
 
