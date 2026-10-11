@@ -1156,8 +1156,9 @@ def _reproduction_steps(finding: dict, host: str) -> dict:
         return {
             'title': 'Exposed TCP service',
             'steps': [
-                f'Run: nc -vz {host} {finding.get("port", "")}',
+                f'Run: nc -vz {finding.get("ip") or host} {finding.get("port", "")}',
                 'Record whether the TCP connection succeeds and identify the service only if the program permits it.',
+                'The scanner uses socket.connect_ex, not nc. Service names are inferred from the port number; no application banner was collected.',
                 'Do not infer a vulnerability from reachability alone; demonstrate a security impact without changing data.',
             ],
             'expected': 'A port may be open by design; assess the service against the authorized scope and program criteria.',
@@ -1189,6 +1190,12 @@ def _render_finding_report_html(host: str, findings: list[dict], job_name: str) 
         response_body = finding.get('response_body', finding.get('response_excerpt', finding.get('response_body_excerpt')))
         response_body_html = f'<pre>{escape(str(response_body))}</pre>' if response_body is not None else '<p>[Response body not retained by scanner.]</p>'
         status_text = f'HTTP {status}' if status is not None else 'Not retained'
+        connection_evidence = finding.get('connection_evidence')
+        connection_html = ''
+        if finding.get('type') == 'open_port':
+            status_text = str(connection_evidence.get('outcome', 'Not retained')) if isinstance(connection_evidence, dict) else 'Detailed connection result not retained by this scan'
+            connection_html = '<h3>TCP connection evidence</h3><pre>' + escape(json.dumps(connection_evidence, indent=2)) + '</pre>' if isinstance(connection_evidence, dict) else '<p>Detailed TCP connection evidence was not retained by this older scan.</p>'
+            response_body_html = '<p>Connect-only probe: no application response or service banner was requested or collected. The nc command below is for manual reproduction, not recorded scanner output.</p>'
         evidence = {key: finding[key] for key in ('type', 'port', 'service', 'severity', 'status_code', 'http_status',
                                                    'response_body_truncated', 'response_body_bytes_stored', 'response_sha256') if key in finding}
         if isinstance(finding.get('detail'), str):
@@ -1203,6 +1210,7 @@ def _render_finding_report_html(host: str, findings: list[dict], job_name: str) 
             <p><strong>Endpoint:</strong> <code>{escape(endpoint)}</code></p>
             <h3>Recorded response</h3>
             <p><strong>Status:</strong> <code>{escape(status_text)}</code></p>
+            {connection_html}
             <ul>{header_html}</ul>
             <p><strong>Captured response body (unredacted):</strong></p>{response_body_html}
             <h3>Scanner evidence</h3>
@@ -1621,15 +1629,28 @@ _UNEXPECTED_PORTS: dict[int, tuple[str, str]] = {
 }
 
 
+_TCP_PROBE_EVIDENCE = threading.local()
+
+
 def _tcp_port_open(ip: str, port: int, timeout: float = 1.5) -> bool:
     family = socket.AF_INET6 if ':' in ip else socket.AF_INET
     sock = socket.socket(family, socket.SOCK_STREAM)
     sock.settimeout(timeout)
+    started = time.monotonic()
+    evidence = {'transport': 'TCP', 'probe': 'socket.connect_ex', 'ip': ip, 'port': port,
+                'timeout_seconds': timeout, 'timestamp': time.time(), 'application_data_collected': False}
     try:
-        return sock.connect_ex((ip, port)) == 0
-    except OSError:
+        code = sock.connect_ex((ip, port))
+        evidence.update({'return_code': code, 'outcome': 'connected' if code == 0 else 'connect_failed',
+                         'message': 'TCP connection succeeded' if code == 0 else os.strerror(code)})
+        return code == 0
+    except OSError as error:
+        evidence.update({'return_code': error.errno, 'outcome': 'connect_failed',
+                         'message': str(error), 'error_type': type(error).__name__})
         return False
     finally:
+        evidence['elapsed_seconds'] = round(time.monotonic() - started, 6)
+        _TCP_PROBE_EVIDENCE.latest = evidence
         sock.close()
 
 
@@ -1665,7 +1686,16 @@ def _port_scan_tests(hosts: list[str], *, use_external_tools: bool = False, prog
                 service, severity = _UNEXPECTED_PORTS.get(port, ('unknown', 'info'))
                 attempt = {'thread_id': thread_name, 'host': host, 'ip': ip, 'port': port, 'status': 'checking', 'timestamp': time.time()}
                 probe_log.append(attempt)
-                if probe(ip, port):
+                _TCP_PROBE_EVIDENCE.latest = None
+                connected = bool(probe(ip, port))
+                connection_evidence = getattr(_TCP_PROBE_EVIDENCE, 'latest', None)
+                if not connection_evidence or connection_evidence.get('ip') != ip or connection_evidence.get('port') != port:
+                    connection_evidence = {'transport': 'TCP', 'probe': 'boolean-only probe', 'ip': ip, 'port': port,
+                                           'outcome': 'connected' if connected else 'connect_failed',
+                                           'return_code': None, 'message': 'Probe returned True' if connected else 'Probe returned False',
+                                           'application_data_collected': False}
+                attempt['connection_evidence'] = dict(connection_evidence)
+                if connected:
                     if service == 'unknown':
                         try:
                             service = socket.getservbyport(port, 'tcp')
@@ -1673,7 +1703,8 @@ def _port_scan_tests(hosts: list[str], *, use_external_tools: bool = False, prog
                             pass
                     attempt['status'] = 'open'
                     open_ports.append(port)
-                    findings.append({'type': 'open_port', 'ip': ip, 'port': port, 'service': service, 'severity': severity})
+                    findings.append({'type': 'open_port', 'ip': ip, 'port': port, 'service': service, 'severity': severity,
+                                     'connection_evidence': dict(connection_evidence), 'service_identification': 'port-number heuristic'})
                 else:
                     attempt['status'] = 'closed'
                 record['checked_ports'] += 1

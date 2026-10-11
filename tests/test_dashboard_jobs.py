@@ -747,6 +747,8 @@ class DashboardJobMetadataTest(unittest.TestCase):
         asset = next(a for a in result['assets'] if a['domain'] == 'host.example.com')
         open_ports = [f for f in asset['findings'] if f['type'] == 'open_port']
         self.assertTrue(any(f['port'] == 6379 and f['service'] == 'redis' and f['severity'] == 'critical' for f in open_ports))
+        self.assertEqual(open_ports[0]['connection_evidence']['probe'], 'boolean-only probe')
+        self.assertIsNone(open_ports[0]['connection_evidence']['return_code'])
         self.assertIn(6379, asset['ports'])
         self.assertEqual(asset['status'], 'findings')
         self.assertIn('host.example.com', result['discovered'])
@@ -761,6 +763,42 @@ class DashboardJobMetadataTest(unittest.TestCase):
         # Hosts with no open ports are not reported at all.
         self.assertEqual(result['assets'], [])
         self.assertEqual(result['discovered'], [])
+
+    def test_port_scan_retains_real_connect_result_without_second_connection(self):
+        import errno
+        from unittest.mock import MagicMock
+        from worker import _port_scan_tests
+        sock = MagicMock()
+        sock.connect_ex.side_effect = [0, errno.ECONNREFUSED]
+        with patch('worker.socket.socket', return_value=sock):
+            result = _port_scan_tests(['host.example.com'], ports=[6379, 6380],
+                                      resolver=lambda host: {'203.0.113.5'})
+        finding = result['assets'][0]['findings'][0]
+        evidence = finding['connection_evidence']
+        self.assertEqual(evidence['probe'], 'socket.connect_ex')
+        self.assertEqual(evidence['return_code'], 0)
+        self.assertEqual(evidence['message'], 'TCP connection succeeded')
+        self.assertEqual(evidence['ip'], '203.0.113.5')
+        self.assertEqual(evidence['port'], 6379)
+        self.assertFalse(evidence['application_data_collected'])
+        self.assertEqual(result['probe_log'][1]['connection_evidence']['return_code'], errno.ECONNREFUSED)
+        self.assertEqual(sock.connect_ex.call_count, 2)
+        sock.recv.assert_not_called()
+        from worker import _render_finding_report_html
+        html = _render_finding_report_html('host.example.com', [finding], 'port-scan-live-hosts')
+        self.assertIn('TCP connection evidence', html)
+        self.assertIn('TCP connection succeeded', html)
+        self.assertIn('203.0.113.5', html)
+        self.assertIn('socket.connect_ex', html)
+        self.assertIn('no application response', html)
+        from dashboard_app import review_candidates
+        jobs = [{'name': 'alpha-ports', 'program': 'alpha', 'assets': result['assets']}]
+        finding_id = review_candidates(jobs)[0]['id']
+        with patch('dashboard_app.list_jobs', return_value=jobs):
+            draft = app.test_client().get(f'/programs/alpha/findings/{finding_id}/writeup?download=1')
+        self.assertEqual(draft.status_code, 200)
+        self.assertIn('TCP connection succeeded', draft.get_data(as_text=True))
+        self.assertIn('nc -vz 203.0.113.5 6379', draft.get_data(as_text=True))
 
     def test_service_enumeration_uses_step3_live_asset_output(self):
         result_path = ROOT / 'results' / 'confirm-live-web-assets.json'

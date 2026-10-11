@@ -16,6 +16,17 @@ This folder holds the passive recon and automation workflows for approved progra
 - Keep automation limited to approved assets and allowed testing methods.
 - Store only sanitized output; avoid saving secrets or personal data.
 
+## Port Scan Evidence
+
+Port scans use Python `socket.connect_ex`, not `nc`. Each probe log retains the
+connection result code, error message, IP/port, timeout, timestamp, and elapsed
+time; open-port findings retain the same evidence in JSON and both report views.
+No second connection is made to collect evidence. This connect-only scan does
+not send application commands or collect service banners; service names are
+port-number heuristics. The displayed `nc -vz` command reproduces the connection
+to the recorded IP, not an nc transcript captured by the scanner. Older findings
+without detailed connection evidence are explicitly marked as such.
+
 ## Scheduled runner pattern
 
 The repo includes a passive scheduler model that:

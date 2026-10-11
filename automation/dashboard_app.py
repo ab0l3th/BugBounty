@@ -398,12 +398,18 @@ def finding_writeup(slug: str, finding_id: str):
     verification = checks.get(candidate['evidence']['type'], 'Independently verify the recorded scanner observation and demonstrate impact using only permitted, non-destructive checks.')
     evidence = json.dumps(candidate['evidence'], indent=2, ensure_ascii=True)
     response_status = f'HTTP {status_code}' if status_code is not None else 'Not captured by scanner'
+    connection_evidence = finding.get('connection_evidence')
+    connection_lines = []
+    if finding.get('type') == 'open_port':
+      response_status = str(connection_evidence.get('outcome', 'Not captured')) if isinstance(connection_evidence, dict) else 'Detailed connection result not captured by this scan'
+      connection_lines = ['## TCP connection evidence', '```json', json.dumps(connection_evidence, indent=2) if isinstance(connection_evidence, dict) else '[Detailed connection evidence not retained by this older scan.]', '```',
+                          'The scanner uses socket.connect_ex, not nc. Service names are port-number heuristics; no application banner was collected.', '']
     response_header_lines = [f'{key}: {value}' for key, value in captured_headers.items()]
     response_body_bytes = finding.get('response_body_bytes_stored')
     response_body_state = ('truncated at 8192 bytes' if finding.get('response_body_truncated') else
                  f'{response_body_bytes} bytes stored' if response_body_bytes is not None else 'body not captured')
     if finding.get('type') == 'open_port':
-      reproduction_action = f"Connect to the TCP endpoint with `nc -vz {candidate['host']} {finding.get('port', '')}`."
+      reproduction_action = f"Connect to the same IP/port with `nc -vz {finding.get('ip') or candidate['host']} {finding.get('port', '')}`. This is a reproduction command, not captured nc output."
     else:
       reproduction_action = f"Send the `{method}` request to `{endpoint}`."
     draft = '\n'.join([
@@ -416,6 +422,7 @@ def finding_writeup(slug: str, finding_id: str):
       f"Scope status: {decision.get('scope', 'needs_verification')}", '',
       '## Affected endpoint', f'- Method: `{method}`', f'- Exact endpoint: `{endpoint}`',
       f'- Observed status: `{response_status}`', '',
+      *connection_lines,
       '## Captured request and response',
       f"Request: `{method} {endpoint}`", f"Response status: `{response_status}`",
       'Response headers:', '```http', *(response_header_lines or ['[No relevant response headers were retained]']), '```',
